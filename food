@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Food log CLI — log meals via Gemini AI and track daily nutrition."""
+
+import json
+import os
+import sys
+import uuid
+from datetime import datetime
+
+from rich.console import Console
+from rich.table import Table
+from rich import box
+from rich.text import Text
+
+CONFIG_FILE   = os.path.expanduser("~/.config/intervals-icu/config.json")
+FOOD_LOG_FILE = os.path.expanduser("~/.local/share/training-brief/food-log.json")
+
+console = Console()
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        console.print("[red]No config found at ~/.config/intervals-icu/config.json[/]")
+        sys.exit(1)
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+
+
+# ── Food log I/O ─────────────────────────────────────────────────────────────
+
+def load_log():
+    if not os.path.exists(FOOD_LOG_FILE):
+        return {}
+    with open(FOOD_LOG_FILE) as f:
+        return json.load(f)
+
+
+def save_log(log):
+    os.makedirs(os.path.dirname(FOOD_LOG_FILE), exist_ok=True)
+    with open(FOOD_LOG_FILE, "w") as f:
+        json.dump(log, f, indent=2)
+
+
+def today_key():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+# ── AI parsing ───────────────────────────────────────────────────────────────
+
+def _food_prompt(description):
+    return (
+        'You are a nutritionist. Parse this food description — which may cover a single item, '
+        'one meal, or an entire day of eating — into separate meals.\n'
+        'Identify each distinct eating occasion (breakfast, snack, lunch, dinner, etc.) '
+        'and assign a realistic time if not stated '
+        '(breakfast ~08:00, mid-morning ~10:30, lunch ~13:00, afternoon ~16:00, dinner ~19:00, evening ~21:00).\n'
+        'Use realistic portion sizes where not specified (e.g. "eggs" = 2 large eggs, "chicken breast" = ~150g).\n'
+        'Return ONLY valid JSON, no markdown, no explanation.\n\n'
+        f'Description: "{description}"\n\n'
+        'Format:\n'
+        '{\n'
+        '  "meals": [\n'
+        '    {\n'
+        '      "meal": "Breakfast",\n'
+        '      "time": "08:00",\n'
+        '      "items": [\n'
+        '        {"name": "...", "calories": N, "protein_g": N, "carbs_g": N, "fat_g": N, "fiber_g": N, "sugar_g": N, "sodium_mg": N}\n'
+        '      ]\n'
+        '    }\n'
+        '  ]\n'
+        '}'
+    )
+
+
+def _strip_markdown_fence(text):
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    return text
+
+
+def parse_food_with_claude(description, api_key):
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": _food_prompt(description)}],
+    )
+    return json.loads(_strip_markdown_fence(msg.content[0].text.strip()))
+
+
+def parse_food_with_gemini(description, api_key):
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(model="models/gemini-2.5-flash", contents=_food_prompt(description))
+    return json.loads(_strip_markdown_fence(resp.text.strip()))
+
+
+# ── Display helpers ──────────────────────────────────────────────────────────
+
+def _cal_color(consumed, target):
+    if target <= 0:
+        return "white"
+    pct = consumed / target * 100
+    if pct > 100:
+        return "red"
+    if pct >= 80:
+        return "green"
+    return "yellow"
+
+
+def show_entry_table(entry):
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold white",
+        border_style="dim",
+        expand=False,
+    )
+    table.add_column("Item", min_width=28)
+    table.add_column("kcal", justify="right", min_width=6)
+    table.add_column("Protein", justify="right", min_width=8)
+    table.add_column("Carbs", justify="right", min_width=7)
+    table.add_column("Fat", justify="right", min_width=6)
+    table.add_column("Fiber", justify="right", min_width=6)
+
+    for item in entry.get("items", []):
+        table.add_row(
+            item["name"],
+            str(int(item["calories"])),
+            f'{item["protein_g"]:.1f}g',
+            f'{item["carbs_g"]:.1f}g',
+            f'{item["fat_g"]:.1f}g',
+            f'{item["fiber_g"]:.1f}g',
+        )
+
+    # Totals row
+    table.add_row(
+        "[bold]Total[/]",
+        f'[bold]{int(entry["calories"])}[/]',
+        f'[bold]{entry["protein_g"]:.1f}g[/]',
+        f'[bold]{entry["carbs_g"]:.1f}g[/]',
+        f'[bold]{entry["fat_g"]:.1f}g[/]',
+        f'[bold]{entry["fiber_g"]:.1f}g[/]',
+        style="dim",
+    )
+
+    console.print()
+    console.print(f"  [bold]{entry['time']}[/]  [dim]{entry['description']}[/]")
+    console.print(table)
+
+
+def show_day_totals(entries, calorie_target):
+    totals = {k: sum(e.get(k, 0) for e in entries) for k in ("calories", "protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g", "sodium_mg")}
+    consumed = int(totals["calories"])
+    pct = min(consumed / max(calorie_target, 1) * 100, 100)
+    color = _cal_color(consumed, calorie_target)
+
+    # Progress bar (40 chars wide)
+    bar_width = 40
+    filled = int(pct / 100 * bar_width)
+    bar = f"[{color}]{'█' * filled}[/{color}][dim]{'░' * (bar_width - filled)}[/dim]"
+
+    console.print()
+    t = Text()
+    t.append("  Day total  ", style="bold")
+    t.append(f"{consumed:,}", style=color + " bold")
+    t.append(f" / {calorie_target:,} kcal", style="dim")
+    t.append(f"  ({pct:.0f}%)", style="dim")
+    console.print(t)
+    console.print(f"  {bar}")
+    console.print(
+        f"  [dim]Protein [bold white]{totals['protein_g']:.0f}g[/]  "
+        f"Carbs [bold white]{totals['carbs_g']:.0f}g[/]  "
+        f"Fat [bold white]{totals['fat_g']:.0f}g[/]  "
+        f"Fiber [bold white]{totals['fiber_g']:.0f}g[/]  "
+        f"Sugar [bold white]{totals['sugar_g']:.0f}g[/]  "
+        f"Sodium [bold white]{totals['sodium_mg']:.0f}mg[/][/dim]"
+    )
+    console.print(f"  [dim]{len(entries)} meal{'s' if len(entries) != 1 else ''} logged today[/]")
+    console.print()
+
+
+def show_today(entries, calorie_target):
+    if not entries:
+        console.print("\n  [dim]No meals logged today.[/]\n")
+        return
+    for entry in entries:
+        show_entry_table(entry)
+    show_day_totals(entries, calorie_target)
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def _meal_to_entry(meal, raw_description):
+    items = meal.get("items", [])
+    totals = {
+        "calories":   sum(i["calories"]          for i in items),
+        "protein_g":  sum(i["protein_g"]         for i in items),
+        "carbs_g":    sum(i["carbs_g"]            for i in items),
+        "fat_g":      sum(i["fat_g"]              for i in items),
+        "fiber_g":    sum(i.get("fiber_g",   0)   for i in items),
+        "sugar_g":    sum(i.get("sugar_g",   0)   for i in items),
+        "sodium_mg":  sum(i.get("sodium_mg", 0)   for i in items),
+    }
+    return {
+        "id":          str(uuid.uuid4()),
+        "time":        meal.get("time", datetime.now().strftime("%H:%M")),
+        "description": meal.get("meal", raw_description),
+        "items":       items,
+        **{k: round(v, 1) for k, v in totals.items()},
+    }
+
+
+def cmd_add(description, config):
+    calorie_target = config.get("calorie_baseline", 2700)
+
+    anthropic_key = config.get("anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    gemini_key = config.get("gemini_api_key", "")
+
+    if anthropic_key:
+        backend, label = "claude", "Claude"
+        parse = lambda d: parse_food_with_claude(d, anthropic_key)
+    elif gemini_key:
+        backend, label = "gemini", "Gemini"
+        parse = lambda d: parse_food_with_gemini(d, gemini_key)
+    else:
+        console.print("[red]No anthropic_api_key or gemini_api_key in config.[/]")
+        sys.exit(1)
+
+    with console.status(f"[dim]Asking {label} to parse food…[/]"):
+        try:
+            parsed = parse(description)
+        except Exception as e:
+            console.print(f"[red]{label} error:[/] {e}")
+            sys.exit(1)
+
+    meals = parsed.get("meals", [])
+    if not meals:
+        console.print("[yellow]Nothing parsed — try rephrasing.[/]")
+        return
+
+    log = load_log()
+    key = today_key()
+    new_entries = [_meal_to_entry(m, description) for m in meals]
+    log.setdefault(key, []).extend(new_entries)
+    # Keep entries sorted by time
+    log[key].sort(key=lambda e: e.get("time", ""))
+    save_log(log)
+
+    for entry in new_entries:
+        show_entry_table(entry)
+    show_day_totals(log[key], calorie_target)
+
+
+def cmd_today(config):
+    calorie_target = config.get("calorie_baseline", 2700)
+    log = load_log()
+    entries = log.get(today_key(), [])
+    show_today(entries, calorie_target)
+
+
+def cmd_undo(config, count=1):
+    calorie_target = config.get("calorie_baseline", 2700)
+    log = load_log()
+    key = today_key()
+    entries = log.get(key, [])
+    if not entries:
+        console.print("\n  [yellow]Nothing to undo — no meals logged today.[/]\n")
+        return
+    n = min(count, len(entries))
+    removed = entries[-n:]
+    log[key] = entries[:-n]
+    save_log(log)
+    for r in removed:
+        console.print(f"\n  [green]Removed:[/] [dim]{r['time']} — {r['description']}[/]")
+    show_day_totals(log[key], calorie_target) if log[key] else console.print("  [dim]No meals remaining today.[/]\n")
+
+
+def cmd_clear(config):
+    calorie_target = config.get("calorie_baseline", 2700)
+    log = load_log()
+    key = today_key()
+    count = len(log.get(key, []))
+    if count == 0:
+        console.print("\n  [yellow]No meals to clear today.[/]\n")
+        return
+    log[key] = []
+    save_log(log)
+    console.print(f"\n  [green]Cleared {count} meal{'s' if count != 1 else ''} from today.[/]\n")
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def usage():
+    console.print("\n  [bold]food[/] — daily nutrition tracker\n")
+    console.print("  [dim]food add <description>[/]   log a meal via Gemini")
+    console.print("  [dim]food today[/]               show today's log and totals")
+    console.print("  [dim]food undo [N][/]             remove last N entries today (default 1)")
+    console.print("  [dim]food clear[/]               clear all today's entries\n")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        usage()
+        return
+
+    cmd = args[0].lower()
+    config = load_config()
+
+    if cmd == "add":
+        if len(args) < 2:
+            console.print("[red]Usage:[/] food add <description>")
+            sys.exit(1)
+        description = " ".join(args[1:])
+        cmd_add(description, config)
+    elif cmd == "today":
+        cmd_today(config)
+    elif cmd == "undo":
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
+        cmd_undo(config, n)
+    elif cmd == "clear":
+        cmd_clear(config)
+    else:
+        console.print(f"[red]Unknown command:[/] {cmd}")
+        usage()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
