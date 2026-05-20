@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""intervals.icu recent activities CLI."""
+
+import json
+import math
+import os
+import sys
+from bisect import bisect_left
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+
+import requests
+from rich.console import Console
+from rich.table import Table
+from rich import box
+from rich.text import Text
+
+CONFIG_FILE = os.path.expanduser("~/.config/intervals-icu/config.json")
+BASE_URL = "https://intervals.icu/api/v1"
+
+console = Console()
+
+SPORT_COLORS = {
+    "Run": "green",
+    "Ride": "cyan",
+    "VirtualRide": "blue",
+    "Swim": "blue",
+    "Walk": "yellow",
+    "Hike": "yellow",
+    "WeightTraining": "magenta",
+    "Workout": "magenta",
+}
+
+CHART_HEIGHT = 16
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+# Braille rendering — each terminal cell encodes a 2×4 dot grid.
+# Bit layout (Unicode braille standard):
+#   col→  0     1
+# row 0:  0x01  0x08
+# row 1:  0x02  0x10
+# row 2:  0x04  0x20
+# row 3:  0x40  0x80
+BRAILLE_BASE = 0x2800
+_BDOTS = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
+
+ZONE_COLORS = {
+    1: "dim",
+    2: "blue",
+    3: "cyan",
+    4: "yellow",
+    5: "bold yellow",
+    6: "red",
+    7: "bold red",
+}
+
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        console.print("[red]No config found.[/] Run with --setup to configure.", highlight=False)
+        sys.exit(1)
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+
+
+def setup():
+    console.print("\n[bold]intervals.icu setup[/]\n")
+    console.print("Find your athlete ID in the URL when logged in: intervals.icu/athletes/[bold]i12345[/]")
+    console.print("Find your API key at: Settings → Developer Settings → API Key\n")
+    athlete_id = input("Athlete ID (e.g. i12345): ").strip()
+    api_key = input("API key: ").strip()
+    config = {"athlete_id": athlete_id, "api_key": api_key}
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+    console.print(f"\n[green]Saved to {CONFIG_FILE}[/]")
+
+
+def fetch_activities(athlete_id, api_key, count=15):
+    oldest = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%dT00:00:00")
+    newest = datetime.now().strftime("%Y-%m-%dT23:59:59")
+    url = f"{BASE_URL}/athlete/{athlete_id}/activities"
+    params = {"oldest": oldest, "newest": newest}
+    resp = requests.get(url, params=params, auth=("API_KEY", api_key), timeout=10)
+    resp.raise_for_status()
+    activities = resp.json()
+    # Sort by date ascending, take most recent N, reverse for display (newest first)
+    activities.sort(key=lambda a: a.get("start_date_local") or a.get("start_date") or "")
+    return activities[-count:][::-1]
+
+
+def fetch_activities_range(athlete_id, api_key, oldest, newest):
+    url = f"{BASE_URL}/athlete/{athlete_id}/activities"
+    params = {"oldest": oldest.strftime("%Y-%m-%dT00:00:00"),
+              "newest": newest.strftime("%Y-%m-%dT23:59:59")}
+    resp = requests.get(url, params=params, auth=("API_KEY", api_key), timeout=10)
+    resp.raise_for_status()
+    activities = resp.json()
+    activities.sort(key=lambda a: a.get("start_date_local") or a.get("start_date") or "")
+    return activities
+
+
+
+def compute_hi_load(activities, days, tau=14):
+    """Exponentially weighted Z4+ rowing minutes with decay constant τ days.
+
+    Analogous to CTL but specific to high-intensity rowing load. Decays ~3×
+    faster than CTL (τ=14 vs 42) reflecting the shorter half-life of anaerobic
+    and lactate-threshold adaptations.
+    """
+    decay = math.exp(-1 / tau)
+    accumulate = 1 - decay
+
+    hi_by_date = defaultdict(float)
+    for a in activities:
+        if "Row" not in a.get("type", ""):
+            continue
+        date_str = (a.get("start_date_local") or a.get("start_date") or "")[:10]
+        if not date_str:
+            continue
+        zone_times = a.get("icu_hr_zone_times") or []
+        hi_secs = sum(zone_times[i] for i in range(3, min(7, len(zone_times))))
+        hi_by_date[date_str] += hi_secs / 60
+
+    start = datetime.now() - timedelta(days=days)
+    dates, hil = [], []
+    current = 0.0
+    d = start
+    while d.date() <= datetime.now().date():
+        date_str = d.strftime("%Y-%m-%d")
+        current = current * decay + hi_by_date.get(date_str, 0.0) * accumulate
+        dates.append(d)
+        hil.append(round(current, 2))
+        d += timedelta(days=1)
+
+    return dates, hil
+
+
+MIN_ROWING_VELOCITY = 500 / 180  # 3:00/500m split in m/s — below this with Z1 HR is excluded
+
+
+def fetch_active_zone_times(activity_id, api_key, hr_zones):
+    """Return per-zone seconds, excluding slow + Z1 time (traffic, drifting, spinning).
+
+    A second is excluded only if BOTH conditions hold:
+      - velocity < MIN_ROWING_VELOCITY (slower than 3:00/500m)
+      - HR is in Z1 (not working hard enough to count regardless of speed)
+    This keeps elevated-HR rest periods between pieces (e.g. floating after a 500m).
+    """
+    url = f"{BASE_URL}/activity/{activity_id}/streams"
+    resp = requests.get(url, params={"types": "heartrate,velocity_smooth"},
+                        auth=("API_KEY", api_key), timeout=15)
+    resp.raise_for_status()
+    streams = {s["type"]: s["data"] for s in resp.json()}
+    hr_data = streams.get("heartrate") or []
+    vel_data = streams.get("velocity_smooth") or []
+    if not hr_data or not vel_data:
+        return None
+    boundaries = hr_zones[:-1]  # e.g. [141, 156, 164, 174, 179, 184]
+    zone_times = [0] * 7
+    for hr, vel in zip(hr_data, vel_data):
+        if hr is None or vel is None:
+            continue
+        z = bisect_left(boundaries, hr)
+        if vel < MIN_ROWING_VELOCITY and z == 0:
+            continue  # slow AND Z1 — traffic / drift
+        if z < 7:
+            zone_times[z] += 1
+    return zone_times
+
+
+def fetch_wellness(athlete_id, api_key, days=90):
+    oldest = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    newest = datetime.now().strftime("%Y-%m-%d")
+    url = f"{BASE_URL}/athlete/{athlete_id}/wellness"
+    params = {"oldest": oldest, "newest": newest}
+    resp = requests.get(url, params=params, auth=("API_KEY", api_key), timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fmt_duration(seconds):
+    if not seconds:
+        return "—"
+    h, m = divmod(int(seconds) // 60, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def fmt_distance(meters):
+    if not meters:
+        return "—"
+    km = meters / 1000
+    if km >= 10:
+        return f"{km:.1f} km"
+    return f"{km:.2f} km"
+
+
+def fmt_load(activity):
+    for key in ("icu_training_load", "load", "training_load", "tss"):
+        val = activity.get(key)
+        if val:
+            return str(int(val))
+    return "—"
+
+
+def fmt_zones(zone_times):
+    """zone_times: list of seconds per zone from icu_hr_zone_times (index 0 = Z1)."""
+    if not zone_times:
+        return Text("—", style="dim")
+    parts = [(i + 1, t // 60) for i, t in enumerate(zone_times) if t // 60 > 0]
+    if not parts:
+        return Text("—", style="dim")
+    result = Text()
+    for i, (z, mins) in enumerate(parts):
+        if i > 0:
+            result.append(" ", style="dim")
+        result.append(f"Z{z}:", style="dim")
+        result.append(f"{mins}m", style=ZONE_COLORS.get(z, "white"))
+    return result
+
+
+def fmt_date(date_str):
+    if not date_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.strftime("%a %d %b")
+    except Exception:
+        return date_str[:10]
+
+
+def show_activities(activities, show_zones=False):
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold white",
+        border_style="dim",
+        expand=False,
+    )
+    table.add_column("Date", style="dim", min_width=10)
+    table.add_column("Activity", min_width=20, max_width=35)
+    table.add_column("Type", min_width=8)
+    table.add_column("Duration", justify="right", min_width=8)
+    table.add_column("Distance", justify="right", min_width=9)
+    table.add_column("Load", justify="right", min_width=5)
+    if show_zones:
+        table.add_column("Zones", min_width=18)
+
+    for act in activities:
+        sport = act.get("type", "Workout")
+        color = SPORT_COLORS.get(sport, "white")
+        name = act.get("name") or sport
+        desc = act.get("description")
+        name_cell = Text(name, overflow="ellipsis")
+        if desc:
+            name_cell.append(f"\n{desc}", style="dim")
+        row = [
+            fmt_date(act.get("start_date_local") or act.get("start_date")),
+            name_cell,
+            Text(sport, style=color),
+            fmt_duration(act.get("moving_time") or act.get("elapsed_time")),
+            fmt_distance(act.get("distance")),
+            fmt_load(act),
+        ]
+        if show_zones:
+            row.append(fmt_zones(act.get("icu_hr_zone_times") or []))
+        table.add_row(*row)
+
+    console.print()
+    console.print(table)
+    console.print(f"  [dim]Showing {len(activities)} most recent activities[/]\n")
+
+
+def render_line_chart(series, width=80, height=CHART_HEIGHT):
+    """Render multiple time series using Unicode braille for high resolution.
+
+    Each terminal character cell encodes a 2×4 braille dot grid, giving
+    2× horizontal and 4× vertical resolution vs single-character plotting.
+    Consecutive data points are interpolated so lines appear continuous.
+
+    series: list of (label, color, [float|None])
+    """
+    all_vals = [v for _, _, vals in series for v in vals if v is not None]
+    if not all_vals:
+        console.print("[yellow]No data to chart.[/]")
+        return
+
+    lo = min(all_vals)
+    hi = max(all_vals)
+    span = hi - lo or 1
+    label_width = 5
+
+    dot_cols = width * 2    # horizontal sub-pixels
+    dot_rows = height * 4   # vertical sub-pixels
+
+    grid_bits  = [[0]    * width for _ in range(height)]
+    grid_color = [[None] * width for _ in range(height)]
+
+    def set_dot(dc, display_dr, color):
+        char_row = display_dr // 4
+        dot_row  = display_dr % 4
+        char_col = dc // 2
+        dot_col  = dc % 2
+        if char_row >= height or char_col >= width:
+            return
+        bit = _BDOTS[dot_row][dot_col]
+        existing = grid_color[char_row][char_col]
+        if grid_bits[char_row][char_col] & bit:
+            grid_color[char_row][char_col] = "white"
+        else:
+            grid_bits[char_row][char_col] |= bit
+            grid_color[char_row][char_col] = (
+                color if existing is None else ("white" if existing != color else color)
+            )
+
+    for label, color, vals in series:
+        n = len(vals)
+        if n == 0:
+            continue
+        prev_display_dr = None
+        prev_dc = None
+
+        for dc in range(dot_cols):
+            # Linearly interpolate the value at this dot column position
+            x = dc * (n - 1) / max(dot_cols - 1, 1)
+            xi = int(x)
+            xf = x - xi
+            if xi >= n - 1:
+                v = vals[-1]
+            elif vals[xi] is None or vals[xi + 1] is None:
+                v = vals[xi] if vals[xi] is not None else vals[xi + 1]
+            else:
+                v = vals[xi] * (1 - xf) + vals[xi + 1] * xf
+            if v is None:
+                prev_display_dr = None
+                prev_dc = None
+                continue
+
+            frac = (v - lo) / span
+            dr = int(frac * (dot_rows - 1))
+            display_dr = dot_rows - 1 - dr  # flip: 0 = top of display
+
+            # Fill vertical segment within the same char cell to connect to prev point
+            if prev_display_dr is not None and prev_dc is not None and dc // 2 == prev_dc // 2:
+                for fill_dr in range(min(prev_display_dr, display_dr),
+                                     max(prev_display_dr, display_dr) + 1):
+                    set_dot(dc, fill_dr, color)
+            else:
+                set_dot(dc, display_dr, color)
+
+            prev_display_dr = display_dr
+            prev_dc = dc
+
+    y_step = (hi - lo) / (height - 1) if height > 1 else 0
+    console.print()
+    for r in range(height):
+        tick_val = hi - r * y_step
+        label_str = (f"{tick_val:>{label_width}.0f} │" if r % 4 == 0
+                     else " " * label_width + " │")
+        line = Text(label_str, style="dim")
+        for c in range(width):
+            bits = grid_bits[r][c]
+            col  = grid_color[r][c]
+            line.append(chr(BRAILLE_BASE | bits) if bits else "·",
+                        style=(col or "white") if bits else "dim")
+        console.print(line)
+
+    console.print(Text(" " * label_width + " └" + "─" * width, style="dim"))
+    legend = Text("  " + " " * label_width)
+    for label, color, _ in series:
+        legend.append("● ", style=color)
+        legend.append(f"{label}  ", style="dim")
+    console.print(legend)
+    console.print()
+
+
+def show_fitness(wellness_data, days, activities=None):
+    # Filter to requested range and sort by date
+    cutoff = datetime.now() - timedelta(days=days)
+    entries = []
+    for w in wellness_data:
+        d = w.get("id") or w.get("date")
+        if not d:
+            continue
+        try:
+            dt = datetime.strptime(d[:10], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if dt >= cutoff:
+            entries.append((dt, w))
+    entries.sort(key=lambda x: x[0])
+
+    if not entries:
+        console.print("[yellow]No wellness data found.[/]")
+        return
+
+    # Determine terminal width for chart
+    try:
+        term_width = os.get_terminal_size().columns
+    except OSError:
+        term_width = 80
+    chart_width = min(len(entries), term_width - 10)
+
+    # Downsample if more points than width
+    if len(entries) > chart_width:
+        step = len(entries) / chart_width
+        entries = [entries[int(i * step)] for i in range(chart_width)]
+
+    dates = [dt for dt, _ in entries]
+    ctl = [w.get("ctl") for _, w in entries]
+    atl = [w.get("atl") for _, w in entries]
+    tsb = [w.get("atl") and w.get("ctl") and (w["ctl"] - w["atl"]) for _, w in entries]
+
+    has_ctl = any(v is not None for v in ctl)
+    has_atl = any(v is not None for v in atl)
+    has_tsb = any(v is not None for v in tsb)
+
+    if not has_ctl and not has_atl:
+        console.print("[yellow]No CTL/ATL data available. You may need a power meter or HR monitor.[/]")
+        return
+
+    # Current values from most recent entry with data
+    cur_ctl = next((v for v in reversed(ctl) if v is not None), None)
+    cur_atl = next((v for v in reversed(atl) if v is not None), None)
+    cur_tsb = round(cur_ctl - cur_atl, 1) if cur_ctl and cur_atl else None
+
+    summary_parts = []
+    if cur_ctl is not None:
+        summary_parts.append(f"Fitness [cyan]{cur_ctl:.0f}[/cyan]")
+    if cur_atl is not None:
+        summary_parts.append(f"Fatigue [red]{cur_atl:.0f}[/red]")
+    if cur_tsb is not None:
+        tsb_color = "green" if cur_tsb > 5 else ("red" if cur_tsb < -20 else "yellow")
+        summary_parts.append(f"Form [{tsb_color}]{cur_tsb:+.1f}[/{tsb_color}]")
+    summary_str = "  ·  ".join(summary_parts)
+
+    console.print(f"\n  [bold]Fitness & Form[/] [dim]— last {days} days[/]  {summary_str}")
+
+    series = []
+    if has_ctl:
+        series.append(("Fitness (CTL)", "cyan", ctl))
+    if has_atl:
+        series.append(("Fatigue (ATL)", "red", atl))
+    if has_tsb:
+        series.append(("Form (TSB)", "green", tsb))
+
+    render_line_chart(series, width=len(entries))
+
+    # x-axis date labels
+    label_width = 5
+    n = len(entries)
+    tick_positions = [0, n // 4, n // 2, 3 * n // 4, n - 1]
+    label_line = " " * (label_width + 2)
+    prev_pos = 0
+    for pos in tick_positions:
+        gap = pos - prev_pos
+        label = dates[pos].strftime("%d %b")
+        label_line += " " * max(0, gap - len(label) // 2) + label
+        prev_pos = pos + len(label) - len(label) // 2
+    console.print(Text("  " + label_line, style="dim"))
+    console.print()
+
+    if activities is not None:
+        hil_dates, hil_vals = compute_hi_load(activities, days)
+        if any(v > 0 for v in hil_vals):
+            n_hil = len(hil_vals)
+            hil_chart_width = min(n_hil, chart_width)
+            if n_hil > hil_chart_width:
+                step = n_hil / hil_chart_width
+                hil_plot = [hil_vals[int(i * step)] for i in range(hil_chart_width)]
+                hil_dates_plot = [hil_dates[int(i * step)] for i in range(hil_chart_width)]
+            else:
+                hil_plot = hil_vals
+                hil_dates_plot = hil_dates
+
+            console.print(f"  [bold]High-intensity load[/] [dim]— Z4+ rowing, 14-day decay  (now: {hil_vals[-1]:.1f} min)[/]")
+            render_line_chart([("Hi-intensity (Z4+)", "magenta", hil_plot)], width=len(hil_plot))
+
+            n2 = len(hil_dates_plot)
+            tick_positions2 = [0, n2 // 4, n2 // 2, 3 * n2 // 4, n2 - 1]
+            label_line2 = " " * (label_width + 2)
+            prev_pos2 = 0
+            for pos in tick_positions2:
+                gap = pos - prev_pos2
+                lbl = hil_dates_plot[pos].strftime("%d %b")
+                label_line2 += " " * max(0, gap - len(lbl) // 2) + lbl
+                prev_pos2 = pos + len(lbl) - len(lbl) // 2
+            console.print(Text("  " + label_line2, style="dim"))
+            console.print()
+
+
+def fmt_sleep(secs):
+    if not secs:
+        return "—"
+    h, m = divmod(int(secs) // 60, 60)
+    return f"{h}h {m:02d}m"
+
+
+def trend_symbol(values):
+    """Return ↑ ↓ → based on last 3 non-None values."""
+    vals = [v for v in values if v is not None][-3:]
+    if len(vals) < 2:
+        return ""
+    diff = vals[-1] - vals[0]
+    if diff > 1:
+        return "↑"
+    if diff < -1:
+        return "↓"
+    return "→"
+
+
+def show_health(wellness_data, days=7, activities=None):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    entries = sorted(
+        [w for w in wellness_data if w.get("id") and w["id"] >= cutoff],
+        key=lambda w: w["id"]
+    )
+
+    if not entries:
+        console.print("[yellow]No wellness data found.[/]")
+        return
+
+    today = entries[-1]
+    # Use last 7 entries for trend baselines regardless of range shown
+    recent = entries[-7:]
+
+    # --- Daily table ---
+    table = Table(box=box.ROUNDED, header_style="bold white", border_style="dim", expand=False)
+    table.add_column("Date", style="dim", min_width=10)
+    table.add_column("Sleep", justify="right", min_width=8)
+    table.add_column("Score", justify="right", min_width=6)
+    table.add_column("HRV", justify="right", min_width=5)
+    table.add_column("Rest HR", justify="right", min_width=7)
+    table.add_column("Form", justify="right", min_width=6)
+    table.add_column("Steps", justify="right", min_width=7)
+
+    for w in entries:
+        ctl = w.get("ctl")
+        atl = w.get("atl")
+        tsb = round(ctl - atl, 1) if ctl and atl else None
+        hrv = w.get("hrv")
+        rhr = w.get("restingHR")
+        sleep_score = w.get("sleepScore")
+
+        # Colour form (TSB)
+        if tsb is None:
+            tsb_str = Text("—", style="dim")
+        elif tsb > 5:
+            tsb_str = Text(str(tsb), style="green")
+        elif tsb < -20:
+            tsb_str = Text(str(tsb), style="red")
+        else:
+            tsb_str = Text(str(tsb), style="yellow")
+
+        # Colour sleep score
+        if sleep_score is None:
+            score_str = "—"
+        elif sleep_score >= 80:
+            score_str = Text(str(int(sleep_score)), style="green")
+        elif sleep_score >= 60:
+            score_str = Text(str(int(sleep_score)), style="yellow")
+        else:
+            score_str = Text(str(int(sleep_score)), style="red")
+
+        try:
+            date_fmt = datetime.strptime(w["id"], "%Y-%m-%d").strftime("%a %d %b")
+        except ValueError:
+            date_fmt = w["id"]
+
+        table.add_row(
+            date_fmt,
+            fmt_sleep(w.get("sleepSecs")),
+            score_str,
+            str(int(hrv)) if hrv else "—",
+            str(int(rhr)) if rhr else "—",
+            tsb_str,
+            f"{w.get('steps'):,}" if w.get("steps") else "—",
+        )
+
+    console.print()
+    console.print(table)
+
+    # --- Readiness summary ---
+    ctl = today.get("ctl")
+    atl = today.get("atl")
+    tsb = (ctl - atl) if ctl and atl else None
+    hrv = today.get("hrv")
+    rhr = today.get("restingHR")
+    sleep_score = today.get("sleepScore")
+    sleep_secs = today.get("sleepSecs")
+    ramp = today.get("rampRate")
+
+    # Derive HRV baseline from 7-day average
+    hrv_vals = [w.get("hrv") for w in recent if w.get("hrv")]
+    hrv_baseline = sum(hrv_vals[:-1]) / len(hrv_vals[:-1]) if len(hrv_vals) > 1 else None
+    hrv_delta = (hrv - hrv_baseline) if hrv and hrv_baseline else None
+
+    signals = []
+    verdicts = []
+
+    # Sleep
+    if sleep_score is not None:
+        if sleep_score >= 80:
+            signals.append(("[green]Sleep[/]", f"{fmt_sleep(sleep_secs)}, score {int(sleep_score)} — good recovery"))
+        elif sleep_score >= 60:
+            signals.append(("[yellow]Sleep[/]", f"{fmt_sleep(sleep_secs)}, score {int(sleep_score)} — moderate"))
+            verdicts.append("sleep was average")
+        else:
+            signals.append(("[red]Sleep[/]", f"{fmt_sleep(sleep_secs)}, score {int(sleep_score)} — poor"))
+            verdicts.append("poor sleep last night")
+
+    # HRV
+    if hrv is not None:
+        hrv_note = f"HRV {int(hrv)}"
+        if hrv_delta is not None:
+            if hrv_delta < -5:
+                hrv_note += f" (↓{abs(int(hrv_delta))} vs 7-day avg) — suppressed, suggests fatigue or stress"
+                verdicts.append("HRV is below your recent baseline")
+                signals.append(("[red]HRV[/]", hrv_note))
+            elif hrv_delta > 5:
+                hrv_note += f" (↑{int(hrv_delta)} vs 7-day avg) — elevated, good recovery"
+                signals.append(("[green]HRV[/]", hrv_note))
+            else:
+                hrv_note += f" (≈ 7-day avg) — normal"
+                signals.append(("[green]HRV[/]", hrv_note))
+        else:
+            signals.append(("[dim]HRV[/]", hrv_note))
+
+    # Resting HR
+    rhr_vals = [w.get("restingHR") for w in recent if w.get("restingHR")]
+    if rhr and len(rhr_vals) > 1:
+        rhr_baseline = sum(rhr_vals[:-1]) / len(rhr_vals[:-1])
+        rhr_delta = rhr - rhr_baseline
+        if rhr_delta > 4:
+            signals.append(("[red]Resting HR[/]", f"{int(rhr)} bpm (↑{int(rhr_delta)} vs avg) — elevated, possible fatigue or illness"))
+            verdicts.append("resting HR is elevated")
+        elif rhr_delta < -4:
+            signals.append(("[green]Resting HR[/]", f"{int(rhr)} bpm (↓{abs(int(rhr_delta))} vs avg) — lower than usual, good sign"))
+        else:
+            signals.append(("[green]Resting HR[/]", f"{int(rhr)} bpm — normal"))
+
+    # Training load / form
+    if tsb is not None:
+        ctl_atl_str = f"  (Fitness {ctl:.0f}  ·  Fatigue {atl:.0f})" if ctl and atl else ""
+        if tsb > 10:
+            signals.append(("[green]Form (TSB)[/]", f"{tsb:+.1f} — fresh, good day to train hard{ctl_atl_str}"))
+        elif tsb > -10:
+            signals.append(("[green]Form (TSB)[/]", f"{tsb:+.1f} — balanced, productive training zone{ctl_atl_str}"))
+        elif tsb > -25:
+            signals.append(("[yellow]Form (TSB)[/]", f"{tsb:+.1f} — carrying fatigue, keep intensity moderate{ctl_atl_str}"))
+            verdicts.append("you're carrying significant training load")
+        else:
+            signals.append(("[red]Form (TSB)[/]", f"{tsb:+.1f} — heavily fatigued, consider an easy day or rest{ctl_atl_str}"))
+            verdicts.append("you're heavily loaded — a rest day would help")
+
+    if ramp is not None and abs(ramp) > 5:
+        if ramp > 5:
+            signals.append(("[yellow]Ramp rate[/]", f"+{ramp:.1f} CTL/week — building fast, watch for overreaching"))
+        else:
+            signals.append(("[dim]Ramp rate[/]", f"{ramp:.1f} CTL/week — load coming down"))
+
+    if activities is not None:
+        _, hil_vals = compute_hi_load(activities, 90)
+        current_hil = hil_vals[-1] if hil_vals else 0.0
+        if current_hil >= 10:
+            signals.append(("[green]Hi-intensity load[/]", f"{current_hil:.1f} min — good lactate fitness"))
+        elif current_hil >= 4:
+            signals.append(("[yellow]Hi-intensity load[/]", f"{current_hil:.1f} min — moderate, lactate fitness building or decaying"))
+        else:
+            signals.append(("[red]Hi-intensity load[/]", f"{current_hil:.1f} min — low, anaerobic fitness has decayed"))
+            verdicts.append("high-intensity rowing load is low — expect lactate to limit hard efforts")
+
+    console.print("  [bold]Today's readiness[/]\n")
+    for label, note in signals:
+        console.print(f"    {label}  [dim]{note}[/]", highlight=False)
+
+    if verdicts:
+        console.print(f"\n  [bold yellow]Suggestion:[/] [dim]{'; '.join(verdicts).capitalize()}. Consider an easier session or extra recovery today.[/]")
+    else:
+        console.print(f"\n  [bold green]Suggestion:[/] [dim]Signals look good — you should be ready to train well today.[/]")
+
+    console.print()
+
+
+ZONE_LABELS = {
+    1: "Active recovery",
+    2: "Aerobic",
+    3: "Tempo",
+    4: "Threshold",
+    5: "VO2max",
+    6: "Anaerobic",
+    7: "Neuromuscular",
+}
+
+
+def show_week(activities, week_start, active_zones=None):
+    rowing = [a for a in activities if "Row" in a.get("type", "")]
+
+    if not rowing:
+        console.print("\n  [yellow]No rowing sessions this week.[/]\n")
+        return
+
+    total_zone_times = [0] * 7
+    total_dist = 0
+    total_elapsed = 0
+    hr_zones = None
+    for a in rowing:
+        total_dist += a.get("distance") or 0
+        total_elapsed += a.get("moving_time") or a.get("elapsed_time") or 0
+        if hr_zones is None:
+            hr_zones = a.get("icu_hr_zones")
+        act_zones = (active_zones or {}).get(a["id"]) or a.get("icu_hr_zone_times") or []
+        for i, t in enumerate(act_zones[:7]):
+            total_zone_times[i] += t
+
+    total_active = sum(total_zone_times)
+    zone_total = total_active or 1
+    traffic_secs = total_elapsed - total_active
+
+    console.print(
+        f"\n  [bold]Week of {week_start.strftime('%a %d %b')}[/]  "
+        f"[dim]{len(rowing)} rowing sessions · "
+        f"{fmt_duration(total_elapsed)} elapsed · "
+        f"{fmt_distance(total_dist)}[/]"
+    )
+    if active_zones and traffic_secs > 0:
+        console.print(
+            f"  [dim]Active rowing: {fmt_duration(total_active)}  "
+            f"({fmt_duration(traffic_secs)} excluded — slow + Z1 HR)[/]"
+        )
+
+    # Per-session list
+    console.print()
+    for a in rowing:
+        date = fmt_date(a.get("start_date_local") or a.get("start_date"))
+        elapsed = a.get("moving_time") or a.get("elapsed_time") or 0
+        dist = fmt_distance(a.get("distance"))
+        act_z = (active_zones or {}).get(a["id"]) or a.get("icu_hr_zone_times") or []
+        act_secs = sum(act_z)
+        if active_zones and a["id"] in active_zones:
+            dur_str = f"{fmt_duration(act_secs)} active / {fmt_duration(elapsed)}"
+        else:
+            dur_str = fmt_duration(elapsed)
+        line = Text(f"    {date}  ", style="dim")
+        line.append(f"{dur_str}  {dist}  ", style="dim")
+        line.append_text(fmt_zones(act_z))
+        console.print(line)
+
+    # Zone distribution bar chart
+    console.print()
+    console.print("  [bold]Zone distribution[/]  ", end="")
+    if active_zones:
+        console.print("[dim](active rowing only)[/]")
+    else:
+        console.print()
+    if hr_zones:
+        bounds = [f"<{hr_zones[0]}"] + [f"{hr_zones[i]}–{hr_zones[i+1]}" for i in range(len(hr_zones)-1)]
+    console.print()
+
+    BAR_WIDTH = 36
+    for i, t in enumerate(total_zone_times):
+        z = i + 1
+        mins = t // 60
+        if mins == 0 and z > max((j+1 for j, s in enumerate(total_zone_times) if s > 0), default=4):
+            continue
+        pct = 100 * t / zone_total
+        bar_len = int(pct / 100 * BAR_WIDTH)
+        color = ZONE_COLORS.get(z, "white")
+        label = ZONE_LABELS.get(z, f"Zone {z}")
+        bound_str = f"  {bounds[i]}" if hr_zones and i < len(bounds) else ""
+        line = Text(f"  Z{z}  ")
+        line.append(f"{'█' * bar_len:<{BAR_WIDTH}}", style=color)
+        line.append(f"  {pct:3.0f}%  {mins:3d}m  ", style="dim")
+        line.append(label, style="dim italic")
+        line.append(bound_str, style="dim")
+        console.print(line)
+
+    # Evaluation
+    hi_time = sum(total_zone_times[i] for i in range(3, 7))
+    hi_pct = 100 * hi_time / zone_total
+    hi_mins = hi_time // 60
+
+    console.print()
+    console.print("  [bold]Evaluation[/]")
+    console.print()
+
+    hours = total_active / 3600
+    if hours < 3:
+        console.print(f"  [yellow]Volume:[/]    [dim]Light week ({fmt_duration(total_active)} active rowing).[/]")
+    elif hours < 6:
+        console.print(f"  [green]Volume:[/]    [dim]Moderate week ({fmt_duration(total_active)} active rowing).[/]")
+    else:
+        console.print(f"  [green]Volume:[/]    [dim]Good volume ({fmt_duration(total_active)} active rowing across {len(rowing)} sessions).[/]")
+
+    pad = " " * len("  Intensity: ")
+    if hi_pct < 2:
+        console.print(f"  [red]Intensity:[/] [dim]Almost none — only {hi_mins}m above Z3 ({hi_pct:.0f}% of zone time).[/]")
+        console.print(f"  [dim]{pad}All aerobic base work. Add 1–2 sessions with race-pace intervals[/]")
+        console.print(f"  [dim]{pad}(e.g. 8×500m at 1:35–1:36).[/]")
+    elif hi_pct < 10:
+        console.print(f"  [yellow]Intensity:[/] [dim]{hi_mins}m above Z3 ({hi_pct:.0f}%).[/]")
+        console.print(f"  [dim]{pad}Some intensity, but below a healthy polarized target of ~15–20%.[/]")
+    elif hi_pct <= 25:
+        console.print(f"  [green]Intensity:[/] [dim]{hi_mins}m above Z3 ({hi_pct:.0f}%) — good polarized balance.[/]")
+    else:
+        console.print(f"  [yellow]Intensity:[/] [dim]{hi_mins}m above Z3 ({hi_pct:.0f}%).[/]")
+        console.print(f"  [dim]{pad}High intensity load — monitor recovery closely.[/]")
+
+    console.print()
+
+
+def main():
+    if "--setup" in sys.argv or "setup" in sys.argv:
+        setup()
+        return
+
+    health_mode = "health" in sys.argv or "-h" in sys.argv or "--health" in sys.argv
+    fitness_mode = "fitness" in sys.argv or "-f" in sys.argv or "--fitness" in sys.argv
+    zones_mode = "zones" in sys.argv or "-z" in sys.argv or "--zones" in sys.argv
+    week_mode = "week" in sys.argv or "-w" in sys.argv or "--week" in sys.argv
+
+    count = 15
+    days = 7 if health_mode else 90
+    for arg in sys.argv[1:]:
+        if arg.isdigit():
+            if fitness_mode or health_mode:
+                days = int(arg)
+            else:
+                count = int(arg)
+
+    config = load_config()
+    athlete_id = config["athlete_id"]
+    api_key = config["api_key"]
+
+    if week_mode:
+        today = datetime.now()
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+        with console.status("[dim]Fetching week data...[/]"):
+            try:
+                activities = fetch_activities_range(athlete_id, api_key, week_start, week_end)
+            except requests.HTTPError as e:
+                console.print(f"[red]API error:[/] {e}")
+                sys.exit(1)
+            except requests.ConnectionError:
+                console.print("[red]Connection failed.[/]")
+                sys.exit(1)
+        rowing = [a for a in activities if "Row" in a.get("type", "")]
+        active_zones = {}
+        if rowing:
+            with console.status("[dim]Fetching stream data...[/]"):
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {
+                        executor.submit(
+                            fetch_active_zone_times, a["id"], api_key,
+                            a.get("icu_hr_zones") or []
+                        ): a["id"]
+                        for a in rowing if a.get("icu_hr_zones")
+                    }
+                    for future in as_completed(futures):
+                        act_id = futures[future]
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                active_zones[act_id] = result
+                        except Exception:
+                            pass
+        show_week(activities, week_start, active_zones or None)
+        return
+
+    if health_mode:
+        with console.status("[dim]Fetching wellness & activity data...[/]"):
+            try:
+                wellness = fetch_wellness(athlete_id, api_key, days)
+                act_oldest = datetime.now() - timedelta(days=104)  # 90 + 14-day decay warm-up
+                activities = fetch_activities_range(athlete_id, api_key, act_oldest, datetime.now())
+            except requests.HTTPError as e:
+                console.print(f"[red]API error:[/] {e}")
+                sys.exit(1)
+            except requests.ConnectionError:
+                console.print("[red]Connection failed.[/]")
+                sys.exit(1)
+        show_health(wellness, days, activities)
+        return
+
+    if fitness_mode:
+        with console.status("[dim]Fetching wellness & activity data...[/]"):
+            try:
+                wellness = fetch_wellness(athlete_id, api_key, days)
+                act_oldest = datetime.now() - timedelta(days=max(days, 90) + 14)
+                activities = fetch_activities_range(athlete_id, api_key, act_oldest, datetime.now())
+            except requests.HTTPError as e:
+                console.print(f"[red]API error:[/] {e}")
+                sys.exit(1)
+            except requests.ConnectionError:
+                console.print("[red]Connection failed.[/]")
+                sys.exit(1)
+        show_fitness(wellness, days, activities)
+    else:
+        with console.status("[dim]Fetching activities...[/]"):
+            try:
+                activities = fetch_activities(athlete_id, api_key, count)
+            except requests.HTTPError as e:
+                console.print(f"[red]API error:[/] {e}")
+                sys.exit(1)
+            except requests.ConnectionError:
+                console.print("[red]Connection failed.[/] Check your internet connection.")
+                sys.exit(1)
+
+        if not activities:
+            console.print("[yellow]No activities found in the last 90 days.[/]")
+            return
+
+        if zones_mode:
+            show_activities(activities, show_zones=True)
+        else:
+            show_activities(activities)
+
+
+if __name__ == "__main__":
+    main()

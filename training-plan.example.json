@@ -1,0 +1,23 @@
+{
+  "projection_weeks": 1,
+  "sessions": [
+    {
+      "date": "2026-05-20",
+      "name": "outing 17km rate work",
+      "tss": 75,
+      "z4_mins": 8
+    },
+    {
+      "date": "2026-05-21",
+      "name": "UT2 erg",
+      "tss": 40,
+      "z4_mins": 0
+    },
+    {
+      "date": "2026-05-22",
+      "name": "hard erg",
+      "tss": 90,
+      "z4_mins": 15
+    }
+  ]
+}

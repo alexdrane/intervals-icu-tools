@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+config.json
+training-plan.json
+food-log.json
+stretch-log.json
