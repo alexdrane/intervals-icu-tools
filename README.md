@@ -1,6 +1,7 @@
 # intervals-icu-tools
 
-Two tools for [intervals.icu](https://intervals.icu) that give you a terminal CLI and a GTK morning dashboard for your training data.
+Two tools for [intervals.icu](https://intervals.icu) that give you a terminal CLI and a GTK morning dashboard for your training data for linux
+
 
 ---
 
