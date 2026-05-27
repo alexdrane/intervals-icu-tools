@@ -10,12 +10,13 @@ import sys
 import time
 import threading
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import Gtk, WebKit2, GLib
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, WebKit2, GLib, GdkPixbuf
 
 import requests
 
@@ -370,11 +371,11 @@ def compute_hi_load_projection(activities, training_plan, tau=14):
     return proj_dates, proj_hil
 
 
-def compute_projections(wellness_entries, training_plan):
+def compute_projections(wellness_entries, training_plan, sigma_tss=35.0):
     entries = sorted([w for w in wellness_entries if w.get("ctl") and w.get("atl")],
                      key=lambda w: w["id"])
     if not entries:
-        return [], [], [], []
+        return [], [], [], [], [], [], []
 
     last      = entries[-1]
     last_date = last["id"]
@@ -393,10 +394,26 @@ def compute_projections(wellness_entries, training_plan):
     for s in training_plan.get("sessions", []):
         tss_by_date[s["date"]] += s.get("tss", 0)
 
-    proj_dates = [last_date]
-    proj_ctl   = [round(ctl, 1)]
-    proj_atl   = [round(atl, 1)]
-    proj_tsb   = [round(ctl - atl, 1)]
+    # If the last wellness entry is from today, apply today's planned sessions
+    # (which haven't been uploaded yet but will happen later in the day).
+    today_str = today.strftime("%Y-%m-%d")
+    if last_date == today_str:
+        today_tss = tss_by_date.get(today_str, 0)
+        ctl = ctl * ctl_decay + today_tss * ctl_acc
+        atl = atl * atl_decay + today_tss * atl_acc
+
+    proj_dates    = [last_date]
+    proj_ctl      = [round(ctl, 1)]
+    proj_atl      = [round(atl, 1)]
+    proj_tsb      = [round(ctl - atl, 1)]
+    proj_ctl_sig  = [0.0]
+    proj_atl_sig  = [0.0]
+    proj_tsb_sig  = [0.0]
+
+    # Uncertainty propagation: Var_n = Var_{n-1} * decay² + (acc * sigma_tss)²
+    # TSB = CTL - ATL; treat as independent (slightly conservative)
+    var_ctl = 0.0
+    var_atl = 0.0
 
     d = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
     while d.date() <= end_date:
@@ -404,12 +421,17 @@ def compute_projections(wellness_entries, training_plan):
         tss = tss_by_date.get(date_str, 0)
         ctl = ctl * ctl_decay + tss * ctl_acc
         atl = atl * atl_decay + tss * atl_acc
+        var_ctl = var_ctl * ctl_decay**2 + (ctl_acc * sigma_tss)**2
+        var_atl = var_atl * atl_decay**2 + (atl_acc * sigma_tss)**2
         proj_dates.append(date_str)
         proj_ctl.append(round(ctl, 1))
         proj_atl.append(round(atl, 1))
         proj_tsb.append(round(ctl - atl, 1))
+        proj_ctl_sig.append(round(math.sqrt(var_ctl), 1))
+        proj_atl_sig.append(round(math.sqrt(var_atl), 1))
+        proj_tsb_sig.append(round(math.sqrt(var_ctl + var_atl), 1))
         d += timedelta(days=1)
-    return proj_dates, proj_ctl, proj_atl, proj_tsb
+    return proj_dates, proj_ctl, proj_atl, proj_tsb, proj_ctl_sig, proj_atl_sig, proj_tsb_sig
 
 
 def compute_sleep_balance(wellness_entries, target_hours=8.0, tau=5):
@@ -424,6 +446,101 @@ def compute_sleep_balance(wellness_entries, target_hours=8.0, tau=5):
         dates.append(w["id"])
         vals.append(round(current, 2))
     return dates, vals
+
+
+def compute_sleep_projections(entries, proj_days=14, target_hours=8.0, tau=5):
+    """Project sleep debt EMA forward under three scenarios.
+
+    Returns (dates, best, medium, trend, avg_sleep_hrs) where dates[0] is today
+    (the anchor, equal to the last historical EMA value) and dates[1..] are future.
+    best   = 9.5h/night,  medium = 8.5h/night,  trend = recent 7-day average.
+    """
+    sorted_entries = sorted([w for w in entries if w.get("id")], key=lambda w: w["id"])
+    decay = math.exp(-1 / tau)
+    target_secs = target_hours * 3600
+
+    current = 0.0
+    for w in sorted_entries:
+        daily = (w["sleepSecs"] - target_secs) / 3600 if w.get("sleepSecs") else 0.0
+        current = current * decay + daily * (1 - decay)
+
+    recent = [w for w in sorted_entries[-7:] if w.get("sleepSecs")]
+    avg_sleep = sum(w["sleepSecs"] for w in recent) / len(recent) / 3600 if recent else target_hours
+
+    today = date.today()
+    dates = [today.isoformat()]
+    best_vals  = [round(current, 2)]
+    med_vals   = [round(current, 2)]
+    trend_vals = [round(current, 2)]
+
+    b, m, t = current, current, current
+    for i in range(1, proj_days + 1):
+        b = b * decay + (9.5  - target_hours) * (1 - decay)
+        m = m * decay + (8.5  - target_hours) * (1 - decay)
+        t = t * decay + (avg_sleep - target_hours) * (1 - decay)
+        dates.append((today + timedelta(days=i)).isoformat())
+        best_vals.append(round(b, 2))
+        med_vals.append(round(m, 2))
+        trend_vals.append(round(t, 2))
+
+    return dates, best_vals, med_vals, trend_vals, round(avg_sleep, 1)
+
+
+def sleep_debt_clearance(current_debt, tau=5, target_hours=8.0, threshold=0.1,
+                         next_exam_days=None):
+    """Return (value_str, sub_str, color, tip_str) for a sleep-clearance recommendation stat.
+
+    Uses the same EMA model as compute_sleep_balance.  current_debt is the most
+    recent EMA value (negative = in debt, positive = surplus).
+    next_exam_days: if provided, adds a line showing required h/night to clear by that date.
+    """
+    if current_debt >= -threshold:
+        return "Clear", "no active debt", "#4ade80", "Sleep debt EMA is at or above zero — no recovery needed."
+
+    decay = math.exp(-1 / tau)
+    debt = abs(current_debt)
+
+    # At target (8h/night): daily contribution = 0, pure EMA decay
+    # d_n = d_0 * decay^n < threshold  =>  n = tau * ln(debt / threshold)
+    days_at_target = math.ceil(tau * math.log(debt / threshold))
+
+    # Extra hours above target to clear in exactly N nights
+    # Solve: 0 = -debt * decay^n + extra * (1 - decay^n)  =>  extra = debt * decay^n / (1 - decay^n)
+    def extra_to_clear(n_nights):
+        dn = decay ** n_nights
+        return debt * dn / (1 - dn)
+
+    extra_7  = extra_to_clear(7)
+    extra_14 = extra_to_clear(14)
+
+    color = "#f87171" if debt > 1.0 else "#fbbf24"
+    value_str = f"~{days_at_target} nights at {target_hours:.0f}h"
+
+    lines = [
+        f"clear in 7n → {target_hours + extra_7:.1f}h/night",
+        f"14n → {target_hours + extra_14:.1f}h/night",
+    ]
+    tip_lines = [
+        f"EMA debt: {current_debt:.2f}h (τ={tau}d model, {target_hours:.0f}h target).",
+        f"At {target_hours:.0f}h/night (target): clears in ~{days_at_target} nights.",
+        f"To clear in 7 nights: {target_hours + extra_7:.1f}h/night.",
+        f"To clear in 14 nights: {target_hours + extra_14:.1f}h/night.",
+    ]
+
+    if next_exam_days is not None and 1 <= next_exam_days <= 30:
+        extra_exam = extra_to_clear(next_exam_days)
+        needed = target_hours + extra_exam
+        needed_capped = min(needed, 12.0)
+        lines.insert(0, f"by exam ({next_exam_days}n) → {needed_capped:.1f}h/night")
+        tip_lines.append(
+            f"To clear before exam in {next_exam_days} nights: {needed_capped:.1f}h/night"
+            + (" (capped at 12h)" if needed > 12.0 else "") + "."
+        )
+        tip_lines.append("These figures account for the exponential carry-over of the model.")
+
+    sub_str = "  ·  ".join(lines)
+    tip_str = "  ".join(tip_lines)
+    return value_str, sub_str, color, tip_str
 
 
 # ── Gemini coach brief ───────────────────────────────────────────────────────
@@ -862,6 +979,22 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     else:
         debt_tip = None
 
+    # Sleep clearance recommendation (uses EMA model, same τ=5 as chart)
+    _slp_dates, _slp_vals = compute_sleep_balance(entries)
+    current_sleep_debt = _slp_vals[-1] if _slp_vals else 0.0
+    _today = date.today()
+    _key_dates = training_plan.get("key_dates", []) if training_plan else []
+    _next_exam_days = None
+    for kd in sorted(_key_dates, key=lambda x: x.get("date", "")):
+        kd_date = datetime.strptime(kd["date"], "%Y-%m-%d").date()
+        delta = (kd_date - _today).days
+        if 1 <= delta <= 30:
+            _next_exam_days = delta
+            break
+    clearance_val, clearance_sub, clearance_color, clearance_tip = sleep_debt_clearance(
+        current_sleep_debt, next_exam_days=_next_exam_days)
+    clearance_stat = _stat("Sleep Clearance", clearance_val, clearance_color, clearance_sub, tip=clearance_tip)
+
     # ── Nutrition section ─────────────────────────────────────────────────────
     protein_target_g = 150
     carbs_target_g   = round(kcal_total * 0.55 / 4)
@@ -1034,6 +1167,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
               tip=sleep_tip),
         '<hr class="div">',
         _stat("Sleep Avg (14d)", debt_str, debt_color, "avg vs 8h/night target", tip=debt_tip),
+        clearance_stat,
         '<hr class="div">',
         kcal_stat,
         nutr_html,
@@ -1055,7 +1189,10 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     hil_dates, hil_vals           = compute_hi_load_series(activities)
     proj_hil_dates, proj_hil_vals = compute_hi_load_projection(activities, training_plan)
     sleep_dates, sleep_balance    = compute_sleep_balance(entries)
-    proj_dates, proj_ctl, proj_atl, proj_tsb = compute_projections(entries, training_plan)
+    proj_dates, proj_ctl, proj_atl, proj_tsb, proj_ctl_sig, proj_atl_sig, proj_tsb_sig = \
+        compute_projections(entries, training_plan)
+    slp_proj_dates, slp_proj_best, slp_proj_med, slp_proj_trend, slp_avg = \
+        compute_sleep_projections(entries)
 
     plan_sessions = [{"date": s["date"], "name": s.get("name", ""), "tss": s.get("tss", 0)}
                      for s in training_plan.get("sessions", [])]
@@ -1074,7 +1211,11 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         "hilDates": hil_dates, "hil": hil_vals,
         "projHilDates": proj_hil_dates, "projHil": proj_hil_vals,
         "sleepDates": sleep_dates, "sleepBalance": sleep_balance,
+        "slpProjDates": slp_proj_dates, "slpProjBest": slp_proj_best,
+        "slpProjMed": slp_proj_med, "slpProjTrend": slp_proj_trend,
+        "slpAvg": slp_avg,
         "projDates": proj_dates, "projCtl": proj_ctl, "projAtl": proj_atl, "projTsb": proj_tsb,
+        "projCtlSig": proj_ctl_sig, "projAtlSig": proj_atl_sig, "projTsbSig": proj_tsb_sig,
         "planSessions": plan_sessions,
         "calHistDates": cal_hist_dates, "calHistConsumed": cal_hist_consumed,
         "calHistTarget": cal_hist_target,
@@ -1202,7 +1343,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
         <div class="chart-wrap" id="w-wt"><canvas id="c-wt"></canvas></div>
       </div>
       <div class="chart-cell wide">
-        <div class="chart-label">Sleep Debt — exp. weighted τ=5d vs 8h/night</div>
+        <div class="chart-label">Sleep Debt — exp. weighted τ=5d vs 8h/night · <span style="color:#4ade80">─</span> 9.5h  <span style="color:#fbbf24">─</span> 8.5h  <span style="color:#f87171">─</span> trend</div>
         <div class="chart-wrap" id="w-slp"><canvas id="c-slp"></canvas></div>
       </div>
     </div>
@@ -1319,12 +1460,27 @@ function tsbZoneColor(v,a) {{
   return `rgba(239,68,68,${{al}})`;
 }}
 
+// ── Projection band helper ────────────────────────────────────────────────────
+function drawProjBand(ctx, xOf, yOf, mid, sigma, fillStyle) {{
+  if (!mid.length || !sigma.length) return;
+  ctx.fillStyle = fillStyle;
+  ctx.beginPath();
+  ctx.moveTo(xOf(0), yOf(mid[0] + sigma[0]));
+  for (let i=1; i<mid.length; i++) ctx.lineTo(xOf(i), yOf(mid[i]+sigma[i]));
+  for (let i=mid.length-1; i>=0; i--) ctx.lineTo(xOf(i), yOf(mid[i]-sigma[i]));
+  ctx.closePath(); ctx.fill();
+}}
+
 // ── CTL/ATL ──────────────────────────────────────────────────────────────────
 function drawCtl() {{
   const {{ctx,W,H}}=setupCanvas('c-ctl','w-ctl');
   const PAD={{top:6,right:10,bottom:22,left:36}};
   const [dates,ctl,atl]=sliceByDays(DATA.dates,DATA.ctl,DATA.atl);
-  const allVals=[...ctl,...atl].filter(v=>v!=null);
+  const sigCtl=DATA.projCtlSig, sigAtl=DATA.projAtlSig;
+  const allVals=[...ctl,...atl,
+    ...DATA.projCtl.map((v,i)=>v+sigCtl[i]), ...DATA.projCtl.map((v,i)=>v-sigCtl[i]),
+    ...DATA.projAtl.map((v,i)=>v+sigAtl[i]), ...DATA.projAtl.map((v,i)=>v-sigAtl[i]),
+  ].filter(v=>v!=null);
   if(!allVals.length) return;
   const lo=Math.min(...allVals)*0.95, hi=Math.max(...allVals)*1.05;
   const fullDates=[...dates,...DATA.projDates.filter(d=>d>dates[dates.length-1])];
@@ -1332,14 +1488,18 @@ function drawCtl() {{
   const cW=W-PAD.left-PAD.right, nHist=dates.length;
   const xOf=i=>PAD.left+(i/Math.max(fullDates.length-1,1))*cW;
   drawTodayLine(ctx,xOf(nHist-1),PAD,H);
+  drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projCtl,sigCtl,'rgba(34,211,238,.18)');
+  drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projAtl,sigAtl,'rgba(248,113,113,.18)');
   plotSeries(ctx,i=>xOf(i),yOf,ctl,'#22d3ee',1.8);
   plotSeries(ctx,i=>xOf(i),yOf,atl,'#f87171',1.8);
   plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projCtl,'#22d3ee',1.2,true);
   plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projAtl,'#f87171',1.2,true);
   const ctlTip=[...ctl,...DATA.projCtl.slice(1)], atlTip=[...atl,...DATA.projAtl.slice(1)];
+  const ctlSigTip=[...ctl.map(()=>null),...sigCtl.slice(1)];
+  const atlSigTip=[...atl.map(()=>null),...sigAtl.slice(1)];
   CHART_META['c-ctl']={{dates:fullDates,PAD,yOf,series:[
-    {{label:'CTL',data:ctlTip,color:'#22d3ee',fmt:v=>Math.round(v)+''}},
-    {{label:'ATL',data:atlTip,color:'#f87171',fmt:v=>Math.round(v)+''}},
+    {{label:'CTL',data:ctlTip,sigmaData:ctlSigTip,color:'#22d3ee',fmt:v=>Math.round(v)+''}},
+    {{label:'ATL',data:atlTip,sigmaData:atlSigTip,color:'#f87171',fmt:v=>Math.round(v)+''}},
   ]}};
 }}
 
@@ -1349,8 +1509,11 @@ function drawTsb() {{
   const PAD={{top:6,right:10,bottom:22,left:36}};
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const [dates,tsb]=sliceByDays(DATA.dates,DATA.tsb);
+  const sigTsb=DATA.projTsbSig;
   const fullDates=[...dates,...DATA.projDates.filter(d=>d>dates[dates.length-1])];
-  const allVals=[...tsb,...DATA.projTsb].filter(v=>v!=null);
+  const allVals=[...tsb,
+    ...DATA.projTsb.map((v,i)=>v+sigTsb[i]), ...DATA.projTsb.map((v,i)=>v-sigTsb[i]),
+  ].filter(v=>v!=null);
   if(!allVals.length) return;
   const lo=Math.min(...allVals,-5)*1.1, hi=Math.max(...allVals,5)*1.1, span=hi-lo;
   const yOf=v=>PAD.top+(1-(v-lo)/span)*cH;
@@ -1374,14 +1537,16 @@ function drawTsb() {{
     ctx.bezierCurveTo(p1.x+(p2.x-p0.x)/6,p1.y+(p2.y-p0.y)/6,p2.x-(p3.x-p1.x)/6,p2.y-(p3.y-p1.y)/6,p2.x,p2.y);
     ctx.stroke();
   }}
+  drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projTsb,sigTsb,'rgba(148,163,184,.22)');
   plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projTsb,'#94a3b8',1.2,true);
   for(const s of DATA.planSessions) {{
     const di=fullDates.indexOf(s.date); if(di<0) continue;
     ctx.fillStyle='#fbbf24'; ctx.beginPath(); ctx.arc(xOf(di),PAD.top+6,3,0,Math.PI*2); ctx.fill();
   }}
   const tsbTip=[...tsb,...DATA.projTsb.slice(1)];
+  const tsbSigTip=[...tsb.map(()=>null),...sigTsb.slice(1)];
   CHART_META['c-tsb']={{dates:fullDates,PAD,yOf,series:[
-    {{label:'Form',data:tsbTip,colorFn:tsbZoneColor,fmt:v=>(v>=0?'+':'')+v.toFixed(1)}},
+    {{label:'Form',data:tsbTip,sigmaData:tsbSigTip,colorFn:tsbZoneColor,fmt:v=>(v>=0?'+':'')+v.toFixed(1)}},
   ]}};
 }}
 
@@ -1441,12 +1606,24 @@ function drawSleep() {{
   const cutoff=new Date(Date.now()-currentDays*86400000).toISOString().slice(0,10);
   let idx=DATA.sleepDates.findIndex(d=>d>=cutoff); if(idx<0) idx=0;
   const dates=DATA.sleepDates.slice(idx), bal=DATA.sleepBalance.slice(idx);
-  const allVals=bal.filter(v=>v!=null); if(!allVals.length) return;
-  const lo=Math.min(...allVals,-0.5)*1.1, hi=Math.max(...allVals,0.3)*1.1, span=hi-lo;
+
+  // Merge historical + projection date axis
+  const projDates=DATA.slpProjDates.filter(d=>d>dates[dates.length-1]);
+  const fullDates=[...dates,...projDates];
+
+  const allVals=[...bal,...DATA.slpProjBest,...DATA.slpProjMed,...DATA.slpProjTrend]
+    .filter(v=>v!=null);
+  if(!allVals.length) return;
+  const lo=Math.min(...allVals,-0.5)*1.15, hi=Math.max(...allVals,0.3)*1.15, span=hi-lo;
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const yOf=v=>PAD.top+(1-(v-lo)/span)*cH;
-  const xOf=i=>PAD.left+(i/Math.max(dates.length-1,1))*cW;
-  chartAxes(ctx,W,H,lo,hi,3,PAD,dates);
+  const xOf=i=>PAD.left+(i/Math.max(fullDates.length-1,1))*cW;
+  const nHist=dates.length;
+
+  chartAxes(ctx,W,H,lo,hi,3,PAD,fullDates);
+  drawTodayLine(ctx,xOf(nHist-1),PAD,H);
+
+  // Historical fill
   for(let i=0;i<bal.length-1;i++) {{
     const v0=bal[i],v1=bal[i+1]; if(v0==null||v1==null) continue;
     ctx.fillStyle=((v0+v1)/2>=0)?'rgba(74,222,128,.18)':'rgba(239,68,68,.18)';
@@ -1454,11 +1631,26 @@ function drawSleep() {{
     ctx.moveTo(xOf(i),yOf(0)); ctx.lineTo(xOf(i),yOf(v0)); ctx.lineTo(xOf(i+1),yOf(v1)); ctx.lineTo(xOf(i+1),yOf(0));
     ctx.closePath(); ctx.fill();
   }}
+
+  // Historical line
   const pts=bal.map((v,i)=>v!=null?{{x:xOf(i),y:yOf(v)}}:null).filter(Boolean);
   ctx.strokeStyle='#67e8f9'; ctx.lineWidth=1.5; ctx.lineJoin='round';
   ctx.beginPath(); drawSmooth(ctx,pts); ctx.stroke();
-  CHART_META['c-slp']={{dates,PAD,yOf,series:[
-    {{label:'Sleep debt',data:bal,color:'#67e8f9',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+
+  // Projection lines (dashed), anchored at today (nHist-1)
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjBest, '#4ade80',1.2,true);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjMed,  '#fbbf24',1.2,true);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjTrend,'#f87171',1.2,true);
+
+  // Tooltip data: history + best-case projection for hover
+  const balTip=[...bal,...DATA.slpProjBest.slice(1)];
+  const medTip=[...bal.map(()=>null),...DATA.slpProjMed.slice(1)];
+  const trendTip=[...bal.map(()=>null),...DATA.slpProjTrend.slice(1)];
+  CHART_META['c-slp']={{dates:fullDates,PAD,yOf,series:[
+    {{label:'Sleep debt',  data:balTip,   color:'#67e8f9',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Best (9.5h)', data:[...bal.map(()=>null),...DATA.slpProjBest.slice(1)],  color:'#4ade80',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Med (8.5h)',  data:medTip,   color:'#fbbf24',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Trend (' + DATA.slpAvg + 'h)',data:trendTip,color:'#f87171',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
   ]}};
 }}
 
@@ -1497,9 +1689,10 @@ function addHoverToChart(cid, wid) {{
     for(const s of series) {{
       const v=s.data[idx]; if(v==null) continue;
       const col=s.colorFn?s.colorFn(v):s.color;
+      const sigV=s.sigmaData?s.sigmaData[idx]:null;
       html+=`<div style="display:flex;justify-content:space-between;gap:14px;margin-bottom:1px">
         <span style="color:${{col}}">${{s.label}}</span>
-        <span style="color:#e2e8f0;font-weight:600">${{s.fmt?s.fmt(v):v.toFixed(1)}}</span></div>`;
+        <span style="color:#e2e8f0;font-weight:600">${{s.fmt?s.fmt(v):v.toFixed(1)}}${{sigV!=null?' <span style="color:#64748b;font-size:10px;font-weight:400">\xb1'+sigV.toFixed(1)+'</span>':''}}</span></div>`;
     }}
     tooltip.innerHTML=html; tooltip.style.display='block';
     let tx=e.clientX+16; if(tx+160>window.innerWidth) tx=e.clientX-175;
@@ -1754,6 +1947,9 @@ function triggerRefresh() {{
 
 # ── GTK window ───────────────────────────────────────────────────────────────
 
+_ICON_PATH = os.path.expanduser("~/.local/share/icons/training-brief.svg")
+
+
 class BriefWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="Morning Brief")
@@ -1761,6 +1957,11 @@ class BriefWindow(Gtk.Window):
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(True)
         self.connect("destroy", Gtk.main_quit)
+        if os.path.exists(_ICON_PATH):
+            try:
+                self.set_icon(GdkPixbuf.Pixbuf.new_from_file(_ICON_PATH))
+            except Exception:
+                pass
 
         self.wv = WebKit2.WebView()
         self.wv.get_settings().set_enable_javascript(True)
