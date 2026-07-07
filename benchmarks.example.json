@@ -1,0 +1,12 @@
+{
+  "metrics": {
+    "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#a78bfa"},
+    "row_2k":     {"label": "2k row", "target": 420, "unit": "s", "color": "#f59e0b", "lower_is_better": true},
+    "bodyweight": {"label": "Body weight", "target": 80, "unit": "kg", "color": "#94a3b8"}
+  },
+  "radar_axes": [
+    {"label": "Strength",  "keys": ["back_squat"]},
+    {"label": "Endurance", "keys": ["row_2k"]},
+    {"label": "Body",      "keys": ["bodyweight"]}
+  ]
+}

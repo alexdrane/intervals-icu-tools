@@ -141,6 +141,44 @@ Claude will write the correct JSON into `~/.config/intervals-icu/training-plan.j
 
 ---
 
+## Benchmarks (Performance tab)
+
+The "Performance" tab in `training-brief.py` — the radar profile + test-metric cards — is driven entirely by `~/.config/intervals-icu/benchmarks.json` (gitignored). The tracked lifts/tests are per-athlete, so nothing is hardcoded in the script; the file is seeded with a small generic placeholder on first run. Copy the example to customise it:
+
+```bash
+cp benchmarks.example.json ~/.config/intervals-icu/benchmarks.json
+```
+
+### Format
+
+```json
+{
+  "metrics": {
+    "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#a78bfa"},
+    "row_2k":     {"label": "2k row", "target": 420, "unit": "s", "color": "#f59e0b", "lower_is_better": true}
+  },
+  "radar_axes": [
+    {"label": "Strength",  "keys": ["back_squat"]},
+    {"label": "Endurance", "keys": ["row_2k"]}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `metrics` key | The value you log against from the "Performance" tab's form (any string) |
+| `label` | Display name on the metric card and log-form dropdown |
+| `target` | Goal value for the progress bar |
+| `unit` | Appended to displayed values (`kg`, `W`, `s`, `/10`, ...) |
+| `lower_is_better` | Set `true` for time-based tests (e.g. a 2k row) where a smaller number is progress |
+| `baseline` | Optional. Overrides the auto-detected starting point (normally your first logged entry) — useful after resetting a target so the progress bar doesn't measure from years-old history |
+| `color` | Hex colour for the card accent and sparkline |
+| `radar_axes` | Groups one or more metric keys into a labelled spoke on the radar chart. The polygon always has as many sides as there are axes here. |
+
+`bodyweight` is a special key: if present, its history is auto-populated from your logged weigh-ins (the same data behind the Body Weight chart) instead of requiring manual entries, so it stays current without any action from the Performance tab's form.
+
+---
+
 ## Keeping the repo up to date
 
 If you edit the scripts directly in `~/intervals-icu-tools/` (which you should if you used symlinks above), push changes with:

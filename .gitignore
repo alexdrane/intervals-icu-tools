@@ -6,3 +6,6 @@ config.json
 training-plan.json
 food-log.json
 stretch-log.json
+benchmarks.json
+test-metrics.json
+notes-log.json

@@ -33,6 +33,7 @@ LOCK_FILE          = "/tmp/training-brief.lock"
 CONFIG_FILE        = os.path.expanduser("~/.config/intervals-icu/config.json")
 TRAINING_PLAN_FILE = os.path.expanduser("~/.config/intervals-icu/training-plan.json")
 METRICS_FILE       = os.path.expanduser("~/.config/intervals-icu/test-metrics.json")
+BENCHMARKS_FILE    = os.path.expanduser("~/.config/intervals-icu/benchmarks.json")
 CACHE_FILE         = os.path.expanduser("~/.cache/training-brief/cache.json")
 NUTR_CACHE_FILE    = os.path.expanduser("~/.cache/training-brief/nutrition-cache.json")
 FOOD_LOG_FILE      = os.path.expanduser("~/.local/share/training-brief/food-log.json")
@@ -129,20 +130,37 @@ def metric_history(entries, metric):
     return [e for e in entries if e.get("metric") == metric]
 
 
-METRIC_TARGETS = {
-    "squat_working":      {"label": "Squat (working)",      "target": 130, "unit": "kg",  "color": "#a78bfa"},
-    "rdl_working":        {"label": "RDL (working)",        "target": 120, "unit": "kg",  "color": "#a78bfa"},
-    "hip_thrust_working": {"label": "Hip thrust (working)", "target": 120, "unit": "kg",  "color": "#a78bfa"},
-    "mobility_hip":       {"label": "Mobility (hip)",       "target": 9,   "unit": "/10", "color": "#34d399"},
-    "mobility_squat":     {"label": "Mobility (squat)",     "target": 9,   "unit": "/10", "color": "#34d399"},
-    "wr_20min_watts":     {"label": "WR 20-min watts",      "target": 260, "unit": "W",   "color": "#22d3ee"},
-    "peloton_ftp":        {"label": "Peloton FTP",          "target": 280, "unit": "W",   "color": "#22d3ee"},
-    "2k_c2":              {"label": "2k C2",                "target": 370, "unit": "s",   "color": "#f59e0b", "lower_is_better": True},
-    "rate_r18":           {"label": "Rate ladder r18",      "target": 300, "unit": "W",   "color": "#fb923c"},
-    "rate_r22":           {"label": "Rate ladder r22",      "target": 280, "unit": "W",   "color": "#fb923c"},
-    "rate_r26":           {"label": "Rate ladder r26",      "target": 260, "unit": "W",   "color": "#fb923c"},
-    "bodyweight":         {"label": "Body weight",          "target": 90,  "unit": "kg",  "color": "#94a3b8"},
+# Benchmark metrics + radar groupings are per-user, not per-checkout — every
+# athlete tracks different lifts/tests. Real config lives in BENCHMARKS_FILE
+# (gitignored); this is only the placeholder seeded for a fresh install, and
+# intentionally sport-agnostic rather than shaped around any one person's plan.
+DEFAULT_BENCHMARKS = {
+    "metrics": {
+        "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#a78bfa"},
+        "row_2k":     {"label": "2k row",                   "target": 420, "unit": "s",  "color": "#f59e0b", "lower_is_better": True},
+        "bodyweight": {"label": "Body weight",              "target": 80,  "unit": "kg", "color": "#94a3b8"},
+    },
+    "radar_axes": [
+        {"label": "Strength",  "keys": ["back_squat"]},
+        {"label": "Endurance", "keys": ["row_2k"]},
+        {"label": "Body",      "keys": ["bodyweight"]},
+    ],
 }
+
+
+def load_benchmark_config():
+    """Load the user's benchmark metrics + radar groupings, seeding a
+    placeholder file on first run (mirrors load_training_plan)."""
+    if not os.path.exists(BENCHMARKS_FILE):
+        os.makedirs(os.path.dirname(BENCHMARKS_FILE), exist_ok=True)
+        with open(BENCHMARKS_FILE, "w") as f:
+            json.dump(DEFAULT_BENCHMARKS, f, indent=2)
+        return DEFAULT_BENCHMARKS
+    with open(BENCHMARKS_FILE) as f:
+        cfg = json.load(f)
+    cfg.setdefault("metrics", {})
+    cfg.setdefault("radar_axes", [])
+    return cfg
 
 
 def add_metric_entry(entry_dict):
@@ -160,11 +178,17 @@ def add_metric_entry(entry_dict):
         json.dump(data, f, indent=2)
 
 
-def build_metrics_data(entries):
-    """Build the metrics summary dict passed to the JS tracker."""
+def build_metrics_data(entries, metric_targets, weight_history=None):
+    """Build the metrics summary dict passed to the JS tracker.
+
+    `metric_targets` is the user's benchmark config (see load_benchmark_config).
+    `weight_history` (if given) replaces manually-logged entries for the
+    "bodyweight" key with the wellness weight log, so that benchmark
+    auto-updates from actual weigh-ins instead of requiring a manual test entry.
+    """
     result = []
-    for key, meta in METRIC_TARGETS.items():
-        history = metric_history(entries, key)
+    for key, meta in metric_targets.items():
+        history = weight_history if (key == "bodyweight" and weight_history) else metric_history(entries, key)
         if not history:
             continue
         latest  = history[-1]
@@ -173,7 +197,9 @@ def build_metrics_data(entries):
         reps    = latest.get("reps")
         tgt     = meta["target"]
         lower   = meta.get("lower_is_better", False)
-        start   = first["value"]
+        # An explicit "baseline" overrides the first logged value — useful
+        # when history predates a target change (e.g. bulk goal reset).
+        start   = meta.get("baseline", first["value"])
         # Progress bar: fraction of journey from baseline to target completed
         gap = (start - tgt) if lower else (tgt - start)
         moved = (start - raw) if lower else (raw - start)
@@ -1573,6 +1599,14 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     illness_by_date  = illness.by_date if illness else {}
     illness_7d_vals  = [round(illness_by_date.get(d, 0.0), 4) for d in illness_7d_dates]
 
+    benchmark_cfg = load_benchmark_config()
+    # "bodyweight" is auto-sourced from the wellness weight log (see
+    # weight_history below), not manually logged, so leave it off the form.
+    metric_options_html = "\n".join(
+        f'<option value="{key}">{meta["label"]}</option>'
+        for key, meta in benchmark_cfg["metrics"].items() if key != "bodyweight")
+    radar_axes_json = json.dumps(benchmark_cfg["radar_axes"])
+
     chart_data = json.dumps({
         "dates": chart_dates, "ctl": ctl_vals, "atl": atl_vals, "tsb": tsb_vals,
         "hrv": hrv_vals_c, "rhr": rhr_vals_c,
@@ -1591,7 +1625,8 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         "weightValsFull": weight_vals_full,
         "illnessBands": illness.bands if illness else [],
         "illness7dDates": illness_7d_dates, "illness7dVals": illness_7d_vals,
-        "metrics": build_metrics_data(load_test_metrics().get("entries", [])),
+        "metrics": build_metrics_data(load_test_metrics().get("entries", []), benchmark_cfg["metrics"],
+                                       weight_history=[{"date": d, "value": v} for d, v in zip(weight_dates, weight_vals)]),
     })
 
     day_str = datetime.now().strftime("%A %d %B")
@@ -1789,18 +1824,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
       <div class="log-form" id="log-form">
           <select id="log-metric">
             <option value="">— metric —</option>
-            <option value="squat_working">Squat (working set)</option>
-            <option value="rdl_working">RDL (working set)</option>
-            <option value="hip_thrust_working">Hip thrust (working set)</option>
-            <option value="mobility_hip">Mobility — hip (1–10)</option>
-            <option value="mobility_squat">Mobility — squat (1–10)</option>
-            <option value="wr_20min_watts">WaterRower 20-min watts</option>
-            <option value="peloton_ftp">Peloton FTP watts</option>
-            <option value="2k_c2">2k C2 (seconds)</option>
-            <option value="rate_r18">Rate ladder r18 watts</option>
-            <option value="rate_r22">Rate ladder r22 watts</option>
-            <option value="rate_r26">Rate ladder r26 watts</option>
-            <option value="bodyweight">Body weight (kg)</option>
+            {metric_options_html}
           </select>
           <input id="log-value" type="number" step="0.5" placeholder="Value">
           <input id="log-reps"  type="number" step="1"   placeholder="×reps">
@@ -2650,15 +2674,10 @@ function drawRadar() {{
   if (!canvas) return;
   var metrics = DATA.metrics || [];
 
-  // Aggregate into 6 radar axes
-  var axes = [
-    {{ label:'Strength',  keys:['squat_working','rdl_working','hip_thrust_working'] }},
-    {{ label:'Threshold', keys:['wr_20min_watts','peloton_ftp'] }},
-    {{ label:'Mobility',  keys:['mobility_hip','mobility_squat'] }},
-    {{ label:'Rate Power',keys:['rate_r18','rate_r22','rate_r26'] }},
-    {{ label:'2k Prog.',  keys:['2k_c2'] }},
-    {{ label:'Body',      keys:['bodyweight'] }},
-  ];
+  // User-configured radar groupings (~/.config/intervals-icu/benchmarks.json)
+  // — the polygon below is drawn with as many sides as there are axes, so
+  // this list alone controls the shape.
+  var axes = {radar_axes_json};
 
   var byKey = {{}};
   metrics.forEach(function(m) {{ byKey[m.key] = m; }});
@@ -2847,7 +2866,12 @@ class BriefWindow(Gtk.Window):
             try:
                 entry_dict = json.loads(_up.unquote(enc))
                 add_metric_entry(entry_dict)
-                new_metrics = build_metrics_data(load_test_metrics().get("entries", []))
+                benchmark_cfg = load_benchmark_config()
+                wellness = self._last_data[0] if getattr(self, "_last_data", None) else []
+                weight_history = [{"date": w["id"], "value": w["weight"]}
+                                   for w in wellness if w.get("weight") and w.get("id")]
+                new_metrics = build_metrics_data(load_test_metrics().get("entries", []), benchmark_cfg["metrics"],
+                                                  weight_history=weight_history)
                 metrics_json = json.dumps(new_metrics).replace("\\", "\\\\").replace("'", "\\'")
                 GLib.idle_add(
                     lambda: self.wv.run_javascript(
