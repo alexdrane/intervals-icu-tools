@@ -102,26 +102,43 @@ def fetch_activities_range(athlete_id, api_key, oldest, newest):
 
 
 
-def compute_hi_load(activities, days, tau=14):
-    """Exponentially weighted Z4+ rowing minutes with decay constant τ days.
+# Sport-specificity weights for high-intensity load.
+# Rowing is the target sport; other sports transfer partially.
+# "Other" = old Garmin watch default for rowing activities.
+_HI_SPORT_WEIGHTS = {
+    "Rowing":        1.0,
+    "VirtualRow":    1.0,
+    "Other":         1.0,  # pre-2025 Garmin logged rowing as Other
+    "Run":           0.8,
+    "VirtualRun":    0.8,
+    "Ride":          0.7,
+    "VirtualRide":   0.7,
+    "Workout":       0.8,
+}
 
-    Analogous to CTL but specific to high-intensity rowing load. Decays ~3×
+
+def compute_hi_load(activities, days, tau=14):
+    """Exponentially weighted Z4+ cross-sport load, rowing-equivalent minutes.
+
+    Analogous to CTL but specific to high-intensity load. Decays ~3×
     faster than CTL (τ=14 vs 42) reflecting the shorter half-life of anaerobic
-    and lactate-threshold adaptations.
+    and lactate-threshold adaptations. Non-rowing sports are weighted by their
+    estimated transfer to rowing-specific fitness.
     """
     decay = math.exp(-1 / tau)
     accumulate = 1 - decay
 
     hi_by_date = defaultdict(float)
     for a in activities:
-        if "Row" not in a.get("type", ""):
+        weight = _HI_SPORT_WEIGHTS.get(a.get("type", ""), 0.0)
+        if weight == 0.0:
             continue
         date_str = (a.get("start_date_local") or a.get("start_date") or "")[:10]
         if not date_str:
             continue
         zone_times = a.get("icu_hr_zone_times") or []
         hi_secs = sum(zone_times[i] for i in range(3, min(7, len(zone_times))))
-        hi_by_date[date_str] += hi_secs / 60
+        hi_by_date[date_str] += (hi_secs / 60) * weight
 
     start = datetime.now() - timedelta(days=days)
     dates, hil = [], []
@@ -476,8 +493,8 @@ def show_fitness(wellness_data, days, activities=None):
                 hil_plot = hil_vals
                 hil_dates_plot = hil_dates
 
-            console.print(f"  [bold]High-intensity load[/] [dim]— Z4+ rowing, 14-day decay  (now: {hil_vals[-1]:.1f} min)[/]")
-            render_line_chart([("Hi-intensity (Z4+)", "magenta", hil_plot)], width=len(hil_plot))
+            console.print(f"  [bold]High-intensity load[/] [dim]— Z4+ all sports (rowing-equiv), 14-day decay  (now: {hil_vals[-1]:.1f} min)[/]")
+            render_line_chart([("Hi-intensity Z4+ (rowing-equiv)", "magenta", hil_plot)], width=len(hil_plot))
 
             n2 = len(hil_dates_plot)
             tick_positions2 = [0, n2 // 4, n2 // 2, 3 * n2 // 4, n2 - 1]
@@ -666,12 +683,12 @@ def show_health(wellness_data, days=7, activities=None):
         _, hil_vals = compute_hi_load(activities, 90)
         current_hil = hil_vals[-1] if hil_vals else 0.0
         if current_hil >= 10:
-            signals.append(("[green]Hi-intensity load[/]", f"{current_hil:.1f} min — good lactate fitness"))
+            signals.append(("[green]Hi-intensity load[/]", f"{current_hil:.1f} min rowing-equiv — good lactate fitness"))
         elif current_hil >= 4:
-            signals.append(("[yellow]Hi-intensity load[/]", f"{current_hil:.1f} min — moderate, lactate fitness building or decaying"))
+            signals.append(("[yellow]Hi-intensity load[/]", f"{current_hil:.1f} min rowing-equiv — moderate, lactate fitness building or decaying"))
         else:
-            signals.append(("[red]Hi-intensity load[/]", f"{current_hil:.1f} min — low, anaerobic fitness has decayed"))
-            verdicts.append("high-intensity rowing load is low — expect lactate to limit hard efforts")
+            signals.append(("[red]Hi-intensity load[/]", f"{current_hil:.1f} min rowing-equiv — low, anaerobic fitness has decayed"))
+            verdicts.append("high-intensity load is low — expect lactate to limit hard efforts")
 
     console.print("  [bold]Today's readiness[/]\n")
     for label, note in signals:

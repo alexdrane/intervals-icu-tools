@@ -4,8 +4,11 @@
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
+import re
+import subprocess
 import sys
 import time
 import threading
@@ -20,15 +23,32 @@ from gi.repository import Gtk, WebKit2, GLib, GdkPixbuf
 
 import requests
 
+try:
+    from illness_model import get_illness_data, get_cached_result
+    _ILLNESS_AVAILABLE = True
+except ImportError:
+    _ILLNESS_AVAILABLE = False
+
 LOCK_FILE          = "/tmp/training-brief.lock"
 CONFIG_FILE        = os.path.expanduser("~/.config/intervals-icu/config.json")
 TRAINING_PLAN_FILE = os.path.expanduser("~/.config/intervals-icu/training-plan.json")
+METRICS_FILE       = os.path.expanduser("~/.config/intervals-icu/test-metrics.json")
 CACHE_FILE         = os.path.expanduser("~/.cache/training-brief/cache.json")
 NUTR_CACHE_FILE    = os.path.expanduser("~/.cache/training-brief/nutrition-cache.json")
 FOOD_LOG_FILE      = os.path.expanduser("~/.local/share/training-brief/food-log.json")
 STRETCH_LOG_FILE   = os.path.expanduser("~/.local/share/training-brief/stretch-log.json")
+NOTES_LOG_FILE     = os.path.expanduser("~/.local/share/training-brief/notes-log.json")
 BASE_URL           = "https://intervals.icu/api/v1"
 WINDOW_W, WINDOW_H = 1440, 860
+LOG_FILE           = os.path.expanduser("~/.cache/training-brief/brief.log")
+
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stderr)],
+)
+log = logging.getLogger("training-brief")
 
 
 # ── Loading / error screens ──────────────────────────────────────────────────
@@ -89,7 +109,158 @@ def load_training_plan():
         return json.load(f)
 
 
+def load_test_metrics():
+    if not os.path.exists(METRICS_FILE):
+        return {"entries": []}
+    with open(METRICS_FILE) as f:
+        return json.load(f)
+
+
+def epley_1rm(weight, reps):
+    return round(weight * (1 + reps / 30), 1) if reps else weight
+
+
+def latest_metric(entries, metric):
+    hits = [e for e in entries if e.get("metric") == metric]
+    return hits[-1] if hits else None
+
+
+def metric_history(entries, metric):
+    return [e for e in entries if e.get("metric") == metric]
+
+
+METRIC_TARGETS = {
+    "squat_working":      {"label": "Squat (working)",      "target": 130, "unit": "kg",  "color": "#a78bfa"},
+    "rdl_working":        {"label": "RDL (working)",        "target": 120, "unit": "kg",  "color": "#a78bfa"},
+    "hip_thrust_working": {"label": "Hip thrust (working)", "target": 120, "unit": "kg",  "color": "#a78bfa"},
+    "mobility_hip":       {"label": "Mobility (hip)",       "target": 9,   "unit": "/10", "color": "#34d399"},
+    "mobility_squat":     {"label": "Mobility (squat)",     "target": 9,   "unit": "/10", "color": "#34d399"},
+    "wr_20min_watts":     {"label": "WR 20-min watts",      "target": 260, "unit": "W",   "color": "#22d3ee"},
+    "peloton_ftp":        {"label": "Peloton FTP",          "target": 280, "unit": "W",   "color": "#22d3ee"},
+    "2k_c2":              {"label": "2k C2",                "target": 370, "unit": "s",   "color": "#f59e0b", "lower_is_better": True},
+    "rate_r18":           {"label": "Rate ladder r18",      "target": 300, "unit": "W",   "color": "#fb923c"},
+    "rate_r22":           {"label": "Rate ladder r22",      "target": 280, "unit": "W",   "color": "#fb923c"},
+    "rate_r26":           {"label": "Rate ladder r26",      "target": 260, "unit": "W",   "color": "#fb923c"},
+    "bodyweight":         {"label": "Body weight",          "target": 90,  "unit": "kg",  "color": "#94a3b8"},
+}
+
+
+def add_metric_entry(entry_dict):
+    """Append a new test result to METRICS_FILE."""
+    from datetime import date as _date
+    data = load_test_metrics()
+    new_entry = {"date": _date.today().isoformat(), "metric": entry_dict["metric"],
+                 "value": float(entry_dict["value"])}
+    if entry_dict.get("reps"):
+        new_entry["reps"] = int(entry_dict["reps"])
+    if entry_dict.get("notes"):
+        new_entry["notes"] = entry_dict["notes"]
+    data["entries"].append(new_entry)
+    with open(METRICS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def build_metrics_data(entries):
+    """Build the metrics summary dict passed to the JS tracker."""
+    result = []
+    for key, meta in METRIC_TARGETS.items():
+        history = metric_history(entries, key)
+        if not history:
+            continue
+        latest  = history[-1]
+        first   = history[0]
+        raw     = latest["value"]
+        reps    = latest.get("reps")
+        tgt     = meta["target"]
+        lower   = meta.get("lower_is_better", False)
+        start   = first["value"]
+        # Progress bar: fraction of journey from baseline to target completed
+        gap = (start - tgt) if lower else (tgt - start)
+        moved = (start - raw) if lower else (raw - start)
+        journey_pct = (moved / gap * 100) if gap else 100
+        journey_pct = max(0, min(100, journey_pct))
+        # Subtitle: reps + notes
+        notes = latest.get("notes", "")
+        subtitle = (f"×{reps} · {notes}" if reps and notes
+                    else f"×{reps}" if reps else notes)
+        # Historical sparkline
+        spark = [{"date": e["date"], "value": e["value"]} for e in history[-12:]]
+        result.append({
+            "key":          key,
+            "label":        meta["label"],
+            "value":        raw,
+            "reps":         reps,
+            "start":        start,
+            "target":       tgt,
+            "unit":         meta["unit"],
+            "color":        meta["color"],
+            "journey_pct":  round(journey_pct, 1),
+            "date":         latest["date"],
+            "notes":        subtitle,
+            "lower":        lower,
+            "spark":        spark,
+        })
+    return result
+
+
 # ── Food log ─────────────────────────────────────────────────────────────────
+
+def load_notes():
+    """Notes log: {"active": [{"ts","text"}], "archive": [...]}.
+    Active notes feed the LLM prompt and persist until explicitly cleared."""
+    if not os.path.exists(NOTES_LOG_FILE):
+        return {"active": [], "archive": []}
+    try:
+        with open(NOTES_LOG_FILE) as f:
+            d = json.load(f)
+        d.setdefault("active", [])
+        d.setdefault("archive", [])
+        return d
+    except Exception:
+        return {"active": [], "archive": []}
+
+
+def save_notes(notes):
+    os.makedirs(os.path.dirname(NOTES_LOG_FILE), exist_ok=True)
+    with open(NOTES_LOG_FILE, "w") as f:
+        json.dump(notes, f, indent=2)
+
+
+def add_note(text):
+    text = (text or "").strip()
+    if not text:
+        return load_notes()
+    notes = load_notes()
+    notes["active"].append({"ts": datetime.now().isoformat(timespec="seconds"), "text": text})
+    save_notes(notes)
+    log.info("note added (%d active): %s", len(notes["active"]), text[:80])
+    return notes
+
+
+def clear_notes():
+    """Move all active notes into the archive (kept for logging) and empty active."""
+    notes = load_notes()
+    if notes["active"]:
+        notes["archive"].extend(notes["active"])
+        log.info("cleared %d active notes", len(notes["active"]))
+        notes["active"] = []
+        save_notes(notes)
+    return notes
+
+
+def render_notes_html():
+    """HTML for the active-notes list shown in the Notes panel."""
+    import html as _html
+    active = load_notes().get("active", [])
+    if not active:
+        return '<div class="notes-empty">No active notes. Anything you add here feeds the coach brief and persists until cleared.</div>'
+    rows = []
+    for n in active:
+        day = n["ts"][:10]
+        rows.append(f'<div class="note-row"><span class="note-day">{day}</span>'
+                    f'{_html.escape(n["text"])}</div>')
+    return "".join(rows)
+
 
 def load_food_log():
     if not os.path.exists(FOOD_LOG_FILE):
@@ -188,9 +359,17 @@ def get_calorie_history(calorie_base: int, days: int = 14, activities: list = No
         targets.append(calorie_base + session_kcal_by_day.get(d, 0))
     return dates, consumed, targets
 
-def _is_quota_error(e: Exception) -> bool:
-    msg = str(e)
-    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+def _claude_p(prompt: str, timeout: int = 90) -> str:
+    """Call claude -p with the given prompt and return stripped stdout."""
+    result = subprocess.run(
+        ["claude", "-p", "--model", "claude-haiku-4-5-20251001"],
+        input=prompt, capture_output=True, text=True, timeout=timeout
+    )
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip() or "claude -p failed"
+        log.error("claude -p failed (rc=%d): %s", result.returncode, err)
+        raise RuntimeError(err)
+    return result.stdout.strip()
 
 def _load_cache(path: str) -> dict:
     if os.path.exists(path):
@@ -207,7 +386,7 @@ def _save_cache(path: str, data: dict):
         json.dump(data, f)
 
 
-def get_nutrition_insight(gemini_key):
+def get_nutrition_insight():
     """Returns (insight_str, is_stale)."""
     weekly      = get_weekly_food_summary()
     logged      = [l for l in weekly if "not logged" not in l]
@@ -229,15 +408,14 @@ def get_nutrition_insight(gemini_key):
 
     cache = _load_cache(NUTR_CACHE_FILE)
     if cache.get("hash") == input_hash:
-        return cache.get("insight", ""), cache.get("stale", False)
+        return cache.get("insight", ""), False
 
     if not logged and today_data["entry_count"] == 0:
         return "No meals logged this week — log food with `food add` to get nutritional insights.", False
 
-    from google import genai
-    client = genai.Client(api_key=gemini_key, http_options={"timeout": 30})
     prompt = (
-        "You are a sports nutritionist advising a Cambridge University rower who trains 2–3 times daily. "
+        "You are a sports nutritionist advising a solo rower targeting a 2k erg from 6:29 to 6:10 "
+        "over a year, with a lean mass gain goal of 83→90kg (~300 kcal/day surplus, ~2g protein/kg). "
         "Review the last 7 days of food logs and give an honest, balanced weekly assessment.\n\n"
         "Rules:\n"
         "- Only flag a nutrient or food group as a genuine concern if it is CONSISTENTLY absent or "
@@ -254,17 +432,9 @@ def get_nutrition_insight(gemini_key):
         "Write exactly 3 sentences. Be specific about which days/foods you are referencing. "
         "No fluff, no generic advice, no greetings, no markdown formatting."
     )
-    try:
-        resp    = client.models.generate_content(model="models/gemini-2.5-flash", contents=prompt)
-        insight = resp.text.strip()
-        _save_cache(NUTR_CACHE_FILE, {"hash": input_hash, "insight": insight, "stale": False})
-        return insight, False
-    except Exception as e:
-        if _is_quota_error(e):
-            old = cache.get("insight", "")
-            _save_cache(NUTR_CACHE_FILE, {"hash": input_hash, "insight": old, "stale": True})
-            return old, True
-        raise
+    insight = _claude_p(prompt)
+    _save_cache(NUTR_CACHE_FILE, {"hash": input_hash, "insight": insight})
+    return insight, False
 
 
 # ── Data fetching (with retry) ────────────────────────────────────────────────
@@ -282,7 +452,7 @@ def fetch_with_retry(fn, status_cb, max_attempts=4):
             time.sleep(wait)
 
 
-def fetch_wellness(athlete_id, api_key, days=760):
+def fetch_wellness(athlete_id, api_key, days=920):
     oldest = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     newest = datetime.now().strftime("%Y-%m-%d")
     r = requests.get(f"{BASE_URL}/athlete/{athlete_id}/wellness",
@@ -306,15 +476,23 @@ def fetch_activities(athlete_id, api_key, days=790):
 
 # ── Computed series ──────────────────────────────────────────────────────────
 
+_HI_SPORT_WEIGHTS = {
+    "Rowing": 1.0, "VirtualRow": 1.0, "Other": 1.0,
+    "Run": 0.8, "VirtualRun": 0.8,
+    "Ride": 0.7, "VirtualRide": 0.7, "Workout": 0.8,
+}
+
+
 def compute_hi_load_series(activities, days=730, tau=14):
     decay = math.exp(-1 / tau)
     hi_by_date = defaultdict(float)
     for a in activities:
-        if "Row" not in a.get("type", ""):
+        weight = _HI_SPORT_WEIGHTS.get(a.get("type", ""), 0.0)
+        if weight == 0.0:
             continue
         date_str   = (a.get("start_date_local") or a.get("start_date") or "")[:10]
         zone_times = a.get("icu_hr_zone_times") or []
-        hi_by_date[date_str] += sum(zone_times[i] for i in range(3, min(7, len(zone_times)))) / 60
+        hi_by_date[date_str] += sum(zone_times[i] for i in range(3, min(7, len(zone_times)))) / 60 * weight
 
     current = 0.0
     warmup = max(60, tau * 4)  # 4 time constants of warm-up
@@ -333,21 +511,26 @@ def compute_hi_load_series(activities, days=730, tau=14):
     return dates, vals
 
 
-def compute_hi_load_projection(activities, training_plan, tau=14):
+def compute_hi_load_projection(activities, training_plan, hil_series=None, tau=14):
+    """hil_series: (dates, vals) from compute_hi_load_series; used as anchor to avoid discontinuity."""
     decay = math.exp(-1 / tau)
-    hi_by_date = defaultdict(float)
-    for a in activities:
-        if "Row" not in a.get("type", ""):
-            continue
-        date_str   = (a.get("start_date_local") or a.get("start_date") or "")[:10]
-        zone_times = a.get("icu_hr_zone_times") or []
-        hi_by_date[date_str] += sum(zone_times[i] for i in range(3, min(7, len(zone_times)))) / 60
 
-    current = 0.0
-    d = datetime.now() - timedelta(days=394)
-    while d.date() <= datetime.now().date():
-        current = current * decay + hi_by_date.get(d.strftime("%Y-%m-%d"), 0.0) * (1 - decay)
-        d += timedelta(days=1)
+    if hil_series and hil_series[1]:
+        current = hil_series[1][-1]
+    else:
+        hi_by_date = defaultdict(float)
+        for a in activities:
+            weight = _HI_SPORT_WEIGHTS.get(a.get("type", ""), 0.0)
+            if weight == 0.0:
+                continue
+            date_str   = (a.get("start_date_local") or a.get("start_date") or "")[:10]
+            zone_times = a.get("icu_hr_zone_times") or []
+            hi_by_date[date_str] += sum(zone_times[i] for i in range(3, min(7, len(zone_times)))) / 60 * weight
+        current = 0.0
+        d = datetime.now() - timedelta(days=394)
+        while d.date() <= datetime.now().date():
+            current = current * decay + hi_by_date.get(d.strftime("%Y-%m-%d"), 0.0) * (1 - decay)
+            d += timedelta(days=1)
 
     last_date = (datetime.now()).strftime("%Y-%m-%d")
     z4_by_date = defaultdict(float)
@@ -394,18 +577,19 @@ def compute_projections(wellness_entries, training_plan, sigma_tss=35.0):
     for s in training_plan.get("sessions", []):
         tss_by_date[s["date"]] += s.get("tss", 0)
 
-    # If the last wellness entry is from today, apply today's planned sessions
-    # (which haven't been uploaded yet but will happen later in the day).
+    # Anchor must match the last historical value exactly to avoid discontinuity.
+    # Apply today's planned TSS to the working variables *after* storing the anchor,
+    # so the projection extrapolates from the displayed endpoint.
     today_str = today.strftime("%Y-%m-%d")
-    if last_date == today_str:
-        today_tss = tss_by_date.get(today_str, 0)
-        ctl = ctl * ctl_decay + today_tss * ctl_acc
-        atl = atl * atl_decay + today_tss * atl_acc
-
     proj_dates    = [last_date]
     proj_ctl      = [round(ctl, 1)]
     proj_atl      = [round(atl, 1)]
     proj_tsb      = [round(ctl - atl, 1)]
+
+    if last_date == today_str:
+        today_tss = tss_by_date.get(today_str, 0)
+        ctl = ctl * ctl_decay + today_tss * ctl_acc
+        atl = atl * atl_decay + today_tss * atl_acc
     proj_ctl_sig  = [0.0]
     proj_atl_sig  = [0.0]
     proj_tsb_sig  = [0.0]
@@ -545,7 +729,7 @@ def sleep_debt_clearance(current_debt, tau=5, target_hours=8.0, threshold=0.1,
 
 # ── Gemini coach brief ───────────────────────────────────────────────────────
 
-def build_data_text(wellness, activities, training_plan=None, food_data=None):
+def build_data_text(wellness, activities, training_plan=None, food_data=None, illness=None):
     entries = sorted([w for w in wellness if w.get("id")], key=lambda w: w["id"])
     today   = next((w for w in reversed(entries) if w.get("ctl") or w.get("hrv")), {})
     recent  = entries[-7:]
@@ -557,6 +741,10 @@ def build_data_text(wellness, activities, training_plan=None, food_data=None):
 
     hrv_vals     = [w.get("hrv") for w in recent if w.get("hrv")]
     hrv_baseline = sum(hrv_vals[:-1]) / len(hrv_vals[:-1]) if len(hrv_vals) > 1 else None
+
+    # Sleep-debt EMA (τ=5d, 8h target): negative = in debt, positive = surplus
+    _sd_dates, _sd_vals = compute_sleep_balance(wellness)
+    sleep_debt = _sd_vals[-1] if _sd_vals else None
 
     week_start = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("%Y-%m-%d")
     week_rows  = [a for a in activities if "Row" in a.get("type", "")
@@ -580,6 +768,9 @@ def build_data_text(wellness, activities, training_plan=None, food_data=None):
         f"HRV: {int(hrv)}" + (f"  (7-day avg: {hrv_baseline:.0f})" if hrv_baseline else "") if hrv else "HRV: unknown",
         f"Resting HR: {int(rhr)} bpm" if rhr else "Resting HR: unknown",
         f"Sleep: {fmt_sleep(sleep_secs)}" + (f", score {int(sleep_score)}" if sleep_score else ""),
+        (f"Sleep debt (EMA τ=5d vs 8h target): {sleep_debt:+.1f}h "
+         f"({'in deficit — prioritise recovery sleep' if sleep_debt < -0.5 else 'surplus' if sleep_debt > 0.5 else 'roughly balanced'})"
+         if sleep_debt is not None else "Sleep debt: unknown"),
         f"This week zone time: {zone_str}" if zone_str else "This week: no rowing yet",
         f"Sessions last 14 days: {len(activities)}",
     ]
@@ -609,86 +800,226 @@ def build_data_text(wellness, activities, training_plan=None, food_data=None):
     else:
         lines.append("\nNothing logged in intervals.icu yet today.")
 
-    if training_plan:
-        sessions = training_plan.get("sessions", [])
-        today_planned = [s for s in sessions if s.get("date", "") == today_str]
-        future_planned = [s for s in sessions if s.get("date", "") > today_str]
+    sessions       = (training_plan or {}).get("sessions", [])
+    today_planned  = [s for s in sessions if s.get("date", "") == today_str]
+    future_planned = [s for s in sessions if s.get("date", "") > today_str]
 
-        if today_planned:
-            lines.append("\nToday's planned sessions (cross-reference with completed list above to determine what's still to do):")
-            for s in today_planned:
-                lines.append(f"  \"{s['name']}\"")
+    if today_planned:
+        lines.append("\nToday's planned sessions (cross-reference with completed list above to determine what's still to do):")
+        for s in today_planned:
+            lines.append(f"  \"{s['name']}\"")
 
-        if future_planned:
-            lines.append("\nUpcoming sessions (future days):")
-            by_date = defaultdict(list)
-            for s in future_planned:
-                by_date[s["date"]].append(s)
-            for date in sorted(by_date):
-                day_label = datetime.strptime(date, "%Y-%m-%d").strftime("%A %d %b")
-                for s in by_date[date]:
-                    lines.append(f"  {day_label}: \"{s['name']}\"")
+    if future_planned:
+        lines.append("\nUpcoming sessions (future days):")
+        by_date = defaultdict(list)
+        for s in future_planned:
+            by_date[s["date"]].append(s)
+        for date in sorted(by_date):
+            day_label = datetime.strptime(date, "%Y-%m-%d").strftime("%A %d %b")
+            for s in by_date[date]:
+                lines.append(f"  {day_label}: \"{s['name']}\"")
+    else:
+        lines.append("\nNo upcoming sessions are scheduled in the training plan. Do NOT invent or assume "
+                     "future sessions — instead ask the athlete what's coming up so it can be planned around.")
+
+    if illness and illness.today is not None:
+        today_pct     = round(illness.today * 100)
+        yesterday_pct = round(illness.yesterday * 100) if illness.yesterday is not None else today_pct
+        trend = "rising" if illness.today > illness.yesterday + 0.05 else \
+                "falling" if illness.today < illness.yesterday - 0.05 else "stable"
+        level = "elevated — factor this into how hard today's session should be" if illness.today > 0.3 else \
+                "mildly raised — worth a cautious eye" if illness.today > 0.15 else "low"
+        lines.append(f"\nIllness risk (GP+HMM model): {today_pct}% today (was {yesterday_pct}% yesterday, "
+                     f"trend: {trend}, level: {level}).")
+        if illness.today > 0.15 and illness.bands:
+            last = illness.bands[-1]
+            lines.append(f"Last detected illness episode: {last['start']} – {last['end']}.")
+
+    active_notes = load_notes().get("active", [])
+    if active_notes:
+        lines.append("\nRECENT PERSONAL NOTES from the athlete (weight these heavily as current context; "
+                     "most recent last; relative day labels are from today's perspective):")
+        today_date = datetime.now().date()
+        for n in active_notes:
+            day = n["ts"][:10]
+            note_date = datetime.strptime(day, "%Y-%m-%d").date()
+            delta = (today_date - note_date).days
+            if delta == 0:
+                rel = "today"
+            elif delta == 1:
+                rel = "yesterday"
+            else:
+                rel = f"{delta} days ago"
+            day_name = note_date.strftime("%A")
+            lines.append(f"  [{day} {day_name}, {rel}] {n['text']}")
 
     return "\n".join(lines)
 
 
-def get_gemini_summary(data_text, gemini_key):
+def get_claude_summary(data_text):
     """Returns ({"overview": ..., "tips": ...}, is_stale)."""
     input_hash = _data_hash(data_text)
     cache      = _load_cache(CACHE_FILE)
     if cache.get("hash") == input_hash and cache.get("overview"):
-        return {"overview": cache["overview"], "tips": cache.get("tips", "")}, cache.get("stale", False)
+        return {"overview": cache["overview"], "tips": cache.get("tips", "")}, False
 
-    from google import genai
-    client = genai.Client(api_key=gemini_key, http_options={"timeout": 30})
     prompt = (
-        "You are an experienced rowing coach writing a personalised daily brief for a Cambridge University rower.\n\n"
+        "You are an experienced rowing coach writing a personalised daily brief for a post-graduation rower "
+        "training solo (no squad) with a WaterRower at home and a nearby gym.\n\n"
+
+        "ATHLETE CONTEXT: Alex has just graduated from Cambridge, bladed at May Bumps 2026, and is targeting "
+        "a 2k erg improvement from 6:29 to 6:10 (376W → 437W, +61W) by June 2027 to make a good university "
+        "crew if starting a PhD. Current squat ~90kg (glute-limited at depth), RDL ~100kg+, bodyweight 83kg "
+        "targeting 90kg. Training plan phases: Phase 1 Jul–Sep (glute fix + base, target 6:25), "
+        "Phase 2 Oct–Jan (strength build + threshold, target 6:18), "
+        "Phase 3 Feb–Apr (VO2max intervals, target 6:12), Phase 4 May–Jun (race-specific, target 6:10). "
+        "Secondary goals: two half marathons (Feb and Apr/May) and a cycling sportive (Sep/Oct). "
+        "No squad structure — self-accountability is important; the brief should reinforce consistency.\n\n"
 
         "Write TWO separate sections. Separate them with exactly the line: ---TIPS---\n\n"
 
-        "SECTION 1 — OVERVIEW (2 sentences, plain factual prose):\n"
-        "  • One sentence: readiness read from the specific numbers (TSB, HRV vs 7-day baseline, sleep score).\n"
-        "  • One sentence: what's been done today and what's still to do — infer completed sessions from "
+        "SECTION 1 — OVERVIEW (3–4 sentences, plain factual prose):\n"
+        "  • Readiness read from the specific numbers (TSB, HRV vs 7-day baseline, sleep score, "
+        "    sleep-debt EMA, and illness risk — call out elevated illness risk or a significant sleep deficit if present), "
+        "    and what that combination means for how hard today should be.\n"
+        "  • What's been done today and what's still to do — infer completed sessions from "
         "    the logged activity metrics (type/duration/distance/Z4+ time); report actual logged "
-        "    distance/duration, not the planned session name distance (e.g. if 35km was logged for a '50km cycle', say 35km).\n\n"
+        "    distance/duration, not the planned session name distance.\n"
+        "  • If NO upcoming sessions are scheduled, do not assume any — instead ask the athlete directly what "
+        "    sessions are coming up (mention they can type it into the Notes box below and you'll plan around it). "
+        "    If sessions ARE scheduled, briefly orient them to what's ahead.\n\n"
 
-        "SECTION 2 — TIPS (2–3 sentences, genuinely useful and specific):\n"
-        "  Give advice that a knowledgeable coach would give, tailored to today's actual context. "
+        "SECTION 2 — TIPS (3–5 sentences, genuinely useful and specific):\n"
+        "  Give advice that a knowledgeable coach would give, tailored to today's actual context and phase of "
+        "  the plan. Develop the reasoning — say why, not just what. "
         "  Must NOT be 'sleep more', 'stay hydrated', or any other generic wellness platitude. "
-        "  Pick the most relevant angle from: fuelling timing and composition for today's specific session mix "
-        "  (e.g. what to eat between a hard morning piece and an afternoon paddle), "
-        "  pacing or technique cues for the remaining sessions, "
-        "  caffeine strategy around training, warm-down or mobility work to reduce soreness, "
-        "  how fatigue affects stroke mechanics and what to watch for, "
-        "  mental approach for performing under fatigue, "
-        "  or anything else specific and interesting given today's data.\n\n"
+        "  Draw on the most relevant angles from: fuelling for the specific session type (gym vs threshold vs VO2max), "
+        "  strength progression cues (squat depth, hip thrust loading, when to deload), "
+        "  pacing the WaterRower by HR rather than pace since it's not a C2, "
+        "  threshold and VO2max execution cues, running economy for HM prep, "
+        "  how to manage fatigue without a squad keeping you accountable, "
+        "  managing training load when illness risk is elevated or sleep debt is high, "
+        "  acting on anything raised in the athlete's recent personal notes, "
+        "  or anything else specific and useful given today's data and plan phase.\n\n"
 
         "Hard rules: no TSS/load numbers. No bullet points, no headers, no greetings, no markdown. "
-        "Each section plain prose. Overview ≤50 words, Tips ≤80 words.\n\n"
+        "Each section plain prose. Overview ≤90 words, Tips ≤140 words.\n\n"
         + data_text
     )
-    try:
-        resp = client.models.generate_content(model="models/gemini-2.5-flash", contents=prompt)
-        text = resp.text.strip()
-        if "---TIPS---" in text:
-            overview, tips = text.split("---TIPS---", 1)
-            overview = overview.strip(); tips = tips.strip()
+    text = _claude_p(prompt)
+    if not text.strip():
+        raise RuntimeError("claude -p returned empty output")
+    if "---TIPS---" in text:
+        overview, tips = text.split("---TIPS---", 1)
+        overview = overview.strip(); tips = tips.strip()
+    else:
+        # Model didn't emit the separator — degrade loudly, don't blank the tips.
+        log.warning("coach brief missing ---TIPS--- separator; falling back to paragraph split")
+        blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+        if len(blocks) >= 2:
+            overview = blocks[0]
+            tips     = "\n\n".join(blocks[1:])
         else:
-            overview = text; tips = ""
-        _save_cache(CACHE_FILE, {"hash": input_hash, "overview": overview, "tips": tips, "stale": False})
-        return {"overview": overview, "tips": tips}, False
-    except Exception as e:
-        if _is_quota_error(e):
-            old_overview = cache.get("overview", "")
-            old_tips     = cache.get("tips", "")
-            _save_cache(CACHE_FILE, {"hash": input_hash, "overview": old_overview, "tips": old_tips, "stale": True})
-            return {"overview": old_overview, "tips": old_tips}, True
-        raise
+            overview = text.strip(); tips = ""
+    if not tips:
+        log.warning("coach brief produced empty tips section")
+    _save_cache(CACHE_FILE, {"hash": input_hash, "overview": overview, "tips": tips})
+    return {"overview": overview, "tips": tips}, False
+
+
+EXTRACT_CACHE_FILE = os.path.expanduser("~/.cache/training-brief/extract-cache.json")
+
+def extract_sessions_from_notes(active_notes):
+    """Conservatively pull *clearly-described* upcoming sessions out of the active
+    notes and append them to training-plan.json. Returns the list of added
+    sessions. Does nothing (returns []) unless a note unambiguously describes a
+    future session — never invents or duplicates entries."""
+    if not active_notes:
+        return []
+
+    plan      = load_training_plan()
+    sessions  = plan.get("sessions", [])
+    existing  = {(s.get("date"), s.get("name", "").strip().lower()) for s in sessions}
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    notes_blob = "\n".join(f"[{n['ts'][:10]}] {n['text']}" for n in active_notes)
+
+    # Skip the LLM call if neither the notes nor the upcoming plan have changed
+    # since the last extraction (avoids a ~5s call on every refresh).
+    state_key = notes_blob + "||" + "|".join(sorted(
+        f"{d}:{n}" for d, n in existing if d and d >= today_str))
+    state_hash = _data_hash(state_key)
+    if _load_cache(EXTRACT_CACHE_FILE).get("hash") == state_hash:
+        return []
+
+    prompt = (
+        "You maintain a rower's training plan. Read the athlete's free-text notes below and extract ONLY "
+        "concrete upcoming training sessions that are clearly described (a session on a stated or clearly "
+        "implied date). Do NOT invent sessions, infer vague intentions, or include sessions already in the plan.\n\n"
+        f"Today is {today_str}. Resolve relative dates (\"tomorrow\", \"Friday\") to absolute YYYY-MM-DD.\n\n"
+        "Sessions ALREADY in the plan (do not duplicate):\n"
+        + ("\n".join(f"  {s.get('date')}: {s.get('name')}" for s in sessions if s.get("date", "") >= today_str) or "  (none upcoming)")
+        + "\n\nAthlete's notes:\n" + notes_blob + "\n\n"
+        "Output a STRICT JSON array (no prose, no code fences). Each item: "
+        '{"date":"YYYY-MM-DD","name":"<short session name>","tss":<int estimate>,"z4_mins":<int estimate>}. '
+        "TSS scales with DURATION, not just intensity — a short maximal effort is still LOW TSS. "
+        "Guide: easy paddle/recovery ~30-45; steady 60-90min ~60-80; long row 2h+ ~100-130; "
+        "a SHORT all-out race or sprint (a few minutes up to ~15min, e.g. a bumps race) is only ~20-45 "
+        "even though it feels maximal — do NOT inflate short efforts. Include the paddle to/from in the estimate. "
+        "z4_mins = minutes actually spent at Z4+ (a 5-min sprint is ~5, an easy paddle is 0). "
+        "If no clear upcoming session is described, output exactly: []"
+    )
+
+    raw = _claude_p(prompt).strip()
+    # Extract the first JSON array, tolerating code fences or trailing prose
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        log.info("session extraction: no JSON array in model output")
+        return []
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception:
+        log.warning("session extraction: could not parse model JSON: %s", raw[:200])
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    added = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        date = str(item.get("date", "")).strip()
+        name = str(item.get("name", "")).strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or not name:
+            continue
+        if date < today_str:                       # only future/today
+            continue
+        if (date, name.lower()) in existing:        # dedupe
+            continue
+        try:
+            tss = int(item.get("tss", 60)); z4 = int(item.get("z4_mins", 0))
+        except (TypeError, ValueError):
+            tss, z4 = 60, 0
+        entry = {"date": date, "name": name, "tss": tss, "z4_mins": z4}
+        sessions.append(entry); existing.add((date, name.lower())); added.append(entry)
+
+    if added:
+        plan["sessions"] = sorted(sessions, key=lambda s: s.get("date", ""))
+        with open(TRAINING_PLAN_FILE, "w") as f:
+            json.dump(plan, f, indent=2)
+        log.info("session extraction added %d session(s): %s",
+                 len(added), "; ".join(f"{a['date']} {a['name']}" for a in added))
+        # `existing` now includes the added sessions; cache the post-add state so an
+        # unchanged re-run is a cache hit rather than one more (empty) LLM call.
+        final_key = notes_blob + "||" + "|".join(sorted(
+            f"{d}:{n}" for d, n in existing if d and d >= today_str))
+        state_hash = _data_hash(final_key)
+    _save_cache(EXTRACT_CACHE_FILE, {"hash": state_hash})
+    return added
 
 
 NUTR_COACH_CACHE = os.path.expanduser("~/.cache/training-brief/nutrition-coach-cache.json")
 
-def get_nutrition_coach(activities, training_plan, gemini_key, coach_summary=None):
+def get_nutrition_coach(activities, training_plan, coach_summary=None):
     """Returns (brief_str, is_stale)."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     weekly    = get_weekly_food_summary()
@@ -733,12 +1064,11 @@ def get_nutrition_coach(activities, training_plan, gemini_key, coach_summary=Non
     input_hash = _data_hash(input_str)
     cache      = _load_cache(NUTR_COACH_CACHE)
     if cache.get("hash") == input_hash:
-        return cache.get("brief", ""), cache.get("stale", False)
+        return cache.get("brief", ""), False
 
-    from google import genai
-    client = genai.Client(api_key=gemini_key, http_options={"timeout": 30})
     prompt = (
-        "You are a sports nutritionist advising a Cambridge University rower. "
+        "You are a sports nutritionist advising a solo rower (post-graduation, no squad) targeting a 2k erg "
+        "from 6:29 to 6:10 over the next year, with a secondary goal of gaining 7kg of lean mass (83→90kg). "
         "Write a concise nutrition-focused daily note (3 sentences, plain prose, no greetings, no headers, no markdown).\n\n"
         "Focus on: what they should eat NOW or next given the sessions done and still ahead, "
         "and one specific food or meal recommendation.\n\n"
@@ -756,17 +1086,9 @@ def get_nutrition_coach(activities, training_plan, gemini_key, coach_summary=Non
         "Last 7 days of eating:\n" + "\n".join(weekly) + "\n\n"
         "Be specific: name actual foods and quantities. No generic advice."
     )
-    try:
-        resp  = client.models.generate_content(model="models/gemini-2.5-flash", contents=prompt)
-        brief = resp.text.strip()
-        _save_cache(NUTR_COACH_CACHE, {"hash": input_hash, "brief": brief, "stale": False})
-        return brief, False
-    except Exception as e:
-        if _is_quota_error(e):
-            old = cache.get("brief", "")
-            _save_cache(NUTR_COACH_CACHE, {"hash": input_hash, "brief": old, "stale": True})
-            return old, True
-        raise
+    brief = _claude_p(prompt)
+    _save_cache(NUTR_COACH_CACHE, {"hash": input_hash, "brief": brief})
+    return brief, False
 
 
 # ── HTML helpers ─────────────────────────────────────────────────────────────
@@ -897,7 +1219,45 @@ def _build_sessions_html(training_plan, today_str, activities=None):
 
 # ── Main HTML builder ────────────────────────────────────────────────────────
 
-def build_html(wellness, activities, training_plan, summary=None, calorie_target=None, food_data=None):
+def _color_illness(p):
+    if p is None: return "#888"
+    if p < 0.20:  return "#4ade80"
+    if p < 0.50:  return "#fbbf24"
+    return "#f87171"
+
+
+def _illness_stat(illness):
+    """Render the illness risk stat with stable IDs for JS updates."""
+    if illness and illness.today is not None:
+        p     = illness.today
+        p_y   = illness.yesterday
+        val   = f"{round(p * 100)}%"
+        color = _color_illness(p)
+        delta = round((p - p_y) * 100)
+        sign  = "+" if delta >= 0 else ""
+        sub   = f"{sign}{delta}pp vs yesterday"
+        tip   = None
+        if illness.bands:
+            last = illness.bands[-1]
+            tip  = f"Last episode: {last['start']} – {last['end']}"
+    else:
+        val, color, sub, tip = "—", "#888", "model loading…", None
+
+    sub_html = f'<div class="sub" id="illness-sub">{sub}</div>'
+    tip_attr = f' data-tip="{tip}"' if tip else ""
+    cursor   = ' style="cursor:help"' if tip else ""
+    return (f'<div class="stat"{tip_attr}{cursor}>'
+            f'<div class="label">Illness Risk</div>'
+            f'<div class="value" id="illness-val" style="color:{color}">{val}</div>'
+            f'{sub_html}'
+            f'<div style="position:relative;width:100%;height:28px;margin-top:5px;border-radius:3px;overflow:hidden">'
+            f'<canvas id="illness-spark" style="position:absolute;top:0;left:0;width:100%;height:100%"></canvas>'
+            f'</div>'
+            f'</div>')
+
+
+def build_html(wellness, activities, training_plan, summary=None, calorie_target=None,
+               food_data=None, illness=None):
     entries     = sorted([w for w in wellness if w.get("id")], key=lambda w: w["id"])
     today_entry = next((w for w in reversed(entries) if w.get("ctl") or w.get("hrv")), {})
     recent      = entries[-7:]
@@ -1162,6 +1522,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
               f"7-day avg {hrv_baseline:.0f}" if hrv_baseline else None,
               tip=hrv_tip),
         _stat("Resting HR", f"{int(rhr)} bpm" if rhr else "—", tip=rhr_tip),
+        _illness_stat(illness),
         _stat("Sleep", _fmt_sleep(sleep_secs), _color_sleep(sleep_score),
               f"Score {int(sleep_score)}" if sleep_score else None,
               tip=sleep_tip),
@@ -1187,7 +1548,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     rhr_vals_c    = [w.get("restingHR") for w in chart_entries]
 
     hil_dates, hil_vals           = compute_hi_load_series(activities)
-    proj_hil_dates, proj_hil_vals = compute_hi_load_projection(activities, training_plan)
+    proj_hil_dates, proj_hil_vals = compute_hi_load_projection(activities, training_plan, hil_series=(hil_dates, hil_vals))
     sleep_dates, sleep_balance    = compute_sleep_balance(entries)
     proj_dates, proj_ctl, proj_atl, proj_tsb, proj_ctl_sig, proj_atl_sig, proj_tsb_sig = \
         compute_projections(entries, training_plan)
@@ -1204,6 +1565,13 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     weight_entries = [w for w in entries if w.get("weight") and w.get("id")]
     weight_dates  = [w["id"] for w in weight_entries]
     weight_vals   = [w["weight"] for w in weight_entries]
+    weight_by_date = dict(zip(weight_dates, weight_vals))
+    weight_vals_full = [weight_by_date.get(d) for d in chart_dates]
+
+    today_dt = datetime.now()
+    illness_7d_dates = [(today_dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+    illness_by_date  = illness.by_date if illness else {}
+    illness_7d_vals  = [round(illness_by_date.get(d, 0.0), 4) for d in illness_7d_dates]
 
     chart_data = json.dumps({
         "dates": chart_dates, "ctl": ctl_vals, "atl": atl_vals, "tsb": tsb_vals,
@@ -1220,6 +1588,10 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         "calHistDates": cal_hist_dates, "calHistConsumed": cal_hist_consumed,
         "calHistTarget": cal_hist_target,
         "weightDates": weight_dates, "weightVals": weight_vals,
+        "weightValsFull": weight_vals_full,
+        "illnessBands": illness.bands if illness else [],
+        "illness7dDates": illness_7d_dates, "illness7dVals": illness_7d_vals,
+        "metrics": build_metrics_data(load_test_metrics().get("entries", [])),
     })
 
     day_str = datetime.now().strftime("%A %d %B")
@@ -1230,6 +1602,8 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     else:
         overview_html = loading_span
         tips_html     = loading_span
+
+    notes_html = render_notes_html()
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -1260,11 +1634,26 @@ hr.div{{border:none;border-top:1px solid #1e293b;margin:8px 0 10px}}
               letter-spacing:.06em;margin-bottom:3px;flex-shrink:0;display:flex;align-items:center;gap:8px}}
 .chart-wrap{{flex:1;min-height:0;position:relative}}
 canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
-.brief-carousel{{border-top:1px solid #1e293b;flex-shrink:0;height:120px;position:relative;overflow:hidden}}
+.brief-carousel{{border-top:1px solid #1e293b;flex-shrink:0;height:170px;position:relative;overflow:hidden}}
 .brief-track{{display:flex;height:100%;transition:transform .45s cubic-bezier(.4,0,.2,1);will-change:transform}}
 .brief-panel{{min-width:100%;padding:10px 18px 24px;overflow-y:auto;box-sizing:border-box}}
 .brief-panel.tips-panel{{background:#0b1929}}
 .brief-panel.nutr-panel{{background:#071a10}}
+.brief-panel.notes-panel{{background:#0c1322;display:flex;flex-direction:column;gap:6px}}
+.notes-hint{{font-size:9px;color:#475569;text-transform:none;letter-spacing:0}}
+.notes-list{{flex:1;min-height:0;overflow-y:auto;font-size:12px;color:#cbd5e1;line-height:1.5}}
+.notes-empty{{color:#475569;font-style:italic;font-size:12px}}
+.note-row{{padding:2px 0;border-bottom:1px solid #16213a}}
+.note-added{{color:#4ade80;font-size:11px;padding:3px 0}}
+.note-day{{color:#64748b;font-size:10px;margin-right:7px}}
+.notes-input{{display:flex;gap:6px;align-items:flex-end}}
+#note-box{{flex:1;background:#0f1b30;color:#e2e8f0;border:1px solid #1e293b;border-radius:5px;
+          padding:5px 7px;font-size:12px;font-family:inherit;resize:none}}
+.notes-input button{{background:#1e293b;color:#e2e8f0;border:none;border-radius:5px;padding:5px 10px;
+          font-size:11px;cursor:pointer}}
+.notes-input button:hover{{background:#334155}}
+.notes-input button.notes-clear{{background:transparent;color:#64748b}}
+.notes-input button.notes-clear:hover{{color:#f87171}}
 .brief-label{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}}
 .brief-text{{font-size:15px;color:#94a3b8;line-height:1.65}}
 .tips-text{{color:#cbd5e1;font-size:15px;line-height:1.65}}
@@ -1300,6 +1689,47 @@ button:hover{{background:#334155;color:#e2e8f0}}
   border:1px solid #f59e0b; border-radius:6px; padding:6px 9px; font-size:11px; color:#fcd34d;
   white-space:nowrap; pointer-events:none; }}
 #stale-warn:hover .stale-tip {{ display:block; }}
+/* ── Performance tracker ─────────────────────────────────────────────────── */
+.tracker-view {{ display:none; flex-direction:column; overflow-y:auto; height:100%;
+  padding:10px 12px; gap:10px; }}
+.tracker-view.active {{ display:flex; }}
+.tracker-top {{ display:flex; gap:12px; align-items:flex-start; }}
+.tracker-radar-col {{ flex-shrink:0; display:flex; flex-direction:column; align-items:center; gap:4px; }}
+.tracker-header {{ font-size:10px; color:#64748b; font-weight:600; letter-spacing:.05em;
+  text-transform:uppercase; }}
+.tracker-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(175px,1fr));
+  gap:7px; flex:1; }}
+.metric-card {{ background:#1e293b; border:1px solid #1e3a5f; border-radius:7px;
+  padding:9px 11px; }}
+.mc-label {{ font-size:10px; color:#64748b; margin-bottom:2px; }}
+.mc-val {{ font-size:20px; font-weight:700; line-height:1; }}
+.mc-date {{ font-size:9px; color:#334155; margin-top:3px; }}
+.mc-bar-wrap {{ height:3px; background:#0f172a; border-radius:2px; margin-top:5px; }}
+.mc-bar-fill {{ height:100%; border-radius:2px; transition:width .6s ease; }}
+.mc-spark {{ width:100%; height:24px; margin-top:4px; display:block; }}
+.mc-notes {{ font-size:9px; color:#475569; margin-top:2px; font-style:italic;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.mc-journey {{ font-size:9px; color:#475569; display:flex; justify-content:space-between;
+  margin-top:3px; }}
+#c-radar {{ display:block; }}
+#tracker-btn {{ font-size:11px; padding:3px 10px; }}
+#tracker-btn.active {{ color:#a78bfa; border-color:#a78bfa; background:#1e1b4b; }}
+.charts.hidden {{ display:none; }}
+.log-form {{ display:flex; flex-wrap:wrap; gap:5px; align-items:center;
+  padding:8px 10px; background:#1e293b; border-radius:7px; border:1px solid #334155; }}
+.log-form select, .log-form input {{
+  -webkit-appearance:none; appearance:none;
+  background:#0f172a; border:1px solid #334155; border-radius:4px;
+  color:#94a3b8; font-size:11px; padding:3px 7px; outline:none; }}
+.log-form select {{ width:170px; cursor:pointer; }}
+.log-form select option {{ background:#0f172a; color:#94a3b8; }}
+.log-form input[type=number] {{ width:72px; }}
+.log-form input[type=text]   {{ flex:1; min-width:80px; }}
+.log-form select:focus, .log-form input:focus {{ border-color:#475569; color:#e2e8f0; }}
+.log-form .log-btn {{ background:#312e81; border-color:#4338ca; color:#c7d2fe;
+  font-size:11px; padding:3px 12px; }}
+.log-form .log-btn:hover {{ background:#3730a3; }}
+.log-added {{ font-size:10px; color:#4ade80; padding:2px 0; }}
 </style></head>
 <body>
 <div class="header">
@@ -1313,6 +1743,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
     <option value="365">1 year</option>
     <option value="730">2 years</option>
   </select>
+  <button id="tracker-btn" onclick="toggleTracker()">Performance</button>
 </div>
 <div class="body">
   <div class="stats">{stats_html}</div>
@@ -1347,6 +1778,37 @@ button:hover{{background:#334155;color:#e2e8f0}}
         <div class="chart-wrap" id="w-slp"><canvas id="c-slp"></canvas></div>
       </div>
     </div>
+    <div class="tracker-view" id="tracker-view">
+      <div class="tracker-top">
+        <div class="tracker-radar-col">
+          <div class="tracker-header">Profile</div>
+          <canvas id="c-radar"></canvas>
+        </div>
+        <div class="tracker-grid" id="tracker-cards" style="align-content:start"></div>
+      </div>
+      <div class="log-form" id="log-form">
+          <select id="log-metric">
+            <option value="">— metric —</option>
+            <option value="squat_working">Squat (working set)</option>
+            <option value="rdl_working">RDL (working set)</option>
+            <option value="hip_thrust_working">Hip thrust (working set)</option>
+            <option value="mobility_hip">Mobility — hip (1–10)</option>
+            <option value="mobility_squat">Mobility — squat (1–10)</option>
+            <option value="wr_20min_watts">WaterRower 20-min watts</option>
+            <option value="peloton_ftp">Peloton FTP watts</option>
+            <option value="2k_c2">2k C2 (seconds)</option>
+            <option value="rate_r18">Rate ladder r18 watts</option>
+            <option value="rate_r22">Rate ladder r22 watts</option>
+            <option value="rate_r26">Rate ladder r26 watts</option>
+            <option value="bodyweight">Body weight (kg)</option>
+          </select>
+          <input id="log-value" type="number" step="0.5" placeholder="Value">
+          <input id="log-reps"  type="number" step="1"   placeholder="×reps">
+          <input id="log-notes" type="text" placeholder="Notes (optional)">
+          <button class="log-btn" onclick="submitMetric()">Add</button>
+          <span id="log-confirm" class="log-added"></span>
+      </div>
+    </div>
     <div class="brief-carousel" id="brief-carousel">
       <div class="brief-track" id="brief-track">
         <div class="brief-panel">
@@ -1361,11 +1823,21 @@ button:hover{{background:#334155;color:#e2e8f0}}
           <div class="brief-label">Nutrition</div>
           <div class="tips-text" id="brief-nutr"><span class="brief-loading">Generating…</span></div>
         </div>
+        <div class="brief-panel notes-panel">
+          <div class="brief-label">Notes <span class="notes-hint">— context for the coach · persists until cleared</span></div>
+          <div class="notes-list" id="notes-list">{notes_html}</div>
+          <div class="notes-input">
+            <textarea id="note-box" rows="2" placeholder="Add context, how you feel, or an upcoming session… (Ctrl+Enter to add)"></textarea>
+            <button onclick="submitNote()">Add</button>
+            <button class="notes-clear" onclick="clearNotes()">Clear all</button>
+          </div>
+        </div>
       </div>
       <div class="brief-dots">
         <span class="dot active" onclick="briefGoTo(0)"></span>
         <span class="dot" onclick="briefGoTo(1)"></span>
         <span class="dot" onclick="briefGoTo(2)"></span>
+        <span class="dot" onclick="briefGoTo(3)"></span>
       </div>
     </div>
   </div>
@@ -1560,6 +2032,20 @@ function drawHrv() {{
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const yOf=v=>PAD.top+(1-(v-lo)/span)*cH;
   const xOf=i=>PAD.left+(i/Math.max(dates.length-1,1))*cW;
+  // Shade illness episodes before drawing data lines
+  const bands = DATA.illnessBands || [];
+  if (bands.length) {{
+    const cutoff = dates[0];
+    bands.forEach(function(b) {{
+      const s = b.start > cutoff ? b.start : cutoff;
+      const e = b.end   < dates[dates.length-1] ? b.end : dates[dates.length-1];
+      const si = dates.findIndex(d=>d>=s);
+      let ei   = dates.findIndex(d=>d>e); if(ei<0) ei=dates.length-1;
+      if(si<0||si>ei) return;
+      ctx.fillStyle='rgba(239,68,68,0.13)';
+      ctx.fillRect(xOf(si), PAD.top, xOf(ei)-xOf(si), cH);
+    }});
+  }}
   chartAxes(ctx,W,H,lo,hi,4,PAD,dates);
   plotSeries(ctx,xOf,yOf,hrv,'#f472b6',1.8);
   plotSeries(ctx,xOf,yOf,rhr,'#fb923c',1.6);
@@ -1802,40 +2288,97 @@ function drawCalHistory() {{
 function drawWeight() {{
   const {{ctx,W,H}}=setupCanvas('c-wt','w-wt');
   const PAD={{top:4,right:10,bottom:22,left:36}};
-  const cutoff=new Date(Date.now()-currentDays*86400000).toISOString().slice(0,10);
-  const dates=DATA.weightDates, vals=DATA.weightVals;
-  if(!dates||!vals||!vals.length) {{
+  if(!DATA.weightDates||!DATA.weightDates.length) {{
     ctx.fillStyle='#334155'; ctx.font='11px sans-serif'; ctx.textAlign='center';
     ctx.fillText('No weight data logged',W/2,H/2); return;
   }}
-  let idx=dates.findIndex(d=>d>=cutoff); if(idx<0) idx=0;
-  const sDates=dates.slice(idx), sVals=vals.slice(idx);
-  if(!sVals.length) return;
-  const lo=Math.min(...sVals)*0.997, hi=Math.max(...sVals)*1.003, span=hi-lo||1;
+  // Aligned to the full calendar-day axis (DATA.dates) so gaps between
+  // weigh-ins are spaced by actual elapsed time, not by log count.
+  const [sDates,sVals]=sliceByDays(DATA.dates,DATA.weightValsFull);
+  const logged=sVals.filter(v=>v!=null);
+  if(!logged.length) return;
+  const lo=Math.min(...logged)*0.997, hi=Math.max(...logged)*1.003, span=hi-lo||1;
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const yOf=v=>PAD.top+(1-(v-lo)/span)*cH;
   const xOf=i=>PAD.left+(i/Math.max(sDates.length-1,1))*cW;
-  // Fill under
-  ctx.fillStyle='rgba(167,139,250,.12)';
-  ctx.beginPath(); ctx.moveTo(xOf(0),H-PAD.bottom);
-  sVals.forEach((v,i)=>ctx.lineTo(xOf(i),yOf(v)));
-  ctx.lineTo(xOf(sVals.length-1),H-PAD.bottom); ctx.closePath(); ctx.fill();
-  // Line
+  chartAxes(ctx,W,H,lo,hi,3,PAD,sDates);
+  // Connect only the logged points with one continuous line — using dense
+  // xOf (not the filtered points' own index) keeps the true time spacing,
+  // while skipping nulls (rather than breaking the line, like plotSeries
+  // does) avoids the sparse weigh-ins rendering as disconnected dots.
+  // Straight segments, not drawSmooth's spline — that spline assumes roughly
+  // even point spacing and overshoots badly when weigh-in gaps are wildly
+  // uneven in time (days vs. months apart).
   const pts=sVals.map((v,i)=>v!=null?{{x:xOf(i),y:yOf(v)}}:null).filter(Boolean);
   ctx.strokeStyle='#a78bfa'; ctx.lineWidth=1.5; ctx.lineJoin='round';
-  ctx.beginPath(); drawSmooth(ctx,pts); ctx.stroke();
+  ctx.beginPath();
+  pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+  ctx.stroke();
   // Dots
   pts.forEach(p=>{{
     ctx.fillStyle='#a78bfa'; ctx.beginPath(); ctx.arc(p.x,p.y,2.5,0,Math.PI*2); ctx.fill();
   }});
-  chartAxes(ctx,W,H,lo,hi,3,PAD,sDates);
   CHART_META['c-wt']={{dates:sDates,PAD,yOf,series:[
     {{label:'Weight',data:sVals,color:'#a78bfa',fmt:v=>v.toFixed(1)+' kg'}},
   ]}};
 }}
 
+function drawIllnessSpark() {{
+  var canvas = document.getElementById('illness-spark');
+  if (!canvas) return;
+  var dates = DATA.illness7dDates || [];
+  var vals  = DATA.illness7dVals  || [];
+  if (!dates.length) return;
+  var dpr = window.devicePixelRatio || 1;
+  var wrap = canvas.parentElement;
+  var W = (wrap || canvas).clientWidth, H = (wrap || canvas).clientHeight;
+  if (!W || !H) return;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  var ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+  var PAD = {{l:3, r:3, t:3, b:3}};
+  var cW = W - PAD.l - PAD.r, cH = H - PAD.t - PAD.b;
+  var n = vals.length;
+  var xOf = function(i) {{ return PAD.l + (i / Math.max(n - 1, 1)) * cW; }};
+  // Auto-scale to the week's actual range — illness risk usually sits well
+  // under 1.0, so a fixed 0-1 scale flattens real day-to-day variation.
+  var dataLo = Math.min.apply(null, vals), dataHi = Math.max.apply(null, vals);
+  var lo = Math.max(0, Math.min(dataLo - 0.03, 0.05));
+  var hi = Math.min(1, Math.max(dataHi + 0.03, lo + 0.1));
+  var span = hi - lo;
+  var yOf = function(v) {{ return PAD.t + (1 - (Math.min(Math.max(v, lo), hi) - lo) / span) * cH; }};
+  // 0.5 threshold line (only if it falls within the visible range)
+  if (0.5 >= lo && 0.5 <= hi) {{
+    ctx.strokeStyle = 'rgba(239,68,68,0.25)'; ctx.lineWidth = 0.5; ctx.setLineDash([2,2]);
+    ctx.beginPath(); ctx.moveTo(PAD.l, yOf(0.5)); ctx.lineTo(W - PAD.r, yOf(0.5)); ctx.stroke(); ctx.setLineDash([]);
+  }}
+  // Fill under curve
+  ctx.fillStyle = 'rgba(239,68,68,0.10)';
+  ctx.beginPath(); ctx.moveTo(xOf(0), H - PAD.b);
+  for (var i = 0; i < n; i++) ctx.lineTo(xOf(i), yOf(vals[i]));
+  ctx.lineTo(xOf(n - 1), H - PAD.b); ctx.closePath(); ctx.fill();
+  // Line
+  ctx.strokeStyle = '#f87171'; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  for (var i = 0; i < n; i++) {{ i === 0 ? ctx.moveTo(xOf(i), yOf(vals[i])) : ctx.lineTo(xOf(i), yOf(vals[i])); }}
+  ctx.stroke();
+  // Day dots
+  for (var i = 0; i < n; i++) {{
+    var v = vals[i];
+    ctx.fillStyle = v < 0.20 ? '#4ade80' : v < 0.50 ? '#fbbf24' : '#f87171';
+    ctx.beginPath(); ctx.arc(xOf(i), yOf(v), 2, 0, Math.PI * 2); ctx.fill();
+  }}
+  // Day-of-week labels (Mon…Sun)
+  var days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  ctx.fillStyle = '#334155'; ctx.font = '7px system-ui'; ctx.textAlign = 'center';
+  for (var i = 0; i < n; i++) {{
+    var d = new Date(dates[i] + 'T00:00:00');
+    ctx.fillText(days[d.getDay()], xOf(i), H - 0.5);
+  }}
+}}
+
 function drawAll() {{
   drawCtl(); drawTsb(); drawHrv(); drawHil(); drawCalHistory(); drawWeight(); drawSleep();
+  drawIllnessSpark();
   ['c-ctl','c-tsb','c-hrv','c-hil','c-cal','c-wt','c-slp'].forEach(function(id) {{
     addHoverToChart(id, id.replace('c-','w-'));
   }});
@@ -1871,14 +2414,59 @@ function setNutritionCoach(text) {{
   var el = document.getElementById('brief-nutr');
   if (el) el.innerHTML = text;
 }}
+function setNotes(html) {{
+  var el = document.getElementById('notes-list');
+  if (el) el.innerHTML = html;
+}}
+function submitNote() {{
+  var box = document.getElementById('note-box');
+  if (!box) return;
+  var v = box.value.trim();
+  if (!v) return;
+  // nonce ensures notify::title fires even for repeated text
+  document.title = '__note__' + Date.now() + '|' + encodeURIComponent(v);
+  box.value = '';
+}}
+function clearNotes() {{
+  document.title = '__clearnotes__' + Date.now();
+}}
+function setIllnessData(todayP, yesterdayP, bands, spark7d) {{
+  DATA.illnessBands = bands;
+  if (spark7d) {{
+    DATA.illness7dDates = spark7d.dates;
+    DATA.illness7dVals  = spark7d.vals;
+  }}
+  var val = document.getElementById('illness-val');
+  var sub = document.getElementById('illness-sub');
+  if (!val) return;
+  var pct = Math.round(todayP * 100);
+  val.textContent = pct + '%';
+  val.style.color = todayP < 0.20 ? '#4ade80' : todayP < 0.50 ? '#fbbf24' : '#f87171';
+  if (sub) {{
+    var delta = Math.round((todayP - yesterdayP) * 100);
+    sub.textContent = (delta >= 0 ? '+' : '') + delta + 'pp vs yesterday';
+  }}
+  drawHrv();
+  drawIllnessSpark();
+}}
 
 // ── Brief carousel ────────────────────────────────────────────────────────────
 (function() {{
-  var cur = 0, total = 3, hovered = false, timer = null;
+  var cur = 0, total = 4, hovered = false, timer = null;
   var track = document.getElementById('brief-track');
   var carousel = document.getElementById('brief-carousel');
   var dots = document.querySelectorAll('.dot');
   var swipeX = 0;
+
+  // Pause auto-advance and submit-on-Ctrl+Enter while typing a note
+  var noteBox = document.getElementById('note-box');
+  if (noteBox) {{
+    noteBox.addEventListener('focus', function() {{ hovered = true; }});
+    noteBox.addEventListener('blur',  function() {{ hovered = false; }});
+    noteBox.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ e.preventDefault(); submitNote(); }}
+    }});
+  }}
 
   function goTo(n) {{
     cur = ((n % total) + total) % total;
@@ -1893,15 +2481,19 @@ function setNutritionCoach(text) {{
   carousel.addEventListener('mouseenter', function() {{ hovered = true; }});
   carousel.addEventListener('mouseleave', function() {{ hovered = false; }});
 
-  // Drag / swipe
-  track.addEventListener('mousedown', function(e) {{ swipeX = e.clientX; }});
+  // Drag / swipe — but never hijack interaction with the notes input
+  function inNotesInput(e) {{ return e.target.closest && e.target.closest('.notes-input'); }}
+  track.addEventListener('mousedown', function(e) {{
+    if (inNotesInput(e)) {{ swipeX = null; return; }}
+    swipeX = e.clientX; track.style.cursor = 'grabbing';
+  }});
   track.addEventListener('mouseup', function(e) {{
+    track.style.cursor = 'grab';
+    if (swipeX === null || inNotesInput(e)) return;
     var dx = e.clientX - swipeX;
     if (Math.abs(dx) > 40) goTo(dx < 0 ? cur + 1 : cur - 1);
   }});
   track.style.cursor = 'grab';
-  track.addEventListener('mousedown', function() {{ track.style.cursor = 'grabbing'; }});
-  track.addEventListener('mouseup',   function() {{ track.style.cursor = 'grab'; }});
 }})();
 
 // Stat hover tooltips
@@ -1942,6 +2534,204 @@ function triggerRefresh() {{
   if (btn) {{ btn.textContent = 'Refreshing…'; btn.disabled = true; }}
   document.title = '__refresh__';
 }}
+
+function submitMetric() {{
+  var metric = document.getElementById('log-metric').value;
+  var value  = parseFloat(document.getElementById('log-value').value);
+  var reps   = parseInt(document.getElementById('log-reps').value) || null;
+  var notes  = document.getElementById('log-notes').value.trim();
+  if (!metric || isNaN(value)) {{ return; }}
+  var payload = JSON.stringify({{metric:metric, value:value, reps:reps, notes:notes}});
+  document.title = '__logmetric__' + Date.now() + '|' + encodeURIComponent(payload);
+  // Clear inputs and confirm
+  document.getElementById('log-value').value = '';
+  document.getElementById('log-reps').value  = '';
+  document.getElementById('log-notes').value = '';
+  document.getElementById('log-metric').value = '';
+  var conf = document.getElementById('log-confirm');
+  if (conf) {{ conf.textContent = '✓ logged'; setTimeout(function(){{ conf.textContent=''; }}, 2500); }}
+}}
+
+// ── Performance tracker ───────────────────────────────────────────────────────
+var trackerVisible = false;
+
+function toggleTracker() {{
+  trackerVisible = !trackerVisible;
+  var charts  = document.querySelector('.charts');
+  var tracker = document.getElementById('tracker-view');
+  var btn     = document.getElementById('tracker-btn');
+  var period  = document.getElementById('periodSelect');
+  if (trackerVisible) {{
+    if (charts)  charts.classList.add('hidden');
+    if (tracker) tracker.classList.add('active');
+    if (btn)     btn.classList.add('active');
+    if (period)  period.style.display = 'none';
+    renderTracker();
+  }} else {{
+    if (charts)  charts.classList.remove('hidden');
+    if (tracker) tracker.classList.remove('active');
+    if (btn)     btn.classList.remove('active');
+    if (period)  period.style.display = '';
+    drawAll();
+  }}
+}}
+
+function renderTracker() {{
+  drawRadar();
+  renderMetricCards();
+}}
+
+function drawRadar() {{
+  var canvas = document.getElementById('c-radar');
+  if (!canvas) return;
+  var metrics = DATA.metrics || [];
+
+  // Aggregate into 6 radar axes
+  var axes = [
+    {{ label:'Strength',  keys:['squat_working','rdl_working','hip_thrust_working'] }},
+    {{ label:'Threshold', keys:['wr_20min_watts','peloton_ftp'] }},
+    {{ label:'Mobility',  keys:['mobility_hip','mobility_squat'] }},
+    {{ label:'Rate Power',keys:['rate_r18','rate_r22','rate_r26'] }},
+    {{ label:'2k Prog.',  keys:['2k_c2'] }},
+    {{ label:'Body',      keys:['bodyweight'] }},
+  ];
+
+  var byKey = {{}};
+  metrics.forEach(function(m) {{ byKey[m.key] = m; }});
+
+  var vals = axes.map(function(ax) {{
+    var pcts = ax.keys.map(function(k) {{ return byKey[k] ? byKey[k].pct : null; }}).filter(function(v){{return v!==null;}});
+    return pcts.length ? pcts.reduce(function(a,b){{return a+b;}},0)/pcts.length : 0;
+  }});
+
+  var dpr = window.devicePixelRatio || 1;
+  var S = 180;
+  canvas.style.width  = S + 'px';
+  canvas.style.height = S + 'px';
+  canvas.width  = S * dpr;
+  canvas.height = S * dpr;
+  var ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+  var W = S, H = S;
+  var cx = W/2, cy = H/2, r = W/2 - 28;
+  var n = axes.length;
+
+  // Background fill
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid rings
+  [0.25, 0.5, 0.75, 1.0].forEach(function(t) {{
+    ctx.beginPath();
+    for (var i=0; i<n; i++) {{
+      var a = i * 2*Math.PI/n - Math.PI/2;
+      var x = cx + t*r*Math.cos(a), y = cy + t*r*Math.sin(a);
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }}
+    ctx.closePath();
+    ctx.strokeStyle = t===1.0 ? '#334155' : '#1e293b';
+    ctx.lineWidth = 1; ctx.stroke();
+  }});
+
+  // Spokes and labels
+  for (var i=0; i<n; i++) {{
+    var a = i * 2*Math.PI/n - Math.PI/2;
+    ctx.strokeStyle='#1e293b'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a)); ctx.stroke();
+    var lx = cx + (r+14)*Math.cos(a), ly = cy + (r+14)*Math.sin(a);
+    ctx.fillStyle='#64748b'; ctx.font='9px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(axes[i].label, lx, ly);
+  }}
+
+  // Data polygon
+  ctx.beginPath();
+  for (var i=0; i<n; i++) {{
+    var pct = vals[i] !== null ? Math.min(vals[i], 120) / 100 : 0;
+    var a = i * 2*Math.PI/n - Math.PI/2;
+    var x = cx + pct*r*Math.cos(a), y = cy + pct*r*Math.sin(a);
+    if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }}
+  ctx.closePath();
+  ctx.fillStyle='rgba(167,139,250,0.15)'; ctx.fill();
+  ctx.strokeStyle='#a78bfa'; ctx.lineWidth=2; ctx.stroke();
+
+  // Target ring (100%)
+  ctx.beginPath();
+  for (var i=0; i<n; i++) {{
+    var a = i * 2*Math.PI/n - Math.PI/2;
+    if (i===0) ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a));
+    else ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a));
+  }}
+  ctx.closePath(); ctx.strokeStyle='rgba(167,139,250,0.35)'; ctx.lineWidth=1.5;
+  ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+
+  // Dots
+  for (var i=0; i<n; i++) {{
+    if (vals[i] === null) continue;
+    var pct = Math.min(vals[i], 120) / 100;
+    var a = i * 2*Math.PI/n - Math.PI/2;
+    ctx.beginPath(); ctx.arc(cx+pct*r*Math.cos(a), cy+pct*r*Math.sin(a), 3, 0, 2*Math.PI);
+    ctx.fillStyle='#a78bfa'; ctx.fill();
+  }}
+}}
+
+function renderMetricCards() {{
+  var container = document.getElementById('tracker-cards');
+  if (!container) return;
+  var metrics = DATA.metrics || [];
+  if (!metrics.length) {{
+    container.innerHTML = '<div style="color:#475569;font-size:12px;padding:8px">No test results yet — use the form below to log your first result.</div>';
+    return;
+  }}
+
+  container.innerHTML = metrics.map(function(m) {{
+    var jpct     = Math.max(0, Math.min(100, m.journey_pct));
+    var valStr   = m.lower ? formatTime(m.value, m.unit) : (m.value + m.unit);
+    var repsStr  = (m.reps && !m.lower) ? (' <span style="font-size:11px;color:#475569">×' + m.reps + '</span>') : '';
+    var startStr = m.lower ? formatTime(m.start, m.unit) : (m.start + m.unit);
+    var tgtStr   = m.lower ? formatTime(m.target, m.unit) : (m.target + m.unit);
+    var color    = m.color || '#a78bfa';
+    var spark    = renderSparkSVG(m.spark, m.lower, color);
+    var jpctCol  = jpct >= 66 ? '#4ade80' : jpct >= 33 ? '#fbbf24' : '#f87171';
+    return '<div class="metric-card">' +
+      '<div class="mc-label">' + m.label + '</div>' +
+      '<div><span class="mc-val" style="color:' + color + '">' + valStr + '</span>' +
+      repsStr + ' <span style="font-size:10px;color:' + jpctCol + '">' + Math.round(jpct) + '%</span></div>' +
+      '<div class="mc-bar-wrap">' +
+        '<div class="mc-bar-fill" style="width:' + jpct + '%;background:' + color + '"></div>' +
+      '</div>' +
+      '<div class="mc-journey"><span>' + startStr + '</span><span>→ ' + tgtStr + '</span></div>' +
+      (m.notes ? '<div class="mc-notes">' + m.notes + '</div>' : '') +
+      '<div class="mc-date">Tested ' + m.date + '</div>' +
+      spark +
+      '</div>';
+  }}).join('');
+}}
+
+function formatTime(secs, unit) {{
+  if (unit !== 's') return secs + unit;
+  var m = Math.floor(secs/60), s = Math.round(secs%60);
+  return m + ':' + (s<10?'0':'') + s;
+}}
+
+function renderSparkSVG(spark, lowerBetter, color) {{
+  if (!spark || spark.length < 2) return '';
+  var vals = spark.map(function(e){{return e.value;}});
+  var mn = Math.min.apply(null,vals), mx = Math.max.apply(null,vals);
+  var range = mx - mn || 1;
+  var W = 166, H = 26, pad = 3;
+  var pts = vals.map(function(v,i) {{
+    var x = pad + (i/(vals.length-1)) * (W-2*pad);
+    var frac = lowerBetter ? (mx - v) / range : (v - mn) / range;
+    var y = pad + (1 - frac) * (H - 2*pad);
+    return x + ',' + y;
+  }});
+  var trend = lowerBetter ? (vals[0] - vals[vals.length-1]) : (vals[vals.length-1] - vals[0]);
+  var trendCol = trend > 0 ? '#4ade80' : trend < 0 ? '#f87171' : '#475569';
+  return '<svg class="mc-spark" viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg">' +
+    '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linejoin="round"/>' +
+    '<circle cx="' + pts[pts.length-1].split(',')[0] + '" cy="' + pts[pts.length-1].split(',')[1] + '" r="2.5" fill="' + trendCol + '"/>' +
+    '</svg>';
+}}
 </script></body></html>"""
 
 
@@ -1973,15 +2763,57 @@ class BriefWindow(Gtk.Window):
         threading.Thread(target=self._fetch_and_render, daemon=True).start()
 
     def _on_title_changed(self, wv, _):
-        t = wv.get_title()
+        t = wv.get_title() or ""
         if t == "__close__":
             Gtk.main_quit()
         elif t == "__refresh__":
             self._refresh()
+        elif t.startswith("__note__"):
+            import urllib.parse
+            _nonce, _, enc = t[len("__note__"):].partition("|")
+            text = urllib.parse.unquote(enc)
+            add_note(text)
+            self._notes_changed()
+        elif t.startswith("__clearnotes__"):
+            clear_notes()
+            self._notes_changed()
+        elif t.startswith("__logmetric__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t[len("__logmetric__"):].partition("|")
+            try:
+                entry_dict = json.loads(_up.unquote(enc))
+                add_metric_entry(entry_dict)
+                new_metrics = build_metrics_data(load_test_metrics().get("entries", []))
+                metrics_json = json.dumps(new_metrics).replace("\\", "\\\\").replace("'", "\\'")
+                GLib.idle_add(
+                    lambda: self.wv.run_javascript(
+                        f"DATA.metrics={metrics_json}; renderTracker();",
+                        None, None, None) or False)
+            except Exception:
+                log.exception("logmetric failed")
+
+    def _notes_changed(self):
+        """Refresh the notes list in the UI and reprocess all briefs with the new context."""
+        notes_html = render_notes_html().replace("\\", "\\\\").replace("'", "\\'")
+        GLib.idle_add(
+            lambda: self.wv.run_javascript(
+                f"setNotes('{notes_html}')", None, None, None) or False)
+        if getattr(self, "_last_data", None):
+            wellness, activities, training_plan, food_data, illness = self._last_data
+            # Show the briefs regenerating, then re-run the LLM with note context included
+            GLib.idle_add(
+                lambda: self.wv.run_javascript(
+                    "setCoachBrief('Regenerating…', '');"
+                    "setNutritionCoach('Regenerating…');", None, None, None) or False)
+            threading.Thread(
+                target=self._fetch_claude,
+                args=(wellness, activities, training_plan, food_data, illness),
+                daemon=True).start()
 
     def _refresh(self):
         self.wv.load_html(LOADING_HTML, "file:///")
-        threading.Thread(target=self._fetch_and_render, daemon=True).start()
+        threading.Thread(target=self._fetch_and_render, kwargs={"force_illness_full": True},
+                         daemon=True).start()
 
     def _status(self, msg):
         # Update the loading screen status text via JS (safe from any thread via idle_add)
@@ -1995,11 +2827,10 @@ class BriefWindow(Gtk.Window):
     def _load(self, html):
         GLib.idle_add(lambda: self.wv.load_html(html, "file:///") or False)
 
-    def _fetch_and_render(self):
+    def _fetch_and_render(self, force_illness_full=False):
         config     = load_config()
         athlete_id = config["athlete_id"]
         api_key    = config["api_key"]
-        gemini_key = config.get("gemini_api_key", "")
 
         try:
             wellness = fetch_with_retry(
@@ -2017,18 +2848,29 @@ class BriefWindow(Gtk.Window):
         food_data       = get_today_nutrition()
         food_data["_calorie_target"] = calorie_target
 
-        # Load charts immediately — coach brief fills in asynchronously
+        # Grab cached illness data synchronously (instant — no model run)
+        illness = get_cached_result() if _ILLNESS_AVAILABLE else None
+
+        # Stash so briefs can be reprocessed (e.g. after a note) without re-fetching
+        self._last_data = (wellness, activities, training_plan, food_data, illness)
+
+        # Load charts immediately — coach brief and illness model fill in asynchronously
         self._load(build_html(wellness, activities, training_plan,
                                summary=None, calorie_target=calorie_target,
-                               food_data=food_data))
+                               food_data=food_data, illness=illness))
 
-        if gemini_key:
+        threading.Thread(
+            target=self._fetch_claude,
+            args=(wellness, activities, training_plan, food_data, illness),
+            daemon=True).start()
+
+        if _ILLNESS_AVAILABLE:
             threading.Thread(
-                target=self._fetch_gemini,
-                args=(wellness, activities, training_plan, gemini_key, food_data),
+                target=self._fetch_illness,
+                args=(wellness, force_illness_full),
                 daemon=True).start()
 
-    def _fetch_gemini(self, wellness, activities, training_plan, gemini_key, food_data=None):
+    def _fetch_claude(self, wellness, activities, training_plan, food_data=None, illness=None):
         time.sleep(0.8)
         import re
         def md_to_html(s):
@@ -2044,51 +2886,73 @@ class BriefWindow(Gtk.Window):
         esc     = md_to_html
         esc_tip = strip_md
 
-        any_stale     = False
-        coach_summary = None
-        try:
-            coach_summary, stale = get_gemini_summary(
-                build_data_text(wellness, activities, training_plan), gemini_key)
-            any_stale = any_stale or stale
-            overview = esc(coach_summary.get("overview", ""))
-            tips     = esc(coach_summary.get("tips", ""))
-            GLib.idle_add(
-                lambda: self.wv.run_javascript(
-                    f"setCoachBrief('{overview}', '{tips}')", None, None, None) or False)
-        except Exception:
-            GLib.idle_add(
-                lambda: self.wv.run_javascript(
-                    "setCoachBrief('Brief unavailable.', '')", None, None, None) or False)
+        def _js(code):
+            GLib.idle_add(lambda c=code: self.wv.run_javascript(c, None, None, None) or False)
 
-        try:
-            insight, stale = get_nutrition_insight(gemini_key)
-            any_stale = any_stale or stale
-            if insight:
-                e = esc_tip(insight)
-                GLib.idle_add(
-                    lambda: self.wv.run_javascript(
-                        f"setNutritionInsight('{e}')", None, None, None) or False)
-        except Exception:
-            pass
-
-        try:
-            nutr_brief, stale = get_nutrition_coach(activities, training_plan, gemini_key,
+        # Critical path: coach brief, then the nutrition coach (which uses it as context)
+        def coach_worker():
+            coach_summary = None
+            try:
+                coach_summary, _ = get_claude_summary(
+                    build_data_text(wellness, activities, training_plan, illness=illness))
+                _js(f"setCoachBrief('{esc(coach_summary.get('overview', ''))}', "
+                    f"'{esc(coach_summary.get('tips', ''))}')")
+            except Exception:
+                log.exception("coach brief failed")
+                _js("setCoachBrief('Brief unavailable.', '')")
+            try:
+                nutr_brief, _ = get_nutrition_coach(activities, training_plan,
                                                     coach_summary=coach_summary)
-            any_stale = any_stale or stale
-            if nutr_brief:
-                en = esc(nutr_brief)
-                GLib.idle_add(
-                    lambda: self.wv.run_javascript(
-                        f"setNutritionCoach('{en}')", None, None, None) or False)
-        except Exception:
-            GLib.idle_add(
-                lambda: self.wv.run_javascript(
-                    "setNutritionCoach('Nutrition brief unavailable.')", None, None, None) or False)
+                if nutr_brief:
+                    _js(f"setNutritionCoach('{esc(nutr_brief)}')")
+            except Exception:
+                log.exception("nutrition coach brief failed")
+                _js("setNutritionCoach('Nutrition brief unavailable.')")
 
-        if any_stale:
-            GLib.idle_add(
-                lambda: self.wv.run_javascript(
-                    "showStaleWarning()", None, None, None) or False)
+        def insight_worker():
+            try:
+                insight, _ = get_nutrition_insight()
+                if insight:
+                    _js(f"setNutritionInsight('{esc_tip(insight)}')")
+            except Exception:
+                log.exception("nutrition insight failed")
+
+        # Let the LLM log any clearly-described upcoming sessions from the notes
+        def extract_worker():
+            try:
+                added = extract_sessions_from_notes(load_notes().get("active", []))
+                if added:
+                    summary = "; ".join(f"{a['date']} {a['name']}" for a in added)
+                    msg = ("✓ Added to plan: " + summary).replace("\\", "\\\\").replace("'", "\\'")
+                    _js("var l=document.getElementById('notes-list');"
+                        "if(l){var d=document.createElement('div');d.className='note-added';"
+                        "d.textContent='" + msg + "';l.insertBefore(d,l.firstChild);}")
+            except Exception:
+                log.exception("session extraction failed")
+
+        # Run the independent LLM calls concurrently — each claude -p call is ~4-5s,
+        # so this cuts a full regenerate from ~4 calls in series to ~2 on the critical path.
+        workers = [threading.Thread(target=w, daemon=True)
+                   for w in (coach_worker, insight_worker, extract_worker)]
+        for w in workers: w.start()
+        for w in workers: w.join()
+
+    def _fetch_illness(self, wellness, force_full=False):
+        try:
+            result = get_illness_data(wellness, force_full=force_full)
+        except Exception:
+            return
+        today_dt    = datetime.now()
+        spark_dates = [(today_dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+        spark_vals  = [round(result.by_date.get(d, 0.0), 4) for d in spark_dates]
+        today_p     = float(result.today)
+        yesterday_p = float(result.yesterday)
+        bands_json  = json.dumps(result.bands)
+        spark_json  = json.dumps({"dates": spark_dates, "vals": spark_vals})
+        GLib.idle_add(
+            lambda: self.wv.run_javascript(
+                f"setIllnessData({today_p:.4f}, {yesterday_p:.4f}, {bands_json}, {spark_json})",
+                None, None, None) or False)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
