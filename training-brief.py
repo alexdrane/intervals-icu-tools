@@ -2292,11 +2292,20 @@ function drawCalHistory() {{
 // measurements and widens over unmeasured stretches.
 function dayNum(d) {{ return Math.floor(new Date(d+'T00:00:00').getTime()/86400000); }}
 
-function gpPredict(xTrain, yTrain, xQuery, lengthscale, sigmaF, sigmaN) {{
+// `kernels` is a list of {{l: lengthscale, sf: amplitude}} RBF components,
+// summed. A single short lengthscale reverts to the flat prior mean within
+// a few lengthscales of any data — a long-lengthscale component carries the
+// slow trend across gaps instead of collapsing to a flat line, while a
+// short-lengthscale component still lets the fit snap to local measurements.
+function gpPredict(xTrain, yTrain, xQuery, kernels, sigmaN) {{
   const n = xTrain.length;
   const yMean = yTrain.reduce((a,b)=>a+b,0)/n;
   const yC = yTrain.map(y=>y-yMean);
-  const kern = (a,b)=>{{ const d=a-b; return sigmaF*sigmaF*Math.exp(-(d*d)/(2*lengthscale*lengthscale)); }};
+  const kern = (a,b)=>{{
+    const d=a-b;
+    return kernels.reduce((s,{{l,sf}})=>s+sf*sf*Math.exp(-(d*d)/(2*l*l)),0);
+  }};
+  const priorVar = kernels.reduce((s,{{sf}})=>s+sf*sf,0);
   // Covariance matrix + measurement-noise jitter on the diagonal.
   const K = Array.from({{length:n}},(_,i)=>Array.from({{length:n}},(_,j)=>kern(xTrain[i],xTrain[j])+(i===j?sigmaN*sigmaN:0)));
   // Cholesky decomposition K = Lc Lc^T.
@@ -2320,7 +2329,7 @@ function gpPredict(xTrain, yTrain, xQuery, lengthscale, sigmaF, sigmaN) {{
     const v = new Array(n);
     for (let i=0;i<n;i++) {{ let sum=kStar[i]; for (let k=0;k<i;k++) sum-=Lc[i][k]*v[k]; v[i]=sum/Lc[i][i]; }}
     const vtv = v.reduce((s,x)=>s+x*x,0);
-    std[q] = Math.sqrt(Math.max(sigmaF*sigmaF - vtv, 1e-6));
+    std[q] = Math.sqrt(Math.max(priorVar - vtv, 1e-6));
   }}
   return {{mean, std}};
 }}
@@ -2344,7 +2353,12 @@ function drawWeight() {{
   const yTrain = DATA.weightVals;
   const xQuery = sDates.map(dayNum);
   const yStd = Math.sqrt(yTrain.reduce((s,v)=>{{const d=v-yTrain.reduce((a,b)=>a+b,0)/yTrain.length; return s+d*d;}},0)/yTrain.length);
-  const {{mean,std}} = gpPredict(xTrain, yTrain, xQuery, /*lengthscale days*/14, /*sigmaF*/Math.max(yStd,0.5), /*sigmaN*/0.05);
+  const ampl = Math.max(yStd,0.5);
+  const kernels = [
+    {{l:60, sf:ampl*0.9}},  // slow trend — carries the shape across gaps instead of reverting to the flat mean
+    {{l:6,  sf:ampl*0.45}}, // local wiggle — lets the fit snap to nearby measurements
+  ];
+  const {{mean,std}} = gpPredict(xTrain, yTrain, xQuery, kernels, /*sigmaN*/0.15);
   const bandHi = mean.map((m,i)=>m+1.96*std[i]), bandLo = mean.map((m,i)=>m-1.96*std[i]);
   const lo=Math.min(...bandLo,...logged)*0.997, hi=Math.max(...bandHi,...logged)*1.003, span=hi-lo||1;
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
