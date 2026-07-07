@@ -2285,6 +2285,46 @@ function drawCalHistory() {{
   ]}};
 }}
 
+// ── GP regression (RBF kernel) for the weight chart ──────────────────────────
+// Weigh-ins are sparse and irregularly spaced, so a spline/polyline through
+// raw points is noisy and visually misleading. A GP posterior mean + 95% CI
+// gives a principled trend line whose uncertainty band narrows near
+// measurements and widens over unmeasured stretches.
+function dayNum(d) {{ return Math.floor(new Date(d+'T00:00:00').getTime()/86400000); }}
+
+function gpPredict(xTrain, yTrain, xQuery, lengthscale, sigmaF, sigmaN) {{
+  const n = xTrain.length;
+  const yMean = yTrain.reduce((a,b)=>a+b,0)/n;
+  const yC = yTrain.map(y=>y-yMean);
+  const kern = (a,b)=>{{ const d=a-b; return sigmaF*sigmaF*Math.exp(-(d*d)/(2*lengthscale*lengthscale)); }};
+  // Covariance matrix + measurement-noise jitter on the diagonal.
+  const K = Array.from({{length:n}},(_,i)=>Array.from({{length:n}},(_,j)=>kern(xTrain[i],xTrain[j])+(i===j?sigmaN*sigmaN:0)));
+  // Cholesky decomposition K = Lc Lc^T.
+  const Lc = Array.from({{length:n}},()=>new Array(n).fill(0));
+  for (let i=0;i<n;i++) {{
+    for (let j=0;j<=i;j++) {{
+      let sum = K[i][j];
+      for (let k=0;k<j;k++) sum -= Lc[i][k]*Lc[j][k];
+      Lc[i][j] = (i===j) ? Math.sqrt(Math.max(sum,1e-10)) : sum/Lc[j][j];
+    }}
+  }}
+  // Solve Lc z = yC, then Lc^T alpha = z.
+  const z = new Array(n);
+  for (let i=0;i<n;i++) {{ let sum=yC[i]; for (let k=0;k<i;k++) sum-=Lc[i][k]*z[k]; z[i]=sum/Lc[i][i]; }}
+  const alpha = new Array(n);
+  for (let i=n-1;i>=0;i--) {{ let sum=z[i]; for (let k=i+1;k<n;k++) sum-=Lc[k][i]*alpha[k]; alpha[i]=sum/Lc[i][i]; }}
+  const mean = new Array(xQuery.length), std = new Array(xQuery.length);
+  for (let q=0;q<xQuery.length;q++) {{
+    const kStar = xTrain.map(x=>kern(xQuery[q],x));
+    mean[q] = yMean + kStar.reduce((s,k,i)=>s+k*alpha[i],0);
+    const v = new Array(n);
+    for (let i=0;i<n;i++) {{ let sum=kStar[i]; for (let k=0;k<i;k++) sum-=Lc[i][k]*v[k]; v[i]=sum/Lc[i][i]; }}
+    const vtv = v.reduce((s,x)=>s+x*x,0);
+    std[q] = Math.sqrt(Math.max(sigmaF*sigmaF - vtv, 1e-6));
+  }}
+  return {{mean, std}};
+}}
+
 function drawWeight() {{
   const {{ctx,W,H}}=setupCanvas('c-wt','w-wt');
   const PAD={{top:4,right:10,bottom:22,left:36}};
@@ -2292,34 +2332,44 @@ function drawWeight() {{
     ctx.fillStyle='#334155'; ctx.font='11px sans-serif'; ctx.textAlign='center';
     ctx.fillText('No weight data logged',W/2,H/2); return;
   }}
-  // Aligned to the full calendar-day axis (DATA.dates) so gaps between
-  // weigh-ins are spaced by actual elapsed time, not by log count.
-  const [sDates,sVals]=sliceByDays(DATA.dates,DATA.weightValsFull);
-  const logged=sVals.filter(v=>v!=null);
+  // Aligned to the full calendar-day axis (DATA.dates) so the fit is
+  // evaluated on a uniform grid regardless of how sparse logging was.
+  const [sDates,sValsFull]=sliceByDays(DATA.dates,DATA.weightValsFull);
+  const logged=sValsFull.filter(v=>v!=null);
   if(!logged.length) return;
-  const lo=Math.min(...logged)*0.997, hi=Math.max(...logged)*1.003, span=hi-lo||1;
+  // Fit against the *full* logged history (not just the visible window) so
+  // the trend near the edges of the chart isn't starved of context, then
+  // evaluate the posterior only over the visible dense day-grid.
+  const xTrain = DATA.weightDates.map(dayNum);
+  const yTrain = DATA.weightVals;
+  const xQuery = sDates.map(dayNum);
+  const yStd = Math.sqrt(yTrain.reduce((s,v)=>{{const d=v-yTrain.reduce((a,b)=>a+b,0)/yTrain.length; return s+d*d;}},0)/yTrain.length);
+  const {{mean,std}} = gpPredict(xTrain, yTrain, xQuery, /*lengthscale days*/14, /*sigmaF*/Math.max(yStd,0.5), /*sigmaN*/0.05);
+  const bandHi = mean.map((m,i)=>m+1.96*std[i]), bandLo = mean.map((m,i)=>m-1.96*std[i]);
+  const lo=Math.min(...bandLo,...logged)*0.997, hi=Math.max(...bandHi,...logged)*1.003, span=hi-lo||1;
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const yOf=v=>PAD.top+(1-(v-lo)/span)*cH;
   const xOf=i=>PAD.left+(i/Math.max(sDates.length-1,1))*cW;
   chartAxes(ctx,W,H,lo,hi,3,PAD,sDates);
-  // Connect only the logged points with one continuous line — using dense
-  // xOf (not the filtered points' own index) keeps the true time spacing,
-  // while skipping nulls (rather than breaking the line, like plotSeries
-  // does) avoids the sparse weigh-ins rendering as disconnected dots.
-  // Straight segments, not drawSmooth's spline — that spline assumes roughly
-  // even point spacing and overshoots badly when weigh-in gaps are wildly
-  // uneven in time (days vs. months apart).
-  const pts=sVals.map((v,i)=>v!=null?{{x:xOf(i),y:yOf(v)}}:null).filter(Boolean);
-  ctx.strokeStyle='#a78bfa'; ctx.lineWidth=1.5; ctx.lineJoin='round';
+  // 95% CI band
+  ctx.fillStyle='rgba(167,139,250,.15)';
   ctx.beginPath();
-  pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
-  ctx.stroke();
-  // Dots
-  pts.forEach(p=>{{
-    ctx.fillStyle='#a78bfa'; ctx.beginPath(); ctx.arc(p.x,p.y,2.5,0,Math.PI*2); ctx.fill();
+  bandHi.forEach((v,i)=>i===0?ctx.moveTo(xOf(i),yOf(v)):ctx.lineTo(xOf(i),yOf(v)));
+  for (let i=bandLo.length-1;i>=0;i--) ctx.lineTo(xOf(i),yOf(bandLo[i]));
+  ctx.closePath(); ctx.fill();
+  // GP mean — smooth is safe here since xQuery is an evenly-spaced daily grid.
+  const meanPts = mean.map((m,i)=>({{x:xOf(i),y:yOf(m)}}));
+  ctx.strokeStyle='#a78bfa'; ctx.lineWidth=1.5; ctx.lineJoin='round';
+  ctx.beginPath(); drawSmooth(ctx,meanPts); ctx.stroke();
+  // Scatter of actual measurements
+  sValsFull.forEach((v,i)=>{{
+    if(v==null) return;
+    ctx.fillStyle='#c4b5fd'; ctx.strokeStyle='#0f172a'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(xOf(i),yOf(v),2.5,0,Math.PI*2); ctx.fill(); ctx.stroke();
   }});
   CHART_META['c-wt']={{dates:sDates,PAD,yOf,series:[
-    {{label:'Weight',data:sVals,color:'#a78bfa',fmt:v=>v.toFixed(1)+' kg'}},
+    {{label:'Weight (fit)',data:mean,color:'#a78bfa',fmt:v=>v.toFixed(1)+' kg'}},
+    {{label:'Logged',data:sValsFull,color:'#c4b5fd',fmt:v=>v.toFixed(1)+' kg'}},
   ]}};
 }}
 
