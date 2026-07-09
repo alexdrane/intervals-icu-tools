@@ -330,7 +330,7 @@ def get_illness_data(wellness_entries, force_full=False):
         bands   = _bands_from_dict(by_date)
         return IllnessResult(
             by_date   = by_date,
-            today     = by_date.get(today_str, 0.0),
+            today     = by_date.get(today_str),
             yesterday = by_date.get(yesterday_str, 0.0),
             bands     = bands,
             fresh     = False,
@@ -377,7 +377,7 @@ def get_illness_data(wellness_entries, force_full=False):
     bands = _episodes(dates, p_sick)
     return IllnessResult(
         by_date   = existing,
-        today     = existing.get(today_str, 0.0),
+        today     = existing.get(today_str),
         yesterday = existing.get(yesterday_str, 0.0),
         bands     = bands,
         fresh     = True,
@@ -410,7 +410,7 @@ def get_cached_result():
     by_date = cache["illness"]
     return IllnessResult(
         by_date   = by_date,
-        today     = by_date.get(today_str, 0.0),
+        today     = by_date.get(today_str),
         yesterday = by_date.get(yesterday_str, 0.0),
         bands     = _bands_from_dict(by_date),
         fresh     = False,
