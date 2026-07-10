@@ -148,36 +148,98 @@ def metric_history(entries, metric):
     return [e for e in entries if e.get("metric") == metric]
 
 
-# Benchmark metrics + radar groupings are per-user, not per-checkout — every
-# athlete tracks different lifts/tests. Real config lives in BENCHMARKS_FILE
-# (gitignored); this is only the placeholder seeded for a fresh install, and
-# intentionally sport-agnostic rather than shaped around any one person's plan.
+# Benchmark metrics are per-user, not per-checkout — every athlete tracks different
+# lifts and tests. Real config lives in BENCHMARKS_FILE (gitignored); this is only
+# the placeholder seeded for a fresh install, and intentionally sport-agnostic.
+#
+# Every metric sits in exactly one tier:
+#   "goal" — a headline objective, drawn as a full-width progress chart
+#   "key"  — a repeatable test; one axis on the radar, and fed to the coach
+#   "bank" — tracked and stored, but off the radar (old PBs, cross-training)
+TIERS = ("goal", "key", "bank")
+DEFAULT_TIER = "bank"
+
 DEFAULT_BENCHMARKS = {
     "metrics": {
-        "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#a78bfa"},
-        "row_2k":     {"label": "2k row",                   "target": 420, "unit": "s",  "color": "#f59e0b", "lower_is_better": True},
-        "bodyweight": {"label": "Body weight",              "target": 80,  "unit": "kg", "color": "#94a3b8"},
+        "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#a78bfa",
+                       "tier": "key", "rep_weighted": True},
+        "row_2k":     {"label": "2k row",                   "target": 420, "unit": "s",  "color": "#f59e0b",
+                       "tier": "goal", "lower_is_better": True},
+        "bodyweight": {"label": "Body weight",              "target": 80,  "unit": "kg", "color": "#94a3b8",
+                       "tier": "key"},
     },
-    "radar_axes": [
-        {"label": "Strength",  "keys": ["back_squat"]},
-        {"label": "Endurance", "keys": ["row_2k"]},
-        {"label": "Body",      "keys": ["bodyweight"]},
-    ],
 }
 
 
+def save_benchmark_config(cfg):
+    os.makedirs(os.path.dirname(BENCHMARKS_FILE), exist_ok=True)
+    tmp = BENCHMARKS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, BENCHMARKS_FILE)   # atomic: never leave a half-written config
+
+
 def load_benchmark_config():
-    """Load the user's benchmark metrics + radar groupings, seeding a
-    placeholder file on first run (mirrors load_training_plan)."""
+    """Load the user's benchmark metrics, seeding a placeholder on first run.
+
+    Migrates the old `radar_axes` grouping to a per-metric `tier`. Radar axes are
+    now derived from the metrics themselves — one axis per "key" metric — so there
+    is a single source of truth rather than two that can drift apart.
+    """
     if not os.path.exists(BENCHMARKS_FILE):
-        os.makedirs(os.path.dirname(BENCHMARKS_FILE), exist_ok=True)
-        with open(BENCHMARKS_FILE, "w") as f:
-            json.dump(DEFAULT_BENCHMARKS, f, indent=2)
-        return DEFAULT_BENCHMARKS
+        save_benchmark_config(DEFAULT_BENCHMARKS)
+        return json.loads(json.dumps(DEFAULT_BENCHMARKS))   # deep copy
     with open(BENCHMARKS_FILE) as f:
         cfg = json.load(f)
     cfg.setdefault("metrics", {})
-    cfg.setdefault("radar_axes", [])
+
+    if any("tier" not in m for m in cfg["metrics"].values()):
+        on_radar = {k for ax in cfg.get("radar_axes", []) for k in ax.get("keys", [])}
+        for key, meta in cfg["metrics"].items():
+            meta.setdefault("tier", "key" if key in on_radar else DEFAULT_TIER)
+        cfg.pop("radar_axes", None)
+        save_benchmark_config(cfg)
+    else:
+        cfg.pop("radar_axes", None)
+
+    for meta in cfg["metrics"].values():
+        if meta.get("tier") not in TIERS:
+            meta["tier"] = DEFAULT_TIER
+    return cfg
+
+
+def mutate_metric_config(action, key, fields=None):
+    """Apply a single config edit from the UI. Returns the updated config.
+
+    Removing a metric drops its *definition* only — logged results stay in
+    METRICS_FILE, so re-adding the key brings its history back.
+    """
+    fields = fields or {}
+    cfg = load_benchmark_config()
+    metrics = cfg["metrics"]
+
+    if action == "remove":
+        metrics.pop(key, None)
+    else:
+        if action == "add" and key in metrics:
+            raise ValueError(f"metric '{key}' already exists")
+        if action == "update" and key not in metrics:
+            raise KeyError(f"unknown metric '{key}'")
+        meta = metrics.setdefault(key, {"color": "#a78bfa", "unit": "", "target": 0, "tier": DEFAULT_TIER})
+        for f in ("label", "unit", "color", "tier", "notes"):
+            if f in fields:
+                meta[f] = fields[f]
+        for f in ("target", "baseline", "rep_ref"):
+            if f in fields and fields[f] is not None and fields[f] != "":
+                meta[f] = float(fields[f]) if f != "rep_ref" else int(fields[f])
+        for f in ("lower_is_better", "rep_weighted"):
+            if f in fields:
+                meta[f] = bool(fields[f])
+        if meta.get("tier") not in TIERS:
+            meta["tier"] = DEFAULT_TIER
+        meta.setdefault("label", key.replace("_", " ").title())
+
+    save_benchmark_config(cfg)
     return cfg
 
 
@@ -207,7 +269,21 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
     result = []
     for key, meta in metric_targets.items():
         history = weight_history if (key == "bodyweight" and weight_history) else metric_history(entries, key)
+        tier    = meta.get("tier", DEFAULT_TIER)
         if not history:
+            # Still emit a card: a metric added from the UI has no results yet, and
+            # without a card there is nowhere to edit it or log its first entry.
+            result.append({
+                "key": key, "label": meta.get("label", key), "tier": tier,
+                "has_data": False, "value": None, "scored": None, "e1rm": None,
+                "rep_ref": None, "reps": None,
+                "start": meta.get("baseline"), "target": meta.get("target"),
+                "unit": meta.get("unit", ""), "color": meta.get("color", "#a78bfa"),
+                "journey_pct": 0, "date": None, "notes": "",
+                "lower": meta.get("lower_is_better", False),
+                "rep_weighted": bool(meta.get("rep_weighted")),
+                "spark": [], "history": [],
+            })
             continue
         latest  = history[-1]
         first   = history[0]
@@ -247,17 +323,22 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
         subtitle = " · ".join(bits)
 
         # Sparkline follows whatever is being scored, or it would contradict the bar.
-        spark = [{"date": e["date"],
-                  "value": (rep_normalised(e["value"], e.get("reps"), rep_ref)
-                            if weighted else e["value"])}
-                 for e in history[-12:]]
+        def _scored(e):
+            return (rep_normalised(e["value"], e.get("reps"), rep_ref)
+                    if weighted else e["value"])
+
+        full = [{"date": e["date"], "value": _scored(e), "raw": e["value"],
+                 "reps": e.get("reps")} for e in history]
         result.append({
             "key":          key,
             "label":        meta["label"],
+            "tier":         tier,
+            "has_data":     True,
             "value":        raw,
             "scored":       score,
             "e1rm":         e1rm,
             "rep_ref":      rep_ref if weighted else None,
+            "rep_weighted": weighted,
             "reps":         reps,
             "start":        start,
             "target":       tgt,
@@ -267,7 +348,8 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
             "date":         latest["date"],
             "notes":        subtitle,
             "lower":        lower,
-            "spark":        spark,
+            "spark":        full[-12:],
+            "history":      full,           # goal charts plot the whole series
         })
     return result
 
@@ -1278,7 +1360,56 @@ def build_data_text(wellness, activities, training_plan=None, food_data=None, il
             day_name = note_date.strftime("%A")
             lines.append(f"  [{day} {day_name}, {rel}] {n['text']}")
 
+    lines.extend(_benchmark_lines(wellness))
     return "\n".join(lines)
+
+
+def _benchmark_lines(wellness):
+    """Goals and key metrics, for the coach prompt.
+
+    Stored ("bank") metrics are deliberately omitted: they are a record of PBs the
+    athlete is not currently working on, and padding the prompt with them dilutes
+    the targets that actually matter.
+    """
+    try:
+        cfg = load_benchmark_config()
+        weight_history = [{"date": w["id"], "value": w["weight"]}
+                          for w in wellness if w.get("weight") and w.get("id")]
+        metrics = build_metrics_data(load_test_metrics().get("entries", []),
+                                     cfg["metrics"], weight_history=weight_history)
+    except Exception:
+        log.exception("benchmark lines failed")
+        return []
+
+    def fmt(m, v):
+        if v is None:
+            return "—"
+        if m["lower"]:
+            mins, secs = divmod(int(v), 60)
+            return f"{mins}:{secs:02d}"
+        return f"{v:g}{m['unit']}"
+
+    out = []
+    for tier, heading in (("goal", "GOALS"), ("key", "KEY BENCHMARKS")):
+        rows = [m for m in metrics if m["tier"] == tier]
+        if not rows:
+            continue
+        out.append("")
+        out.append(f"{heading}:")
+        for m in rows:
+            if not m["has_data"]:
+                out.append(f"  {m['label']}: no result logged yet "
+                           f"(target {fmt(m, m['target'])})")
+                continue
+            scored = ""
+            if m.get("rep_weighted") and m.get("reps"):
+                scored = (f", set {m['value']:g}{m['unit']}×{m['reps']} "
+                          f"= {m['scored']:g}{m['unit']} at {m['rep_ref']} reps")
+            out.append(
+                f"  {m['label']}: {fmt(m, m['value'])} on {m['date']}{scored} · "
+                f"baseline {fmt(m, m['start'])} → target {fmt(m, m['target'])} "
+                f"({m['journey_pct']:.0f}% of the way)")
+    return out
 
 
 def get_claude_summary(data_text):
@@ -1916,7 +2047,6 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     metric_options_html = "\n".join(
         f'<option value="{key}">{meta["label"]}</option>'
         for key, meta in benchmark_cfg["metrics"].items() if key != "bodyweight")
-    radar_axes_json = json.dumps(benchmark_cfg["radar_axes"])
 
     chart_data = json.dumps({
         "dates": chart_dates, "ctl": ctl_vals, "atl": atl_vals, "tsb": tsb_vals,
@@ -2191,6 +2321,60 @@ button:hover{{background:#334155;color:#e2e8f0}}
   font-size:11px; padding:3px 12px; }}
 .log-form .log-btn:hover {{ background:#3730a3; }}
 .log-added {{ font-size:10px; color:#4ade80; padding:2px 0; }}
+
+/* ── Modular tracker: goals / key metrics / stored ─────────────────────────── */
+.tracker-cols {{ flex:1; min-width:0; }}
+.tier-head {{ display:flex; align-items:baseline; gap:10px; margin-bottom:7px; }}
+.tier-hint {{ font-size:9.5px; color:#475569; }}
+.radar-hint {{ font-size:9px; color:#475569; margin-top:2px; }}
+.add-metric-btn {{ margin-left:auto; font-size:10.5px; padding:2px 9px;
+  background:#1e293b; border:1px solid #334155; color:#94a3b8; border-radius:5px; cursor:pointer; }}
+.add-metric-btn:hover {{ background:#334155; color:#e2e8f0; }}
+
+.goals-section {{ display:flex; flex-direction:column; gap:12px; margin-bottom:6px; }}
+.goal-empty {{ font-size:11.5px; color:#475569; background:#131c2f; border:1px dashed #1e3a5f;
+  border-radius:8px; padding:12px 14px; }}
+.goal-card {{ background:#131c2f; border:1px solid #1e3a5f; border-radius:9px; padding:12px 14px; }}
+.goal-head {{ display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:8px; }}
+.goal-label {{ font-size:13px; font-weight:600; color:#e2e8f0; }}
+.goal-sub {{ font-size:10px; color:#64748b; margin-top:2px; font-variant-numeric:tabular-nums; }}
+.goal-now {{ text-align:right; font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }}
+.goal-pct {{ display:block; font-size:10px; color:#64748b; font-weight:400; }}
+.goal-wrap {{ position:relative; height:150px; }}
+.tier-pill {{ margin-left:8px; font-size:8px; letter-spacing:.08em; text-transform:uppercase;
+  color:#67e8f9; background:#0b2b33; border:1px solid #155e6b; border-radius:4px; padding:2px 5px;
+  vertical-align:2px; font-weight:600; }}
+
+.mc-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:6px; }}
+.mc-actions {{ display:flex; align-items:center; gap:3px; flex-shrink:0; }}
+.mc-none {{ font-size:10.5px; color:#475569; font-style:italic; margin:6px 0; }}
+.metric-card.stored {{ opacity:.62; }}
+.metric-card.stored:hover {{ opacity:1; }}
+.metric-card.empty {{ border-style:dashed; }}
+
+.tier-btns {{ display:flex; gap:1px; }}
+.tier-btn, .edit-btn {{ background:none; border:1px solid transparent; border-radius:4px;
+  color:#475569; font-size:11px; line-height:1; padding:2px 4px; cursor:pointer; }}
+.tier-btn:hover, .edit-btn:hover {{ color:#94a3b8; background:#0f172a; }}
+.tier-btn.active {{ color:#a78bfa; border-color:#a78bfa; background:#1e1b4b; }}
+
+.metric-form {{ margin-top:9px; padding:10px; background:#0f172a; border:1px solid #334155;
+  border-radius:7px; display:flex; flex-wrap:wrap; gap:7px; }}
+.metric-form label {{ display:flex; flex-direction:column; gap:2px; font-size:9px; color:#64748b;
+  text-transform:uppercase; letter-spacing:.05em; }}
+.metric-form label.chk {{ flex-direction:row; align-items:center; gap:5px; text-transform:none;
+  letter-spacing:0; font-size:10.5px; color:#94a3b8; }}
+.metric-form input[type=text], .metric-form input[type=number], .metric-form select {{
+  -webkit-appearance:none; appearance:none; background:#1e293b; border:1px solid #334155;
+  border-radius:4px; color:#e2e8f0; font-size:11px; padding:4px 6px; width:104px; outline:none; }}
+.metric-form input:focus, .metric-form select:focus {{ border-color:#a78bfa; }}
+.metric-form-actions {{ display:flex; gap:6px; align-items:flex-end; width:100%; }}
+.metric-form-actions button {{ font-size:11px; padding:3px 11px; }}
+.metric-form-actions .danger {{ margin-left:auto; background:transparent; border-color:#7f1d1d;
+  color:#f87171; }}
+.metric-form-actions .danger:hover {{ background:#7f1d1d; color:#fecaca; }}
+.metric-err {{ margin-top:8px; font-size:11px; color:#f87171; background:#2a1010;
+  border:1px solid #7f1d1d; border-radius:6px; padding:7px 10px; }}
 </style></head>
 <body>
 <div class="header">
@@ -2278,13 +2462,32 @@ button:hover{{background:#334155;color:#e2e8f0}}
 
   <section class="panel" data-panel="perf">
     <div class="tracker-view" id="tracker-view">
+      <div class="goals-section" id="goals-section"></div>
+
       <div class="tracker-top">
         <div class="tracker-radar-col">
           <div class="tracker-header">Profile</div>
           <canvas id="c-radar"></canvas>
+          <div class="radar-hint">key metrics only</div>
         </div>
-        <div class="tracker-grid" id="tracker-cards" style="align-content:start"></div>
+        <div class="tracker-cols">
+          <div class="tier-head">
+            <span class="tracker-header">Key metrics</span>
+            <span class="tier-hint">★ on the profile · fed to the coach</span>
+          </div>
+          <div class="tracker-grid" id="tracker-cards" style="align-content:start"></div>
+
+          <div class="tier-head" style="margin-top:14px">
+            <span class="tracker-header">Stored</span>
+            <span class="tier-hint">☆ tracked, off the profile</span>
+            <button class="add-metric-btn" onclick="openAddMetric()">+ Add metric</button>
+          </div>
+          <div class="tracker-grid" id="bank-cards" style="align-content:start"></div>
+        </div>
       </div>
+
+      <div class="metric-form" id="add-metric-form" style="display:none"></div>
+      <div class="metric-err" id="metric-err" style="display:none"></div>
       <div class="log-form" id="log-form">
           <select id="log-metric">
             <option value="">— metric —</option>
@@ -3348,8 +3551,227 @@ function submitMetric() {{
 
 // ── Performance tracker ───────────────────────────────────────────────────────
 function renderTracker() {{
+  renderGoals();
   drawRadar();
   renderMetricCards();
+}}
+
+// ── Metric config: tiers, edit, add, remove ───────────────────────────────────
+function metricCfg(action, key, fields) {{
+  var payload = JSON.stringify({{action: action, key: key, fields: fields || null}});
+  document.title = '__metriccfg__' + Date.now() + '|' + encodeURIComponent(payload);
+}}
+
+function metricError(msg) {{
+  var el = document.getElementById('metric-err');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(function() {{ el.style.display = 'none'; }}, 5000);
+}}
+
+function setTier(key, tier) {{ metricCfg('update', key, {{tier: tier}}); }}
+
+function escAttr(s) {{
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}}
+
+function metricByKey(key) {{
+  return (DATA.metrics || []).filter(function(m) {{ return m.key === key; }})[0];
+}}
+
+/** Inline editor, rendered into the card so the value stays next to the field. */
+function openMetricEdit(key) {{
+  var m = metricByKey(key);
+  if (!m) return;
+  var host = document.getElementById('edit-' + key);
+  if (!host) return;
+  if (host.style.display === 'block') {{ host.style.display = 'none'; return; }}
+  host.style.display = 'block';
+  host.innerHTML =
+    '<label>Label<input id="ed-label-' + key + '" type="text" value="' + escAttr(m.label) + '"></label>' +
+    '<label>Baseline<input id="ed-base-' + key + '" type="number" step="any" value="' + escAttr(m.start) + '"></label>' +
+    '<label>Target<input id="ed-tgt-' + key + '" type="number" step="any" value="' + escAttr(m.target) + '"></label>' +
+    '<label>Unit<input id="ed-unit-' + key + '" type="text" value="' + escAttr(m.unit) + '"></label>' +
+    (m.rep_weighted
+      ? '<label>Ref reps<input id="ed-ref-' + key + '" type="number" step="1" value="' + escAttr(m.rep_ref || 8) + '"></label>'
+      : '') +
+    '<label class="chk"><input id="ed-rw-' + key + '" type="checkbox"' + (m.rep_weighted ? ' checked' : '') +
+      '> rep-weighted</label>' +
+    '<label class="chk"><input id="ed-lb-' + key + '" type="checkbox"' + (m.lower ? ' checked' : '') +
+      '> lower is better</label>' +
+    '<div class="metric-form-actions">' +
+      '<button class="log-btn" onclick="saveMetricEdit(\\'' + key + '\\')">Save</button>' +
+      '<button onclick="openMetricEdit(\\'' + key + '\\')">Cancel</button>' +
+      '<button class="danger" onclick="removeMetric(\\'' + key + '\\')">Remove</button>' +
+    '</div>';
+}}
+
+function saveMetricEdit(key) {{
+  var g = function(p) {{ return document.getElementById(p + key); }};
+  var refEl = g('ed-ref-');
+  metricCfg('update', key, {{
+    label:           g('ed-label-').value.trim(),
+    baseline:        g('ed-base-').value,
+    target:          g('ed-tgt-').value,
+    unit:            g('ed-unit-').value.trim(),
+    rep_ref:         refEl ? refEl.value : null,
+    rep_weighted:    g('ed-rw-').checked,
+    lower_is_better: g('ed-lb-').checked
+  }});
+}}
+
+function removeMetric(key) {{
+  var m = metricByKey(key);
+  var n = m && m.history ? m.history.length : 0;
+  var warn = 'Remove "' + (m ? m.label : key) + '" from the tracker?';
+  if (n) warn += '\\n\\n' + n + ' logged result' + (n === 1 ? '' : 's') +
+                 ' stay on disk — re-adding the key "' + key + '" restores them.';
+  if (window.confirm(warn)) metricCfg('remove', key);
+}}
+
+function openAddMetric() {{
+  var host = document.getElementById('add-metric-form');
+  if (host.style.display === 'block') {{ host.style.display = 'none'; return; }}
+  host.style.display = 'block';
+  host.innerHTML =
+    '<label>Key<input id="am-key" type="text" placeholder="run_5k"></label>' +
+    '<label>Label<input id="am-label" type="text" placeholder="5k run"></label>' +
+    '<label>Unit<input id="am-unit" type="text" placeholder="s"></label>' +
+    '<label>Baseline<input id="am-base" type="number" step="any"></label>' +
+    '<label>Target<input id="am-tgt" type="number" step="any"></label>' +
+    '<label>Tier<select id="am-tier">' +
+      '<option value="bank" selected>Stored</option>' +
+      '<option value="key">Key metric</option>' +
+      '<option value="goal">Goal</option>' +
+    '</select></label>' +
+    '<label class="chk"><input id="am-lb" type="checkbox"> lower is better</label>' +
+    '<label class="chk"><input id="am-rw" type="checkbox"> rep-weighted</label>' +
+    '<div class="metric-form-actions">' +
+      '<button class="log-btn" onclick="submitAddMetric()">Add</button>' +
+      '<button onclick="openAddMetric()">Cancel</button>' +
+    '</div>';
+}}
+
+function submitAddMetric() {{
+  var key = document.getElementById('am-key').value.trim();
+  if (!/^[a-z0-9_]+$/.test(key)) {{
+    metricError('Key must be lowercase letters, digits and underscores (e.g. run_5k).');
+    return;
+  }}
+  metricCfg('add', key, {{
+    label:           document.getElementById('am-label').value.trim() || key,
+    unit:            document.getElementById('am-unit').value.trim(),
+    baseline:        document.getElementById('am-base').value,
+    target:          document.getElementById('am-tgt').value,
+    tier:            document.getElementById('am-tier').value,
+    lower_is_better: document.getElementById('am-lb').checked,
+    rep_weighted:    document.getElementById('am-rw').checked
+  }});
+  document.getElementById('add-metric-form').style.display = 'none';
+}}
+
+// ── Goal charts ───────────────────────────────────────────────────────────────
+function renderGoals() {{
+  var host = document.getElementById('goals-section');
+  if (!host) return;
+  var goals = (DATA.metrics || []).filter(function(m) {{ return m.tier === 'goal'; }});
+  if (!goals.length) {{
+    host.innerHTML = '<div class="goal-empty">No goals yet — set a metric\\u2019s tier to ' +
+                     '<b>Goal</b> to track it here with a full-size progress chart.</div>';
+    return;
+  }}
+  host.innerHTML = goals.map(function(m) {{
+    var cur = m.has_data ? (m.lower ? formatTime(m.value, m.unit) : m.value + m.unit) : '—';
+    var tgt = m.lower ? formatTime(m.target, m.unit) : m.target + m.unit;
+    var pct = Math.round(Math.max(0, Math.min(100, m.journey_pct)));
+    return '<div class="goal-card">' +
+      '<div class="goal-head">' +
+        '<div>' +
+          '<div class="goal-label">' + m.label +
+            '<span class="tier-pill">Goal</span></div>' +
+          '<div class="goal-sub">baseline ' + (m.lower ? formatTime(m.start, m.unit) : m.start + m.unit) +
+            ' → target ' + tgt + '</div>' +
+        '</div>' +
+        '<div class="goal-now"><span style="color:' + m.color + '">' + cur + '</span>' +
+          '<span class="goal-pct">' + pct + '%</span></div>' +
+      '</div>' +
+      '<div class="goal-wrap" id="gw-' + m.key + '"><canvas id="gc-' + m.key + '"></canvas></div>' +
+      '<div class="metric-tiers">' + tierButtons(m) + editButton(m) + '</div>' +
+      '<div class="metric-form" id="edit-' + m.key + '" style="display:none"></div>' +
+    '</div>';
+  }}).join('');
+  goals.forEach(function(m) {{ drawGoalChart(m); }});
+}}
+
+function drawGoalChart(m) {{
+  var g = setupCanvas('gc-' + m.key, 'gw-' + m.key);
+  if (!g) return;
+  var ctx = g.ctx, W = g.W, H = g.H;
+  var hist = m.history || [];
+  if (!hist.length) return;
+
+  var PAD = {{top:10, right:12, bottom:20, left:44}};
+  var vals = hist.map(function(e) {{ return e.value; }});
+  var lo = Math.min.apply(null, vals.concat([m.target, m.start]));
+  var hi = Math.max.apply(null, vals.concat([m.target, m.start]));
+  var padv = (hi - lo) * 0.12 || 1;
+  lo -= padv; hi += padv;
+
+  var cW = W - PAD.left - PAD.right, cH = H - PAD.top - PAD.bottom;
+  var xOf = function(i) {{ return PAD.left + (i / Math.max(hist.length - 1, 1)) * cW; }};
+  // For lower-is-better metrics, flip the axis so "up" always means "better".
+  var yOf = function(v) {{
+    var f = (v - lo) / (hi - lo);
+    return PAD.top + (m.lower ? f : 1 - f) * cH;
+  }};
+
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#475569'; ctx.font = '9px system-ui';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (var i = 0; i <= 3; i++) {{
+    var v = lo + (hi - lo) * i / 3, y = Math.round(yOf(v)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+    ctx.fillText(m.lower ? formatTime(v, m.unit) : v.toFixed(0), PAD.left - 6, y);
+  }}
+
+  [[m.start, '#475569', 'baseline'], [m.target, '#4ade80', 'target']].forEach(function(t) {{
+    if (t[0] == null || t[0] < lo || t[0] > hi) return;
+    var y = Math.round(yOf(t[0])) + 0.5;
+    ctx.strokeStyle = t[1]; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = t[1]; ctx.textAlign = 'left'; ctx.font = '9px system-ui';
+    ctx.fillText(t[2], PAD.left + 4, y - 6);
+    ctx.textAlign = 'right';
+  }});
+
+  ctx.strokeStyle = m.color; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  vals.forEach(function(v, i) {{ i ? ctx.lineTo(xOf(i), yOf(v)) : ctx.moveTo(xOf(i), yOf(v)); }});
+  ctx.stroke();
+  vals.forEach(function(v, i) {{
+    ctx.fillStyle = i === vals.length - 1 ? m.color : '#334155';
+    ctx.beginPath(); ctx.arc(xOf(i), yOf(v), i === vals.length - 1 ? 3.5 : 2, 0, 7); ctx.fill();
+  }});
+
+  ctx.fillStyle = '#475569'; ctx.font = '9px system-ui'; ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';  ctx.fillText(hist[0].date, PAD.left, H - PAD.bottom + 5);
+  ctx.textAlign = 'right'; ctx.fillText(hist[hist.length-1].date, W - PAD.right, H - PAD.bottom + 5);
+}}
+
+function tierButtons(m) {{
+  var defs = [['goal','◎','Goal'], ['key','★','Key metric'], ['bank','☆','Stored']];
+  return '<div class="tier-btns">' + defs.map(function(d) {{
+    var on = m.tier === d[0] ? ' active' : '';
+    return '<button class="tier-btn' + on + '" title="' + d[2] +
+           '" onclick="setTier(\\'' + m.key + '\\',\\'' + d[0] + '\\')">' + d[1] + '</button>';
+  }}).join('') + '</div>';
+}}
+
+function editButton(m) {{
+  return '<button class="edit-btn" title="Edit target and baseline" ' +
+         'onclick="openMetricEdit(\\'' + m.key + '\\')">✎</button>';
 }}
 
 function drawRadar() {{
@@ -3357,26 +3779,27 @@ function drawRadar() {{
   if (!canvas) return;
   var metrics = DATA.metrics || [];
 
-  // User-configured radar groupings (~/.config/intervals-icu/benchmarks.json)
-  // — the polygon below is drawn with as many sides as there are axes, so
-  // this list alone controls the shape.
-  var axes = {radar_axes_json};
+  // The n-gon is derived from the metrics themselves: one axis per "key" metric.
+  // There is no separate radar_axes list to drift out of sync with the tiers.
+  var axes = metrics.filter(function(m) {{ return m.tier === 'key'; }});
 
-  var byKey = {{}};
-  metrics.forEach(function(m) {{ byKey[m.key] = m; }});
-
-  // null = no metric in this axis has ever been logged, distinct from a
-  // logged metric sitting at 0% progress since baseline. Averaged the same
-  // way both used to collapse to 0, making unmeasured axes indistinguishable
-  // from measured-but-stalled ones.
-  var vals = axes.map(function(ax) {{
-    // build_metrics_data emits `journey_pct`, not `pct`. Reading the wrong field
-    // yielded undefined, which `v !== null` does not filter out, so the average
-    // came back NaN and the polygon collapsed to nothing.
-    var pcts = ax.keys.map(function(k) {{ return byKey[k] ? byKey[k].journey_pct : null; }})
-                      .filter(function(v) {{ return v !== null && v !== undefined && isFinite(v); }});
-    return pcts.length ? pcts.reduce(function(a,b){{return a+b;}},0)/pcts.length : null;
+  // null = never logged, which is distinct from a logged metric sitting at 0%
+  // progress. Collapsing both to 0 made unmeasured axes indistinguishable from
+  // measured-but-stalled ones.
+  var vals = axes.map(function(m) {{
+    return (m.has_data && isFinite(m.journey_pct)) ? m.journey_pct : null;
   }});
+
+  if (axes.length < 3) {{
+    var c2 = canvas.getContext('2d');
+    c2.setTransform(1,0,0,1,0,0);
+    c2.clearRect(0, 0, canvas.width, canvas.height);
+    c2.fillStyle = '#475569';
+    c2.font = '12px system-ui';
+    c2.textAlign = 'center';
+    c2.fillText('Star 3+ key metrics to draw the profile', canvas.width/2, canvas.height/2);
+    return;
+  }}
 
   var dpr = window.devicePixelRatio || 1;
   var S = 260;
@@ -3455,37 +3878,55 @@ function drawRadar() {{
   }}
 }}
 
-function renderMetricCards() {{
-  var container = document.getElementById('tracker-cards');
-  if (!container) return;
-  var metrics = DATA.metrics || [];
-  if (!metrics.length) {{
-    container.innerHTML = '<div style="color:#475569;font-size:12px;padding:8px">No test results yet — use the form below to log your first result.</div>';
-    return;
+function metricCard(m) {{
+  var jpct     = Math.max(0, Math.min(100, m.journey_pct));
+  var color    = m.color || '#a78bfa';
+  var jpctCol  = jpct >= 66 ? '#4ade80' : jpct >= 33 ? '#fbbf24' : '#f87171';
+  var fmt      = function(v) {{ return m.lower ? formatTime(v, m.unit) : (v + m.unit); }};
+
+  if (!m.has_data) {{
+    return '<div class="metric-card empty">' +
+      '<div class="mc-head"><div class="mc-label">' + m.label + '</div>' +
+        '<div class="mc-actions">' + tierButtons(m) + editButton(m) + '</div></div>' +
+      '<div class="mc-none">No results logged yet</div>' +
+      '<div class="mc-journey"><span>' + (m.start == null ? '—' : fmt(m.start)) +
+        '</span><span>→ ' + (m.target == null ? '—' : fmt(m.target)) + '</span></div>' +
+      '<div class="metric-form" id="edit-' + m.key + '" style="display:none"></div>' +
+      '</div>';
   }}
 
-  container.innerHTML = metrics.map(function(m) {{
-    var jpct     = Math.max(0, Math.min(100, m.journey_pct));
-    var valStr   = m.lower ? formatTime(m.value, m.unit) : (m.value + m.unit);
-    var repsStr  = (m.reps && !m.lower) ? (' <span style="font-size:11px;color:#475569">×' + m.reps + '</span>') : '';
-    var startStr = m.lower ? formatTime(m.start, m.unit) : (m.start + m.unit);
-    var tgtStr   = m.lower ? formatTime(m.target, m.unit) : (m.target + m.unit);
-    var color    = m.color || '#a78bfa';
-    var spark    = renderSparkSVG(m.spark, m.lower, color);
-    var jpctCol  = jpct >= 66 ? '#4ade80' : jpct >= 33 ? '#fbbf24' : '#f87171';
-    return '<div class="metric-card">' +
-      '<div class="mc-label">' + m.label + '</div>' +
-      '<div><span class="mc-val" style="color:' + color + '">' + valStr + '</span>' +
-      repsStr + ' <span style="font-size:10px;color:' + jpctCol + '">' + Math.round(jpct) + '%</span></div>' +
-      '<div class="mc-bar-wrap">' +
-        '<div class="mc-bar-fill" style="width:' + jpct + '%;background:' + color + '"></div>' +
-      '</div>' +
-      '<div class="mc-journey"><span>' + startStr + '</span><span>→ ' + tgtStr + '</span></div>' +
-      (m.notes ? '<div class="mc-notes">' + m.notes + '</div>' : '') +
-      '<div class="mc-date">Tested ' + m.date + '</div>' +
-      spark +
-      '</div>';
-  }}).join('');
+  var repsStr = (m.reps && !m.lower) ? (' <span style="font-size:11px;color:#475569">×' + m.reps + '</span>') : '';
+  return '<div class="metric-card' + (m.tier === 'bank' ? ' stored' : '') + '">' +
+    '<div class="mc-head"><div class="mc-label">' + m.label + '</div>' +
+      '<div class="mc-actions">' + tierButtons(m) + editButton(m) + '</div></div>' +
+    '<div><span class="mc-val" style="color:' + color + '">' + fmt(m.value) + '</span>' +
+    repsStr + ' <span style="font-size:10px;color:' + jpctCol + '">' + Math.round(jpct) + '%</span></div>' +
+    '<div class="mc-bar-wrap">' +
+      '<div class="mc-bar-fill" style="width:' + jpct + '%;background:' + color + '"></div>' +
+    '</div>' +
+    '<div class="mc-journey"><span>' + fmt(m.start) + '</span><span>→ ' + fmt(m.target) + '</span></div>' +
+    (m.notes ? '<div class="mc-notes">' + m.notes + '</div>' : '') +
+    '<div class="mc-date">Tested ' + m.date + '</div>' +
+    renderSparkSVG(m.spark, m.lower, color) +
+    '<div class="metric-form" id="edit-' + m.key + '" style="display:none"></div>' +
+    '</div>';
+}}
+
+function renderMetricCards() {{
+  var keyBox  = document.getElementById('tracker-cards');
+  var bankBox = document.getElementById('bank-cards');
+  if (!keyBox || !bankBox) return;
+  var metrics = DATA.metrics || [];
+
+  var keys = metrics.filter(function(m) {{ return m.tier === 'key'; }});
+  var bank = metrics.filter(function(m) {{ return m.tier === 'bank'; }});
+
+  keyBox.innerHTML = keys.length
+    ? keys.map(metricCard).join('')
+    : '<div class="mc-none" style="padding:8px">No key metrics — press ★ on a stored metric to promote it.</div>';
+  bankBox.innerHTML = bank.length
+    ? bank.map(metricCard).join('')
+    : '<div class="mc-none" style="padding:8px">Nothing stored. Use + Add metric for PBs you want on record.</div>';
 }}
 
 function formatTime(secs, unit) {{
@@ -3562,26 +4003,40 @@ class BriefWindow(Gtk.Window):
             import urllib.parse as _up
             _nonce, _, enc = t[len("__logmetric__"):].partition("|")
             try:
-                entry_dict = json.loads(_up.unquote(enc))
-                add_metric_entry(entry_dict)
-                benchmark_cfg = load_benchmark_config()
-                wellness = self._last_data[0] if getattr(self, "_last_data", None) else []
-                weight_history = [{"date": w["id"], "value": w["weight"]}
-                                   for w in wellness if w.get("weight") and w.get("id")]
-                new_metrics = build_metrics_data(load_test_metrics().get("entries", []), benchmark_cfg["metrics"],
-                                                  weight_history=weight_history)
-                metrics_json = json.dumps(new_metrics).replace("\\", "\\\\").replace("'", "\\'")
-                GLib.idle_add(
-                    lambda: self.wv.run_javascript(
-                        f"DATA.metrics={metrics_json}; renderTracker();",
-                        None, None, None) or False)
+                add_metric_entry(json.loads(_up.unquote(enc)))
+                self._push_metrics()
             except Exception:
                 log.exception("logmetric failed")
+        elif t.startswith("__metriccfg__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t[len("__metriccfg__"):].partition("|")
+            try:
+                payload = json.loads(_up.unquote(enc))
+                mutate_metric_config(payload["action"], payload["key"], payload.get("fields"))
+                self._push_metrics()
+            except Exception as exc:
+                log.exception("metriccfg failed")
+                msg = json.dumps(str(exc))
+                GLib.idle_add(lambda: self.wv.run_javascript(
+                    f"metricError({msg});", None, None, None) or False)
         elif t.startswith("__logfood__"):
             import urllib.parse as _up
             _nonce, _, enc = t[len("__logfood__"):].partition("|")
             description = _up.unquote(enc)
             threading.Thread(target=self._log_food, args=(description,), daemon=True).start()
+
+    def _push_metrics(self):
+        """Rebuild the metrics payload from disk and re-render the tracker in place."""
+        benchmark_cfg = load_benchmark_config()
+        wellness = self._last_data[0] if getattr(self, "_last_data", None) else []
+        weight_history = [{"date": w["id"], "value": w["weight"]}
+                          for w in wellness if w.get("weight") and w.get("id")]
+        new_metrics = build_metrics_data(load_test_metrics().get("entries", []),
+                                         benchmark_cfg["metrics"],
+                                         weight_history=weight_history)
+        metrics_json = json.dumps(new_metrics)
+        GLib.idle_add(lambda: self.wv.run_javascript(
+            f"DATA.metrics={metrics_json}; renderTracker();", None, None, None) or False)
 
     def _log_food(self, description):
         """Runs off the GTK thread: delegates the food entry to claude -p, then
