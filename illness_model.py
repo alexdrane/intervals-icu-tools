@@ -324,8 +324,13 @@ def get_illness_data(wellness_entries, force_full=False):
     last_full = cache.get("last_full_run", "")
     last_warm = cache.get("last_warm_run", "")
 
-    # Pure cache hit: already ran today
-    if last_warm == today_str and not force_full and cache.get("illness"):
+    # Pure cache hit: already ran today AND that run produced a value for today.
+    # A run started just after midnight sees no restingHR for today yet — intervals.icu
+    # has not synced the night — so _extract_arrays drops today's row and no posterior
+    # is stored. Keying the guard on the run date alone would then lock the model out
+    # for the rest of the day, leaving the stat stuck on "awaiting today's data".
+    if (last_warm == today_str and not force_full
+            and cache.get("illness", {}).get(today_str) is not None):
         by_date = cache["illness"]
         bands   = _bands_from_dict(by_date)
         return IllnessResult(
