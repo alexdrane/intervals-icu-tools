@@ -101,6 +101,31 @@ def load_config():
         return json.load(f)
 
 
+# ~6500 kcal per kg of bodyweight change: below the pure-fat 7700 figure because a
+# resistance-trained surplus partitions part of the gain into leaner tissue, and a
+# modest deficit spares some lean mass. Used both ways to map kcal/day <-> kg/week.
+KCAL_PER_KG = 6500
+
+
+def kcal_day_to_kg_week(kcal):
+    return kcal * 7 / KCAL_PER_KG
+
+
+def kg_week_to_kcal_day(kg):
+    return round(kg * KCAL_PER_KG / 7)
+
+
+def set_calorie_goal(surplus_per_day):
+    """Persist the daily surplus/deficit goal (kcal/day; negative for a cut)."""
+    cfg = load_config()
+    cfg["calorie_surplus_target"] = int(round(surplus_per_day))
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)   # atomic: a crash mid-write can't truncate config
+    return cfg["calorie_surplus_target"]
+
+
 def load_training_plan():
     if not os.path.exists(TRAINING_PLAN_FILE):
         default = {"sessions": []}
@@ -2149,6 +2174,36 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         # Gap to the pace marker, not to the end-of-day total.
         "calGapKcal": round(nutr_ctx["expected_so_far"] - (food_data or {}).get("calories", 0)),
         "calPaceKcal": round(nutr_ctx["expected_so_far"]),
+        "nutrition": {
+            "consumed": round((food_data or {}).get("calories", 0)),
+            "target": round(kcal_total),
+            "base": kcal_base, "sessionKcal": session_kcal,
+            "paceExpected": round(expected_so_far), "dayFrac": round(day_frac, 3),
+            "macros": [
+                {"key": "protein", "label": "Protein", "color": "#a78bfa",
+                 "g": round((food_data or {}).get("protein_g", 0), 1),
+                 "target": nutr_ctx["protein_target_g"], "kcalPerG": 4, "kind": "aim"},
+                {"key": "carbs", "label": "Carbs", "color": "#22d3ee",
+                 "g": round((food_data or {}).get("carbs_g", 0), 1),
+                 "target": nutr_ctx["carbs_target_g"], "kcalPerG": 4, "kind": "aim"},
+                {"key": "fat", "label": "Fat", "color": "#fbbf24",
+                 "g": round((food_data or {}).get("fat_g", 0), 1),
+                 "target": nutr_ctx["fat_target_g"], "kcalPerG": 9, "kind": "aim"},
+                {"key": "fiber", "label": "Fibre", "color": "#4ade80",
+                 "g": round((food_data or {}).get("fiber_g", 0), 1),
+                 "target": nutr_ctx["fiber_target_g"], "kind": "aim"},
+                {"key": "sugar", "label": "Sugar", "color": "#f472b6",
+                 "g": round((food_data or {}).get("sugar_g", 0), 1),
+                 "target": nutr_ctx["sugar_target_g"], "kind": "limit"},
+                {"key": "sodium", "label": "Sodium", "color": "#fb923c", "unit": "mg",
+                 "g": round((food_data or {}).get("sodium_mg", 0)),
+                 "target": nutr_ctx["sodium_target_mg"], "kind": "limit"},
+            ],
+        },
+        "bulk": (bulk_trend | {
+            "surplusGoal": surplus_target,
+            "kcalPerKg": KCAL_PER_KG,
+        }) if bulk_trend else {"surplusGoal": surplus_target, "kcalPerKg": KCAL_PER_KG},
         "metrics": build_metrics_data(load_test_metrics().get("entries", []), benchmark_cfg["metrics"],
                                        weight_history=[{"date": d, "value": v} for d, v in zip(weight_dates, weight_vals)]),
     })
@@ -2230,9 +2285,78 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 /* Prose set across a 1400px window is unreadable — hold it to a sane measure. */
 .nutr-grid .tips-text{{max-width:70ch;font-size:14px;line-height:1.7}}
 
+/* ── Nutrition dashboard ──────────────────────────────────────────────────── */
+.nutr-dash{{padding:16px 20px;display:grid;gap:14px;
+            grid-template-columns:repeat(12,1fr);align-items:start}}
+.nutr-card{{background:#131c2f;border:1px solid #1e293b;border-radius:10px;padding:14px 16px;
+            min-width:0}}
+.cal-ring-card{{grid-column:span 3}}
+.nutr-card:nth-child(2){{grid-column:span 4}}   /* composition pie */
+.macro-break-card{{grid-column:span 5}}
+.bulk-card{{grid-column:span 5}}
+.weight-card{{grid-column:span 7}}
+.gap-slot{{grid-column:span 7}}
+.foodlog-card{{grid-column:span 5}}
+@media (max-width:1100px){{
+  .cal-ring-card, .nutr-card:nth-child(2), .macro-break-card, .bulk-card,
+  .weight-card, .gap-slot, .foodlog-card {{ grid-column:span 12 }}
+}}
+.nutr-card-h{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;
+              margin-bottom:10px}}
+.nutr-card-sub{{color:#475569;text-transform:none;letter-spacing:0;margin-left:6px}}
+
+.cal-ring-wrap{{position:relative;width:150px;height:150px;margin:2px auto 8px}}
+.cal-ring-wrap canvas{{position:absolute;inset:0;width:100%;height:100%}}
+.cal-ring-mid{{position:absolute;inset:0;display:flex;flex-direction:column;
+               align-items:center;justify-content:center;text-align:center;pointer-events:none}}
+.cal-ring-mid .big{{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}}
+.cal-ring-mid .small{{font-size:10px;color:#64748b;margin-top:3px}}
+.cal-ring-legend{{display:flex;flex-direction:column;gap:4px;font-size:11px}}
+.cal-ring-legend .row{{display:flex;justify-content:space-between;color:#94a3b8;
+                       font-variant-numeric:tabular-nums}}
+.cal-ring-legend .row b{{color:#e2e8f0;font-weight:600}}
+
+.compo-row{{display:flex;align-items:center;gap:14px}}
+.compo-pie-wrap{{position:relative;width:120px;height:120px;flex-shrink:0}}
+.compo-pie-wrap canvas{{position:absolute;inset:0;width:100%;height:100%}}
+.compo-legend{{display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}}
+.compo-legend .row{{display:flex;align-items:center;gap:8px;font-size:12px;color:#cbd5e1}}
+.compo-legend .sw{{width:10px;height:10px;border-radius:3px;flex-shrink:0}}
+.compo-legend .pct{{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600;color:#e2e8f0}}
+.compo-legend .gg{{font-size:10px;color:#64748b;font-variant-numeric:tabular-nums}}
+
+.macro-break{{display:flex;flex-direction:column;gap:11px}}
+.mb-row{{display:grid;grid-template-columns:64px 1fr 96px;align-items:center;gap:10px}}
+.mb-name{{font-size:11px;color:#94a3b8}}
+.mb-track{{position:relative;height:8px;background:#0f172a;border-radius:4px;overflow:hidden}}
+.mb-fill{{height:100%;border-radius:4px;transition:width .5s ease}}
+.mb-target-mark{{position:absolute;top:-2px;bottom:-2px;width:2px;background:#64748b}}
+.mb-val{{font-size:10.5px;color:#64748b;text-align:right;font-variant-numeric:tabular-nums;
+         white-space:nowrap}}
+.mb-val b{{color:#e2e8f0;font-weight:600}}
+.mb-dot{{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:5px}}
+
+.goal-adjuster{{margin-bottom:12px}}
+.goal-readout{{display:flex;align-items:baseline;gap:6px;margin-bottom:6px}}
+.goal-kg{{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}}
+.goal-kg-unit{{font-size:11px;color:#64748b}}
+.goal-kcal{{margin-left:auto;font-size:12px;color:#94a3b8;font-variant-numeric:tabular-nums}}
+#goal-slider{{width:100%;accent-color:#a78bfa;cursor:pointer}}
+.goal-scale{{display:flex;justify-content:space-between;font-size:9px;color:#475569;
+             text-transform:uppercase;letter-spacing:.05em;margin-top:2px}}
+.bulk-stats{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
+.bulk-stat{{background:#0f172a;border:1px solid #1e293b;border-radius:7px;padding:8px 10px}}
+.bulk-stat .k{{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.05em}}
+.bulk-stat .v{{font-size:15px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}}
+
+.weight-wrap{{position:relative;height:150px}}
+.weight-wrap canvas{{position:absolute;inset:0;width:100%;height:100%}}
+.gap-slot .tips-text{{font-size:13px;line-height:1.6;max-width:none}}
+.foodlog-card .food-entry-list{{max-height:200px}}
+
 /* ── Catch-up-to-pace suggestion ──────────────────────────────────────────── */
 .gap-card{{background:#1c1008;border:1px solid #78350f;border-radius:9px;
-           padding:12px 14px;margin-bottom:18px;max-width:70ch}}
+           padding:12px 14px;margin-bottom:14px}}
 .gap-head{{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:6px}}
 .gap-head .brief-label{{color:#fbbf24}}
 .gap-amount{{font-size:15px;font-weight:700;color:#fbbf24;font-variant-numeric:tabular-nums}}
@@ -2543,20 +2667,66 @@ button:hover{{background:#334155;color:#e2e8f0}}
   </section>
 
   <section class="panel" data-panel="nutrition">
-    <div class="nutr-grid">
-      <div class="nutr-col">{nutr_panel_html}</div>
-      <div class="nutr-col">
+    <div class="nutr-dash">
+
+      <div class="nutr-card cal-ring-card">
+        <div class="nutr-card-h">Energy today</div>
+        <div class="cal-ring-wrap"><canvas id="c-cal-ring"></canvas>
+          <div class="cal-ring-mid" id="cal-ring-mid"></div>
+        </div>
+        <div class="cal-ring-legend" id="cal-ring-legend"></div>
+      </div>
+
+      <div class="nutr-card">
+        <div class="nutr-card-h">Where the calories come from</div>
+        <div class="compo-row">
+          <div class="compo-pie-wrap"><canvas id="c-macro-pie"></canvas></div>
+          <div class="compo-legend" id="macro-pie-legend"></div>
+        </div>
+      </div>
+
+      <div class="nutr-card macro-break-card">
+        <div class="nutr-card-h">Macro &amp; micro breakdown <span class="nutr-card-sub">vs target for the day</span></div>
+        <div class="macro-break" id="macro-break"></div>
+      </div>
+
+      <div class="nutr-card bulk-card">
+        <div class="nutr-card-h">Body composition goal</div>
+        <div class="goal-adjuster">
+          <div class="goal-readout">
+            <span class="goal-kg" id="goal-kg">—</span>
+            <span class="goal-kg-unit">kg/week</span>
+            <span class="goal-kcal" id="goal-kcal"></span>
+          </div>
+          <input type="range" id="goal-slider" min="-750" max="750" step="50" value="0"
+                 oninput="onGoalSlider(this.value)" onchange="commitGoal(this.value)">
+          <div class="goal-scale"><span>cut</span><span>maintain</span><span>bulk</span></div>
+        </div>
+        <div class="bulk-stats" id="bulk-stats"></div>
+      </div>
+
+      <div class="nutr-card weight-card">
+        <div class="nutr-card-h">Body weight <span class="nutr-card-sub" id="weight-sub"></span></div>
+        <div class="weight-wrap"><canvas id="c-nutr-weight"></canvas></div>
+      </div>
+
+      <div class="nutr-card gap-slot">
         <div class="gap-card" id="cal-gap-card" style="display:none">
           <div class="gap-head">
-            <span class="brief-label" style="margin:0">Catch up to pace</span>
+            <span class="nutr-card-h" style="margin:0">Catch up to pace</span>
             <span class="gap-amount" id="cal-gap-amount"></span>
           </div>
           <div class="gap-text" id="cal-gap-text"><span class="brief-loading">Sizing a snack…</span></div>
         </div>
-
-        <div class="brief-label">Nutrition Coach</div>
+        <div class="nutr-card-h">Nutrition coach</div>
         <div class="tips-text" id="brief-nutr"><span class="brief-loading">Generating…</span></div>
       </div>
+
+      <div class="nutr-card foodlog-card">
+        <div class="nutr-card-h">Logged today</div>
+        <div id="nutr-panel-legacy">{nutr_panel_html}</div>
+      </div>
+
     </div>
   </section>
 
@@ -3550,6 +3720,9 @@ function selectTab(name) {{
   var period = document.getElementById('periodSelect');
   if (period) period.hidden = (name !== 'trends');
 
+  // Survive a full-page refresh (the GTK bridge reloads the whole document).
+  try {{ sessionStorage.setItem('activeTab', name); }} catch (e) {{}}
+
   // A canvas inside a hidden panel has zero client size, so charts must be
   // (re)drawn when their panel becomes visible, not merely on load.
   if (name === 'trends') {{
@@ -3565,6 +3738,8 @@ function selectTab(name) {{
       drawIllnessRisk();
       drawIllnessRhr();
     }});
+  }} else if (name === 'nutrition') {{
+    requestAnimationFrame(renderNutritionDash);
   }}
 }}
 
@@ -3578,6 +3753,13 @@ function selectTab(name) {{
     noteBox.addEventListener('keydown', function(e) {{
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ e.preventDefault(); submitNote(); }}
     }});
+  }}
+
+  // Refresh reloads the whole document; restore whichever tab was open.
+  var saved = null;
+  try {{ saved = sessionStorage.getItem('activeTab'); }} catch (e) {{}}
+  if (saved && document.querySelector('.tab[data-panel="' + saved + '"]')) {{
+    selectTab(saved);
   }}
 }})();
 
@@ -3604,6 +3786,208 @@ window.addEventListener('resize', drawAll);
 function showStaleWarning() {{
   var el = document.getElementById('stale-warn');
   if (el) el.style.display = 'block';
+}}
+
+// ── Nutrition dashboard ───────────────────────────────────────────────────────
+function drawDonut(cid, segments, opts) {{
+  var canvas = document.getElementById(cid);
+  if (!canvas) return;
+  var W = canvas.clientWidth, H = canvas.clientHeight;
+  if (!W || !H) return;
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  var ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  var cx = W/2, cy = H/2, R = Math.min(W, H)/2 - 2, r = R * (opts && opts.inner || 0.62);
+  var total = segments.reduce(function(s, x) {{ return s + Math.max(x.value, 0); }}, 0);
+  var a0 = -Math.PI/2;
+  if (total <= 0) {{
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2*Math.PI); ctx.arc(cx, cy, r, 0, 2*Math.PI, true);
+    ctx.fillStyle = '#1e293b'; ctx.fill('evenodd');
+    return;
+  }}
+  segments.forEach(function(seg) {{
+    var frac = Math.max(seg.value, 0) / total;
+    var a1 = a0 + frac * 2 * Math.PI;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, a0, a1);
+    ctx.arc(cx, cy, r, a1, a0, true);
+    ctx.closePath();
+    ctx.fillStyle = seg.color;
+    ctx.fill();
+    a0 = a1;
+  }});
+}}
+
+function macroByKey(k) {{
+  return (DATA.nutrition && DATA.nutrition.macros || []).filter(function(m) {{ return m.key === k; }})[0];
+}}
+
+function renderNutritionDash() {{
+  var n = DATA.nutrition;
+  if (!n) return;
+
+  // ── Energy ring: eaten vs remaining to target ──
+  var remaining = Math.max(n.target - n.consumed, 0);
+  drawDonut('c-cal-ring', [
+    {{value: n.consumed,  color: '#a78bfa'}},
+    {{value: remaining,   color: '#1e293b'}}
+  ], {{inner: 0.72}});
+  var isOver = n.consumed > n.target;
+  var mid = document.getElementById('cal-ring-mid');
+  if (mid) {{
+    mid.innerHTML = '<div class="big" style="color:' + (isOver ? '#fbbf24' : '#e2e8f0') + '">' +
+      Math.round(n.consumed).toLocaleString() + '</div>' +
+      '<div class="small">of ' + Math.round(n.target).toLocaleString() + ' kcal</div>';
+  }}
+  var leg = document.getElementById('cal-ring-legend');
+  if (leg) {{
+    var row = function(k, v) {{ return '<div class="row"><span>' + k + '</span><span>' + v + '</span></div>'; }};
+    leg.innerHTML =
+      row('Base target', n.base + ' kcal') +
+      (n.sessionKcal ? row('Training burn', '+' + n.sessionKcal + ' kcal') : '') +
+      row('Eaten', '<b>' + Math.round(n.consumed).toLocaleString() + '</b>') +
+      row(isOver ? 'Over by' : 'Remaining',
+          '<b>' + Math.abs(n.target - n.consumed).toLocaleString() + ' kcal</b>');
+  }}
+
+  // ── Composition pie: share of energy from each macro ──
+  var comp = ['protein', 'carbs', 'fat'].map(function(k) {{
+    var m = macroByKey(k);
+    return {{key: k, label: m.label, color: m.color, kcal: m.g * m.kcalPerG, g: m.g}};
+  }});
+  var kcalTot = comp.reduce(function(s, c) {{ return s + c.kcal; }}, 0) || 1;
+  drawDonut('c-macro-pie', comp.map(function(c) {{ return {{value: c.kcal, color: c.color}}; }}), {{inner: 0.55}});
+  var pl = document.getElementById('macro-pie-legend');
+  if (pl) {{
+    pl.innerHTML = comp.map(function(c) {{
+      return '<div class="row"><span class="sw" style="background:' + c.color + '"></span>' +
+        c.label + '<span class="gg">' + Math.round(c.g) + 'g</span>' +
+        '<span class="pct">' + Math.round(c.kcal / kcalTot * 100) + '%</span></div>';
+    }}).join('');
+  }}
+
+  // ── Full macro/micro breakdown (was hidden behind a hover) ──
+  var mb = document.getElementById('macro-break');
+  if (mb) {{
+    mb.innerHTML = n.macros.map(function(m) {{
+      var unit = m.unit || 'g';
+      var pct = m.target ? m.g / m.target * 100 : 0;
+      var col = m.kind === 'limit'
+        ? (pct > 100 ? '#ef4444' : pct > 75 ? '#fbbf24' : '#4ade80')
+        : (pct >= 100 ? '#4ade80' : pct >= 75 ? '#fbbf24' : '#ef4444');
+      return '<div class="mb-row">' +
+        '<span class="mb-name">' + m.label + '</span>' +
+        '<span class="mb-track">' +
+          '<span class="mb-fill" style="width:' + Math.min(pct, 100) + '%;background:' + m.color + '"></span>' +
+        '</span>' +
+        '<span class="mb-val"><b>' + Math.round(m.g) + '</b> / ' + Math.round(m.target) + unit +
+          '<span class="mb-dot" style="background:' + col + '"></span></span>' +
+        '</div>';
+    }}).join('');
+  }}
+
+  renderBulk();
+  renderCalGap();
+  drawNutrWeight();
+}}
+
+function renderBulk() {{
+  var b = DATA.bulk || {{}};
+  var goal = b.surplusGoal || 0;
+  var slider = document.getElementById('goal-slider');
+  if (slider && !slider.dataset.touched) slider.value = goal;
+  paintGoalReadout(goal);
+
+  var stats = document.getElementById('bulk-stats');
+  if (!stats) return;
+  if (b.avg_surplus == null) {{
+    stats.innerHTML = '<div class="bulk-stat" style="grid-column:span 2">' +
+      '<div class="k">Trend</div><div class="v" style="font-size:12px;color:#64748b">' +
+      'Log a few full days to see your rolling surplus</div></div>';
+    return;
+  }}
+  var stateCol = {{'on track':'#4ade80','slow but positive':'#fbbf24','in deficit':'#f87171'}}[b.state] || '#94a3b8';
+  var proj = (b.today_projected != null)
+    ? '<div class="bulk-stat"><div class="k">Today projected</div><div class="v" style="color:' +
+      (b.today_projected >= 0 ? '#4ade80' : '#f87171') + '">' +
+      (b.today_projected >= 0 ? '+' : '') + b.today_projected + '</div></div>'
+    : '';
+  stats.innerHTML =
+    '<div class="bulk-stat"><div class="k">7-day avg surplus</div><div class="v" style="color:' + stateCol + '">' +
+      (b.avg_surplus >= 0 ? '+' : '') + b.avg_surplus + '<span style="font-size:10px;color:#64748b"> kcal/d</span></div></div>' +
+    '<div class="bulk-stat"><div class="k">Projected change</div><div class="v" style="color:' + stateCol + '">' +
+      (b.kg_per_week >= 0 ? '+' : '') + b.kg_per_week + '<span style="font-size:10px;color:#64748b"> kg/wk</span></div></div>' +
+    '<div class="bulk-stat"><div class="k">Status</div><div class="v" style="font-size:13px;color:' + stateCol + '">' +
+      b.state + '</div></div>' +
+    (proj || '<div class="bulk-stat"><div class="k">Logged days</div><div class="v">' +
+      b.logged_days + '/' + b.window + '</div></div>');
+}}
+
+function paintGoalReadout(kcalPerDay) {{
+  var perKg = (DATA.bulk && DATA.bulk.kcalPerKg) || 6500;
+  var kg = kcalPerDay * 7 / perKg;
+  var kgEl = document.getElementById('goal-kg'), kcalEl = document.getElementById('goal-kcal');
+  if (kgEl) {{
+    kgEl.textContent = (kg >= 0 ? '+' : '') + kg.toFixed(2);
+    kgEl.style.color = kg > 0.02 ? '#4ade80' : kg < -0.02 ? '#f87171' : '#94a3b8';
+  }}
+  if (kcalEl) kcalEl.textContent = (kcalPerDay >= 0 ? '+' : '') + kcalPerDay + ' kcal/day';
+}}
+
+function onGoalSlider(v) {{
+  document.getElementById('goal-slider').dataset.touched = '1';
+  paintGoalReadout(parseInt(v, 10));
+}}
+
+function commitGoal(v) {{
+  document.title = '__setgoal__' + Date.now() + '|' + encodeURIComponent(v);
+}}
+
+function drawNutrWeight() {{
+  var g = setupCanvas('c-nutr-weight', 'weight-wrap');
+  if (!g) return;
+  var ctx = g.ctx, W = g.W, H = g.H;
+  var dates = DATA.weightDates || [], vals = DATA.weightVals || [];
+  var sub = document.getElementById('weight-sub');
+  if (dates.length < 2) {{
+    if (sub) sub.textContent = 'not enough weigh-ins yet';
+    return;
+  }}
+  var PAD = {{top:10, right:12, bottom:20, left:40}};
+  var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  var pad = (hi - lo) * 0.15 || 0.5; lo -= pad; hi += pad;
+  var cW = W - PAD.left - PAD.right, cH = H - PAD.top - PAD.bottom;
+  var xOf = function(i) {{ return PAD.left + (i / Math.max(dates.length - 1, 1)) * cW; }};
+  var yOf = function(v) {{ return PAD.top + (1 - (v - lo) / (hi - lo)) * cH; }};
+
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#475569'; ctx.font = '9px system-ui';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (var i = 0; i <= 3; i++) {{
+    var v = lo + (hi - lo) * i / 3, y = Math.round(yOf(v)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+    ctx.fillText(v.toFixed(1), PAD.left - 5, y);
+  }}
+  // linear fit, to read the direction against the goal
+  var n = vals.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (var k = 0; k < n; k++) {{ sx += k; sy += vals[k]; sxx += k*k; sxy += k*vals[k]; }}
+  var slope = (n*sxy - sx*sy) / (n*sxx - sx*sx || 1), icpt = (sy - slope*sx) / n;
+  ctx.strokeStyle = '#334155'; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(xOf(0), yOf(icpt)); ctx.lineTo(xOf(n-1), yOf(icpt + slope*(n-1)));
+  ctx.stroke(); ctx.setLineDash([]);
+
+  ctx.strokeStyle = '#67e8f9'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.beginPath();
+  vals.forEach(function(v, i) {{ i ? ctx.lineTo(xOf(i), yOf(v)) : ctx.moveTo(xOf(i), yOf(v)); }});
+  ctx.stroke();
+  ctx.fillStyle = '#67e8f9';
+  ctx.beginPath(); ctx.arc(xOf(n-1), yOf(vals[n-1]), 3, 0, 7); ctx.fill();
+
+  if (sub) {{
+    var perWk = slope * 7;
+    sub.textContent = vals[n-1].toFixed(1) + ' kg · ' +
+      (perWk >= 0 ? '+' : '') + perWk.toFixed(2) + ' kg/wk over ' + n + ' weigh-ins';
+  }}
 }}
 
 /** Behind the pace marker? Show what to eat to catch up. Hidden when on pace. */
@@ -4238,6 +4622,19 @@ class BriefWindow(Gtk.Window):
                 msg = json.dumps(str(exc))
                 GLib.idle_add(lambda: self.wv.run_javascript(
                     f"metricError({msg});", None, None, None) or False)
+        elif t.startswith("__setgoal__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t[len("__setgoal__"):].partition("|")
+            try:
+                kcal = set_calorie_goal(float(_up.unquote(enc)))
+                # The bulk trend and pace targets depend on the goal — re-render.
+                if getattr(self, "_last_data", None):
+                    threading.Thread(target=self._refresh, daemon=True).start()
+                else:
+                    GLib.idle_add(lambda: self.wv.run_javascript(
+                        f"DATA.bulk.surplusGoal={kcal}; renderBulk();", None, None, None) or False)
+            except Exception:
+                log.exception("setgoal failed")
         elif t.startswith("__logfood__"):
             import urllib.parse as _up
             _nonce, _, enc = t[len("__logfood__"):].partition("|")
