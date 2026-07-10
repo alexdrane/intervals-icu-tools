@@ -2262,7 +2262,7 @@ select:hover{{border-color:#475569}}
       display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
 hr.div{{border:none;border-top:1px solid #1e293b;margin:8px 0 10px}}
 .charts{{padding:12px 14px;display:grid;
-         grid-template-columns:1fr 1fr;grid-template-rows:repeat(3,170px) 200px;
+         grid-template-columns:1fr 1fr;grid-template-rows:repeat(3,180px);
          gap:14px 12px;min-width:0}}
 .chart-cell{{display:flex;flex-direction:column;min-height:0}}
 .chart-cell.wide{{grid-column:1 / -1}}
@@ -2270,11 +2270,46 @@ hr.div{{border:none;border-top:1px solid #1e293b;margin:8px 0 10px}}
               letter-spacing:.06em;margin-bottom:3px;flex-shrink:0;display:flex;align-items:center;gap:8px}}
 .chart-wrap{{flex:1;min-height:0;position:relative}}
 canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
-/* ── Today: brief on the left, the week's plan on the right ───────────────── */
-.today-grid{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);
-             gap:26px;padding:18px 22px;align-items:start}}
-.today-col{{min-width:0}}
-.today-col hr.div:first-child{{display:none}}
+/* ── Today: brief + dials + sleep + sessions + notes ──────────────────────── */
+.today-dash{{display:grid;gap:16px;padding:18px 22px;align-items:start;
+             grid-template-columns:minmax(0,1.5fr) minmax(260px,1fr);
+             grid-template-areas:"brief dials" "sleep sessions" "notes sessions";}}
+.today-brief{{grid-area:brief;min-width:0}}
+.today-side{{grid-area:dials;min-width:0}}
+.today-sleep{{grid-area:sleep;min-width:0}}
+.today-sessions{{grid-area:sessions;min-width:0;max-height:calc(100vh - 300px);overflow-y:auto;
+                 padding-right:4px}}
+.today-notes{{grid-area:notes;min-width:0;display:flex;flex-direction:column;gap:8px}}
+.today-brief .brief-text, .today-brief .tips-text{{max-width:64ch}}
+.today-sleep .chart-wrap{{position:relative;height:150px;margin-top:5px}}
+.today-sessions hr.div:first-child{{display:none}}
+@media (max-width:1000px){{
+  .today-dash{{grid-template-columns:1fr;
+               grid-template-areas:"brief" "dials" "sleep" "sessions" "notes";}}
+}}
+
+/* Compact nutrition dials shared with the Nutrition tab's data */
+.today-dials{{display:flex;flex-direction:column;gap:12px;
+             background:#131c2f;border:1px solid #1e293b;border-radius:10px;padding:14px 16px}}
+.dials-top{{display:flex;align-items:center;gap:14px}}
+.dial-ring{{position:relative;width:104px;height:104px;flex-shrink:0}}
+.dial-ring canvas{{position:absolute;inset:0;width:100%;height:100%}}
+.dial-ring-mid{{position:absolute;inset:0;display:flex;flex-direction:column;
+                align-items:center;justify-content:center;text-align:center}}
+.dial-ring-mid .big{{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}}
+.dial-ring-mid .small{{font-size:9px;color:#64748b;margin-top:2px}}
+.dial-macros{{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px}}
+.dm-row{{display:grid;grid-template-columns:38px 1fr auto;align-items:center;gap:7px;font-size:10px}}
+.dm-name{{color:#94a3b8}}
+.dm-track{{height:6px;background:#0f172a;border-radius:3px;overflow:hidden}}
+.dm-fill{{height:100%;border-radius:3px}}
+.dm-val{{color:#64748b;font-variant-numeric:tabular-nums;white-space:nowrap}}
+.dial-foot{{display:flex;justify-content:space-between;font-size:10px;color:#64748b;
+            border-top:1px solid #1e293b;padding-top:9px;font-variant-numeric:tabular-nums}}
+.dial-foot b{{color:#e2e8f0}}
+.dial-link{{margin-top:2px;font-size:10px;color:#a78bfa;cursor:pointer;background:none;border:none;
+            padding:0;text-align:left}}
+.dial-link:hover{{text-decoration:underline}}
 
 /* ── Nutrition: the old rail widget, given room ───────────────────────────── */
 .nutr-grid{{display:grid;grid-template-columns:minmax(340px,440px) minmax(0,1fr);
@@ -2597,12 +2632,11 @@ button:hover{{background:#334155;color:#e2e8f0}}
   <h1>Training Dashboard</h1>
   <span class="date">{day_str}</span>
   <div class="tabs" role="tablist">
-    <button class="tab" role="tab" aria-selected="false" data-panel="today">Today</button>
-    <button class="tab" role="tab" aria-selected="true"  data-panel="trends">Trends</button>
+    <button class="tab" role="tab" aria-selected="true" data-panel="today">Today</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="trends">Trends</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="nutrition">Nutrition</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="perf">Performance</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="illness">Illness</button>
-    <button class="tab" role="tab" aria-selected="false" data-panel="notes">Notes</button>
   </div>
   <select id="periodSelect" onchange="setPeriod(this.value)">
     <option value="14">14 days</option>
@@ -2618,19 +2652,41 @@ button:hover{{background:#334155;color:#e2e8f0}}
 
 <div class="tab-body">
 
-  <section class="panel" data-panel="today">
-    <div class="today-grid">
-      <div class="today-col">
+  <section class="panel active" data-panel="today">
+    <div class="today-dash">
+
+      <div class="today-brief">
         <div class="brief-label">Overview</div>
         <div class="brief-text" id="brief-overview">{overview_html}</div>
-        <div class="brief-label" style="margin-top:18px">Coach's Tips</div>
+        <div class="brief-label" style="margin-top:16px">Coach's Tips</div>
         <div class="tips-text" id="brief-tips">{tips_html}</div>
       </div>
-      <div class="today-col">{sessions_html}</div>
+
+      <div class="today-side">
+        <div class="today-dials" id="today-dials"></div>
+      </div>
+
+      <div class="today-sleep">
+        <div class="brief-label">Sleep Debt <span class="nutr-card-sub">EMA τ=5d vs 8h/night · <span style="color:#4ade80">─</span> 9.5h <span style="color:#fbbf24">─</span> 8.5h <span style="color:#f87171">─</span> trend</span></div>
+        <div class="chart-wrap" id="w-slp"><canvas id="c-slp"></canvas></div>
+      </div>
+
+      <div class="today-sessions">{sessions_html}</div>
+
+      <div class="today-notes">
+        <div class="brief-label">Notes <span class="notes-hint">— context for the coach · persists until cleared</span></div>
+        <div class="notes-list" id="notes-list">{notes_html}</div>
+        <div class="notes-input">
+          <textarea id="note-box" rows="2" placeholder="Add context, how you feel, or an upcoming session… (Ctrl+Enter to add)"></textarea>
+          <button onclick="submitNote()">Add</button>
+          <button class="notes-clear" onclick="clearNotes()">Clear all</button>
+        </div>
+      </div>
+
     </div>
   </section>
 
-  <section class="panel active" data-panel="trends">
+  <section class="panel" data-panel="trends">
     <div class="charts">
       <div class="chart-cell">
         <div class="chart-label">Fitness (CTL) · Fatigue (ATL)</div>
@@ -2658,10 +2714,6 @@ button:hover{{background:#334155;color:#e2e8f0}}
       <div class="chart-cell">
         <div class="chart-label">Body Weight (kg)</div>
         <div class="chart-wrap" id="w-wt"><canvas id="c-wt"></canvas></div>
-      </div>
-      <div class="chart-cell wide">
-        <div class="chart-label">Sleep Debt — exp. weighted τ=5d vs 8h/night · <span style="color:#4ade80">─</span> 9.5h  <span style="color:#fbbf24">─</span> 8.5h  <span style="color:#f87171">─</span> trend</div>
-        <div class="chart-wrap" id="w-slp"><canvas id="c-slp"></canvas></div>
       </div>
     </div>
   </section>
@@ -2831,17 +2883,6 @@ button:hover{{background:#334155;color:#e2e8f0}}
     </div>
   </section>
 
-  <section class="panel" data-panel="notes">
-    <div class="notes-panel-full">
-      <div class="brief-label">Notes <span class="notes-hint">— context for the coach · persists until cleared</span></div>
-      <div class="notes-list" id="notes-list">{notes_html}</div>
-      <div class="notes-input">
-        <textarea id="note-box" rows="2" placeholder="Add context, how you feel, or an upcoming session… (Ctrl+Enter to add)"></textarea>
-        <button onclick="submitNote()">Add</button>
-        <button class="notes-clear" onclick="clearNotes()">Clear all</button>
-      </div>
-    </div>
-  </section>
 
 </div>
 <div class="footer">
@@ -2883,7 +2924,11 @@ function plotSeries(ctx, xOf, yOf, data, color, width, dashed) {{
 
 function setupCanvas(cid, wid) {{
   const wrap=document.getElementById(wid), canvas=document.getElementById(cid);
+  // Null when the canvas is absent or its panel is hidden (zero client size), so a
+  // chart that now lives on a different tab can be in drawAll's list harmlessly.
+  if (!wrap || !canvas) return null;
   const dpr=window.devicePixelRatio||1, W=wrap.clientWidth, H=wrap.clientHeight;
+  if (!W || !H) return null;
   canvas.width=W*dpr; canvas.height=H*dpr;
   const ctx=canvas.getContext('2d'); ctx.scale(dpr,dpr);
   return {{ctx,W,H}};
@@ -2948,7 +2993,7 @@ function drawProjBand(ctx, xOf, yOf, mid, sigma, fillStyle) {{
 
 // ── CTL/ATL ──────────────────────────────────────────────────────────────────
 function drawCtl() {{
-  const {{ctx,W,H}}=setupCanvas('c-ctl','w-ctl');
+  const _g=setupCanvas('c-ctl', 'w-ctl'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:6,right:10,bottom:22,left:36}};
   const [dates,ctl,atl]=sliceByDays(DATA.dates,DATA.ctl,DATA.atl);
   const sigCtl=DATA.projCtlSig, sigAtl=DATA.projAtlSig;
@@ -2980,7 +3025,7 @@ function drawCtl() {{
 
 // ── TSB ───────────────────────────────────────────────────────────────────────
 function drawTsb() {{
-  const {{ctx,W,H}}=setupCanvas('c-tsb','w-tsb');
+  const _g=setupCanvas('c-tsb', 'w-tsb'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:6,right:10,bottom:22,left:36}};
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const [dates,tsb]=sliceByDays(DATA.dates,DATA.tsb);
@@ -3027,7 +3072,7 @@ function drawTsb() {{
 
 // ── HRV ───────────────────────────────────────────────────────────────────────
 function drawHrv() {{
-  const {{ctx,W,H}}=setupCanvas('c-hrv','w-hrv');
+  const _g=setupCanvas('c-hrv', 'w-hrv'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:6,right:10,bottom:22,left:36}};
   const [dates,hrv,rhr]=sliceByDays(DATA.dates,DATA.hrv,DATA.rhr);
   const allVals=[...hrv,...rhr].filter(v=>v!=null); if(!allVals.length) return;
@@ -3060,7 +3105,7 @@ function drawHrv() {{
 
 // ── Z4+ ───────────────────────────────────────────────────────────────────────
 function drawHil() {{
-  const {{ctx,W,H}}=setupCanvas('c-hil','w-hil');
+  const _g=setupCanvas('c-hil', 'w-hil'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:6,right:10,bottom:22,left:36}};
   const cW=W-PAD.left-PAD.right, cH=H-PAD.top-PAD.bottom;
   const cutoff=new Date(Date.now()-currentDays*86400000).toISOString().slice(0,10);
@@ -3090,7 +3135,7 @@ function drawHil() {{
 
 // ── Sleep ─────────────────────────────────────────────────────────────────────
 function drawSleep() {{
-  const {{ctx,W,H}}=setupCanvas('c-slp','w-slp');
+  const _g=setupCanvas('c-slp', 'w-slp'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:4,right:10,bottom:22,left:36}};
   const cutoff=new Date(Date.now()-currentDays*86400000).toISOString().slice(0,10);
   let idx=DATA.sleepDates.findIndex(d=>d>=cutoff); if(idx<0) idx=0;
@@ -3210,7 +3255,7 @@ function addHoverToChart(cid, wid) {{
 }}
 
 function drawCalHistory() {{
-  const {{ctx,W,H}}=setupCanvas('c-cal','w-cal');
+  const _g=setupCanvas('c-cal', 'w-cal'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:4,right:46,bottom:22,left:40}};
   const dates=DATA.calHistDates, consumed=DATA.calHistConsumed, target=DATA.calHistTarget;
   // paceTarget matches target for every complete day; today (if incomplete) is swapped
@@ -3366,7 +3411,7 @@ function gpPredict(xTrain, yTrain, xQuery, kernels, sigmaN) {{
 }}
 
 function drawWeight() {{
-  const {{ctx,W,H}}=setupCanvas('c-wt','w-wt');
+  const _g=setupCanvas('c-wt', 'w-wt'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:4,right:10,bottom:22,left:36}};
   if(!DATA.weightDates||!DATA.weightDates.length) {{
     ctx.fillStyle='#334155'; ctx.font='11px sans-serif'; ctx.textAlign='center';
@@ -3472,9 +3517,10 @@ function drawIllnessSpark() {{
 }}
 
 function drawAll() {{
-  drawCtl(); drawTsb(); drawHrv(); drawHil(); drawCalHistory(); drawWeight(); drawSleep();
+  // Sleep moved to the Today tab; it is drawn from that tab's handler.
+  drawCtl(); drawTsb(); drawHrv(); drawHil(); drawCalHistory(); drawWeight();
   drawIllnessSpark();
-  ['c-ctl','c-tsb','c-hrv','c-hil','c-cal','c-wt','c-slp'].forEach(function(id) {{
+  ['c-ctl','c-tsb','c-hrv','c-hil','c-cal','c-wt'].forEach(function(id) {{
     addHoverToChart(id, id.replace('c-','w-'));
   }});
 }}
@@ -3725,7 +3771,13 @@ function selectTab(name) {{
 
   // A canvas inside a hidden panel has zero client size, so charts must be
   // (re)drawn when their panel becomes visible, not merely on load.
-  if (name === 'trends') {{
+  if (name === 'today') {{
+    requestAnimationFrame(function() {{
+      renderTodayDials();
+      drawSleep();
+      addHoverToChart('c-slp', 'w-slp');   // idempotent; sleep's tooltip lives here now
+    }});
+  }} else if (name === 'trends') {{
     requestAnimationFrame(drawAll);
   }} else if (name === 'perf') {{
     requestAnimationFrame(function() {{
@@ -3755,12 +3807,15 @@ function selectTab(name) {{
     }});
   }}
 
-  // Refresh reloads the whole document; restore whichever tab was open.
+  // Refresh reloads the whole document; restore whichever tab was open, else
+  // draw the default (Today) so its dials and sleep chart render on first paint.
   var saved = null;
   try {{ saved = sessionStorage.getItem('activeTab'); }} catch (e) {{}}
-  if (saved && document.querySelector('.tab[data-panel="' + saved + '"]')) {{
-    selectTab(saved);
+  if (!saved || !document.querySelector('.tab[data-panel="' + saved + '"]')) {{
+    var def = document.querySelector('.tab[aria-selected="true"]');
+    saved = def ? def.dataset.panel : 'today';
   }}
+  selectTab(saved);
 }})();
 
 // Stat hover tooltips
@@ -3987,6 +4042,62 @@ function drawNutrWeight() {{
     var perWk = slope * 7;
     sub.textContent = vals[n-1].toFixed(1) + ' kg · ' +
       (perWk >= 0 ? '+' : '') + perWk.toFixed(2) + ' kg/wk over ' + n + ' weigh-ins';
+  }}
+}}
+
+// Compact nutrition dials for the Today tab — a calorie ring plus P/C/F bars,
+// reading from the same DATA.nutrition the Nutrition tab uses.
+function renderTodayDials() {{
+  var host = document.getElementById('today-dials');
+  var n = DATA.nutrition;
+  if (!host || !n) return;
+  if (n.consumed <= 0) {{
+    host.innerHTML = '<div class="brief-label">Nutrition</div>' +
+      '<div style="font-size:11.5px;color:#475569">Nothing logged yet today. ' +
+      'Log food from the Nutrition tab.</div>';
+    return;
+  }}
+  host.innerHTML =
+    '<div class="brief-label" style="margin:0">Nutrition today</div>' +
+    '<div class="dials-top">' +
+      '<div class="dial-ring"><canvas id="c-dial-ring"></canvas>' +
+        '<div class="dial-ring-mid" id="dial-ring-mid"></div></div>' +
+      '<div class="dial-macros" id="dial-macros"></div>' +
+    '</div>' +
+    '<div class="dial-foot" id="dial-foot"></div>' +
+    '<button class="dial-link" onclick="selectTab(\\'nutrition\\')">Full nutrition dashboard →</button>';
+
+  var remaining = Math.max(n.target - n.consumed, 0);
+  drawDonut('c-dial-ring', [
+    {{value: n.consumed, color: '#a78bfa'}},
+    {{value: remaining,  color: '#1e293b'}}
+  ], {{inner: 0.72}});
+  var over = n.consumed > n.target;
+  document.getElementById('dial-ring-mid').innerHTML =
+    '<div class="big" style="color:' + (over ? '#fbbf24' : '#e2e8f0') + '">' +
+    Math.round(n.consumed / n.target * 100) + '%</div><div class="small">of kcal</div>';
+
+  document.getElementById('dial-macros').innerHTML =
+    ['protein', 'carbs', 'fat'].map(function(k) {{
+      var m = macroByKey(k);
+      var pct = m.target ? Math.min(m.g / m.target * 100, 100) : 0;
+      return '<div class="dm-row"><span class="dm-name">' + m.label + '</span>' +
+        '<span class="dm-track"><span class="dm-fill" style="width:' + pct +
+        '%;background:' + m.color + '"></span></span>' +
+        '<span class="dm-val">' + Math.round(m.g) + '/' + Math.round(m.target) + 'g</span></div>';
+    }}).join('');
+
+  var b = DATA.bulk || {{}};
+  var foot = document.getElementById('dial-foot');
+  if (b.avg_surplus != null) {{
+    var col = {{'on track':'#4ade80','slow but positive':'#fbbf24','in deficit':'#f87171'}}[b.state] || '#94a3b8';
+    foot.innerHTML = '<span>7-day surplus <b style="color:' + col + '">' +
+      (b.avg_surplus >= 0 ? '+' : '') + b.avg_surplus + '</b> kcal/d</span>' +
+      '<span><b style="color:' + col + '">' + (b.kg_per_week >= 0 ? '+' : '') + b.kg_per_week +
+      '</b> kg/wk</span>';
+  }} else {{
+    foot.innerHTML = '<span>Eaten <b>' + Math.round(n.consumed).toLocaleString() +
+      '</b> / ' + Math.round(n.target).toLocaleString() + ' kcal</span>';
   }}
 }}
 
