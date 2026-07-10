@@ -572,26 +572,11 @@ def compute_nutrition_context(activities, calorie_target):
     }
 
 
-def render_nutrition_body(food_data, ctx):
-    """Renders the dynamic contents of #nutr-body: calorie bar, macro rows, the
-    today's-meals dropdown and the quick-add input. Pure function of
-    (food_data, ctx) — called both on initial page build and after a food entry
-    is logged, so #nutr-body can be refreshed in place without disturbing the
-    click/tooltip listener bound to the outer #nutr-section."""
+def render_food_log(food_data):
+    """Just today's logged meals and the quick-add input — the whole content of the
+    Nutrition tab's "Logged today" card. The calorie bar and macro rows the old
+    widget also drew now live in their own dashboard cards, so this stays lean."""
     import html as _html
-
-    kcal_total           = ctx["kcal_total"]
-    expected_so_far      = ctx["expected_so_far"]
-    day_frac             = ctx["day_frac"]
-    training_hours_today = ctx["training_hours_today"]
-
-    protein_target_g = ctx["protein_target_g"]
-    carbs_target_g   = ctx["carbs_target_g"]
-    fat_target_g     = ctx["fat_target_g"]
-    fiber_target_g   = ctx["fiber_target_g"]
-    sugar_target_g   = ctx["sugar_target_g"]
-    sodium_target_mg = ctx["sodium_target_mg"]
-
     entries = (food_data or {}).get("entries", [])
     if entries:
         rows = "".join(
@@ -602,17 +587,12 @@ def render_nutrition_body(food_data, ctx):
             '</div>'
             for e in entries
         )
-        food_list_html = (
-            '<details class="food-list" onclick="event.stopPropagation()">'
-            f'<summary>{len(entries)} meal{"s" if len(entries) != 1 else ""} logged &#9662;</summary>'
-            f'<div class="food-entry-list">{rows}</div>'
-            '</details>'
-        )
+        list_html = f'<div class="food-entry-list">{rows}</div>'
     else:
-        food_list_html = ''
-
-    food_input_html = (
-        '<div class="food-input-row" onclick="event.stopPropagation()">'
+        list_html = '<div class="food-log-empty">No meals logged yet today.</div>'
+    return (
+        f'<div id="food-log-list">{list_html}</div>'
+        '<div class="food-input-row">'
         '<input type="text" id="food-box" placeholder="Log food… (Enter to add)" '
         '''onkeydown="if(event.key==='Enter'){event.preventDefault();submitFood();}">'''
         '<button id="food-add-btn" onclick="submitFood()">Add</button>'
@@ -620,146 +600,38 @@ def render_nutrition_body(food_data, ctx):
         '<div class="food-status" id="food-status" style="display:none"></div>'
     )
 
-    if food_data and food_data.get("entry_count", 0) > 0:
-        consumed_kcal = int(food_data["calories"])
-        cal_pct       = min(round(consumed_kcal / max(kcal_total, 1) * 100), 100)
-        pace_pct      = consumed_kcal / max(expected_so_far, 1) * 100
-        if day_frac <= 0.02:    cal_color = "#3b82f6"   # too early in the window to judge pace
-        elif pace_pct >= 100:   cal_color = "#22c55e"
-        elif pace_pct >= 85:    cal_color = "#fbbf24"
-        else:                   cal_color = "#f87171"
 
-        p_g  = food_data["protein_g"]
-        c_g  = food_data["carbs_g"]
-        fa_g = food_data["fat_g"]
-        fi_g  = food_data.get("fiber_g",  0)
-        su_g  = food_data.get("sugar_g",  0)
-        na_mg = food_data.get("sodium_mg", 0)
-
-        p_kcal  = round(p_g  * 4)
-        c_kcal  = round(c_g  * 4)
-        fa_kcal = round(fa_g * 9)
-        macro_kcal_total = max(p_kcal + c_kcal + fa_kcal, 1)
-
-        p_pct_cal  = round(p_kcal  / macro_kcal_total * 100)
-        c_pct_cal  = round(c_kcal  / macro_kcal_total * 100)
-        fa_pct_cal = round(fa_kcal / macro_kcal_total * 100)
-
-        p_raw  = p_g  / max(protein_target_g, 1) * 100
-        c_raw  = c_g  / max(carbs_target_g,   1) * 100
-        f_raw  = fa_g / max(fat_target_g,     1) * 100
-        fi_raw = fi_g / max(fiber_target_g,   1) * 100
-        su_raw = su_g / max(sugar_target_g,   1) * 100
-        na_raw = na_mg/ max(sodium_target_mg, 1) * 100
-
-        p_pct  = min(round(p_raw),  100)
-        c_pct  = min(round(c_raw),  100)
-        f_pct  = min(round(f_raw),  100)
-        fi_pct = min(round(fi_raw), 100)
-        su_pct = min(round(su_raw), 100)
-        na_pct = min(round(na_raw), 100)
-
-        def _aim_dot(pct):
-            """Green = hit target, amber = ≥75%, red = under."""
-            if pct >= 100: return "#4ade80"
-            if pct >= 75:  return "#fbbf24"
-            return "#ef4444"
-
-        def _limit_dot(pct):
-            """Green = well under limit, amber = approaching, red = over."""
-            if pct > 100: return "#ef4444"
-            if pct > 75:  return "#fbbf24"
-            return "#4ade80"
-
-        tick = "box-shadow:inset -2px 0 0 rgba(255,255,255,0.25)"
-
-        p_tip  = f"Protein: {p_g:.0f} / {protein_target_g}g target · {p_kcal} kcal · {p_pct_cal}% of calories"
-        c_tip  = f"Carbohydrates: {c_g:.0f} / {carbs_target_g}g target · {c_kcal} kcal · {c_pct_cal}% of calories"
-        fa_tip = f"Fat: {fa_g:.0f} / {fat_target_g}g target · {fa_kcal} kcal · {fa_pct_cal}% of calories"
-        fi_tip = f"Fibre: {fi_g:.0f} / {fiber_target_g}g target · supports digestion and glycaemic control"
-        su_base_note = f" ({training_hours_today:.1f}h training today: base 50g + {sugar_target_g - 50}g fuel allowance)" if training_hours_today > 0.1 else " (sedentary limit — log sessions to adjust)"
-        na_base_note = f" ({training_hours_today:.1f}h training today: base 2300mg + {sodium_target_mg - 2300}mg sweat replacement)" if training_hours_today > 0.1 else " (sedentary limit — log sessions to adjust)"
-        su_tip = f"Sugar: {su_g:.0f} / {sugar_target_g}g adjusted limit · fast carbs are valid fuel around sessions{su_base_note}"
-        na_tip = f"Sodium: {na_mg:.0f} / {sodium_target_mg}mg adjusted limit · replace sweat losses; excess still raises blood pressure{na_base_note}"
-
-        return (
-            '<div class="nutr-cal">'
-            '<span class="label">Nutrition</span>'
-            '<span style="display:flex;align-items:center;gap:6px">'
-            f'<span class="nutr-cal-num">{consumed_kcal:,} / {kcal_total:,} kcal</span>'
-            '<button id="nutr-toggle" class="nutr-toggle-btn" onclick="event.stopPropagation();toggleNutrExtras()" title="Toggle extra stats">+</button>'
-            '<button class="nutr-toggle-btn" onclick="event.stopPropagation();toggleNutrModal()" title="Expand">&#10530;</button>'
-            '</span>'
-            '</div>'
-            f'<div class="bar-wrap" data-tip="Expected ~{round(expected_so_far):,} kcal by now ({round(day_frac*100)}% through the {EATING_START_H}:00-{EATING_END_H}:00 eating window)">'
-            f'<div class="bar-fill" style="width:{cal_pct}%;background:{cal_color}"></div>'
-            f'<div class="bar-pace-marker" style="left:{round(day_frac*100, 1)}%"></div>'
-            '</div>'
-            f'<div class="sub" style="margin-top:2px">pace: ~{round(expected_so_far):,} kcal expected by now</div>'
-            f'<div class="macro-row" data-tip="{p_tip}">'
-            '<span class="macro-name">P</span>'
-            f'<div class="macro-bar-wrap" style="{tick}">'
-            f'<div class="macro-bar-fill" style="width:{p_pct}%;background:#a78bfa"></div>'
-            '</div>'
-            f'<span class="macro-val">{p_g:.0f}/{protein_target_g}g</span>'
-            f'<span style="font-size:7px;color:{_aim_dot(p_raw)};margin-left:2px;flex-shrink:0">●</span>'
-            '</div>'
-            f'<div class="macro-row" data-tip="{c_tip}">'
-            '<span class="macro-name">C</span>'
-            f'<div class="macro-bar-wrap" style="{tick}">'
-            f'<div class="macro-bar-fill" style="width:{c_pct}%;background:#fbbf24"></div>'
-            '</div>'
-            f'<span class="macro-val">{c_g:.0f}/{carbs_target_g}g</span>'
-            f'<span style="font-size:7px;color:{_aim_dot(c_raw)};margin-left:2px;flex-shrink:0">●</span>'
-            '</div>'
-            f'<div class="macro-row" data-tip="{fa_tip}">'
-            '<span class="macro-name">F</span>'
-            f'<div class="macro-bar-wrap" style="{tick}">'
-            f'<div class="macro-bar-fill" style="width:{f_pct}%;background:#fb923c"></div>'
-            '</div>'
-            f'<span class="macro-val">{fa_g:.0f}/{fat_target_g}g</span>'
-            f'<span style="font-size:7px;color:{_aim_dot(f_raw)};margin-left:2px;flex-shrink:0">●</span>'
-            '</div>'
-            f'<div class="macro-row nutr-extra" style="display:none" data-tip="{fi_tip}">'
-            '<span class="macro-name" style="color:#4ade80">Fi</span>'
-            f'<div class="macro-bar-wrap" style="{tick}">'
-            f'<div class="macro-bar-fill" style="width:{fi_pct}%;background:#4ade80"></div>'
-            '</div>'
-            f'<span class="macro-val">{fi_g:.0f}/{fiber_target_g}g</span>'
-            f'<span style="font-size:7px;color:{_aim_dot(fi_raw)};margin-left:2px;flex-shrink:0">●</span>'
-            '</div>'
-            f'<div class="macro-row nutr-extra" style="display:none" data-tip="{su_tip}">'
-            '<span class="macro-name" style="color:#f472b6">Su</span>'
-            f'<div class="macro-bar-wrap" style="{tick}">'
-            f'<div class="macro-bar-fill" style="width:{su_pct}%;background:#f472b6"></div>'
-            '</div>'
-            f'<span class="macro-val">{su_g:.0f}/{sugar_target_g}g</span>'
-            f'<span style="font-size:7px;color:{_limit_dot(su_raw)};margin-left:2px;flex-shrink:0">●</span>'
-            '</div>'
-            f'<div class="macro-row nutr-extra" style="display:none" data-tip="{na_tip}">'
-            '<span class="macro-name" style="color:#67e8f9">Na</span>'
-            f'<div class="macro-bar-wrap" style="{tick}">'
-            f'<div class="macro-bar-fill" style="width:{na_pct}%;background:#67e8f9"></div>'
-            '</div>'
-            f'<span class="macro-val">{na_mg:.0f}/{sodium_target_mg}mg</span>'
-            f'<span style="font-size:7px;color:{_limit_dot(na_raw)};margin-left:2px;flex-shrink:0">●</span>'
-            '</div>'
-            f'<div class="macro-row nutr-extra" style="display:none">'
-            f'<span style="font-size:10px;color:#475569">P {p_pct_cal}% · C {c_pct_cal}% · F {fa_pct_cal}%</span>'
-            '</div>'
-            + food_list_html + food_input_html
-        )
-    else:
-        return (
-            '<div class="nutr-cal">'
-            '<span class="label">Nutrition</span>'
-            '<span style="display:flex;align-items:center;gap:6px">'
-            '<span class="nutr-cal-num">— no meals logged today</span>'
-            '<button class="nutr-toggle-btn" onclick="event.stopPropagation();toggleNutrModal()" title="Expand">&#10530;</button>'
-            '</span>'
-            '</div>'
-            + food_input_html
-        )
+def nutrition_data(food_data, ctx):
+    """The `nutrition` block handed to the JS: consumed/target plus per-macro
+    grams, targets and kind. Shared by the initial build and the food-add refresh
+    so the dashboard and the quick-add path never compute macros differently."""
+    fd = food_data or {}
+    kcal_base    = ctx["kcal_base"]
+    session_kcal = ctx["session_kcal"]
+    kcal_total   = ctx["kcal_total"]
+    return {
+        "consumed": round(fd.get("calories", 0)),
+        "target": round(kcal_total),
+        "base": kcal_base, "sessionKcal": session_kcal,
+        "paceExpected": round(ctx["expected_so_far"]), "dayFrac": round(ctx["day_frac"], 3),
+        "macros": [
+            {"key": "protein", "label": "Protein", "color": "#a78bfa",
+             "g": round(fd.get("protein_g", 0), 1), "target": ctx["protein_target_g"],
+             "kcalPerG": 4, "kind": "aim"},
+            {"key": "carbs", "label": "Carbs", "color": "#22d3ee",
+             "g": round(fd.get("carbs_g", 0), 1), "target": ctx["carbs_target_g"],
+             "kcalPerG": 4, "kind": "aim"},
+            {"key": "fat", "label": "Fat", "color": "#fbbf24",
+             "g": round(fd.get("fat_g", 0), 1), "target": ctx["fat_target_g"],
+             "kcalPerG": 9, "kind": "aim"},
+            {"key": "fiber", "label": "Fibre", "color": "#4ade80",
+             "g": round(fd.get("fiber_g", 0), 1), "target": ctx["fiber_target_g"], "kind": "aim"},
+            {"key": "sugar", "label": "Sugar", "color": "#f472b6",
+             "g": round(fd.get("sugar_g", 0), 1), "target": ctx["sugar_target_g"], "kind": "limit"},
+            {"key": "sodium", "label": "Sodium", "color": "#fb923c", "unit": "mg",
+             "g": round(fd.get("sodium_mg", 0)), "target": ctx["sodium_target_mg"], "kind": "limit"},
+        ],
+    }
 
 
 def load_food_log():
@@ -2062,14 +1934,9 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         current_sleep_debt, next_exam_days=_next_exam_days)
     clearance_stat = _stat("Sleep Clearance", clearance_val, clearance_color, clearance_sub, tip=clearance_tip)
 
-    # ── Nutrition section ─────────────────────────────────────────────────────
-    nutr_body_html = render_nutrition_body(food_data, nutr_ctx)
-    nutr_html = (
-        '<hr class="div">'
-        '<div class="nutr-section" id="nutr-section" data-tip="Analysing weekly nutrition…" style="cursor:pointer">'
-        f'<div id="nutr-body">{nutr_body_html}</div>'
-        '</div>'
-    )
+    # The "Logged today" card content — entries + quick-add only. The calorie bar
+    # and macro rows the old widget drew are now their own dashboard cards.
+    food_log_html = render_food_log(food_data)
 
     # Three fragments, three homes: the KPI strip, the Nutrition tab, the Today tab.
     kpi_html = "".join([
@@ -2092,12 +1959,6 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         bt_stat,
     ])
 
-    nutr_panel_html = "".join([
-        nutr_html,
-        '<div id="nutr-detail" style="display:none;margin-top:8px;padding:8px 10px;'
-        'background:#071a10;border:1px solid #14532d;border-radius:6px;'
-        'font-size:12px;color:#86efac;line-height:1.65"></div>',
-    ])
 
     sessions_html = _build_sessions_html(training_plan, today_str_h, activities=activities)
 
@@ -2174,32 +2035,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         # Gap to the pace marker, not to the end-of-day total.
         "calGapKcal": round(nutr_ctx["expected_so_far"] - (food_data or {}).get("calories", 0)),
         "calPaceKcal": round(nutr_ctx["expected_so_far"]),
-        "nutrition": {
-            "consumed": round((food_data or {}).get("calories", 0)),
-            "target": round(kcal_total),
-            "base": kcal_base, "sessionKcal": session_kcal,
-            "paceExpected": round(expected_so_far), "dayFrac": round(day_frac, 3),
-            "macros": [
-                {"key": "protein", "label": "Protein", "color": "#a78bfa",
-                 "g": round((food_data or {}).get("protein_g", 0), 1),
-                 "target": nutr_ctx["protein_target_g"], "kcalPerG": 4, "kind": "aim"},
-                {"key": "carbs", "label": "Carbs", "color": "#22d3ee",
-                 "g": round((food_data or {}).get("carbs_g", 0), 1),
-                 "target": nutr_ctx["carbs_target_g"], "kcalPerG": 4, "kind": "aim"},
-                {"key": "fat", "label": "Fat", "color": "#fbbf24",
-                 "g": round((food_data or {}).get("fat_g", 0), 1),
-                 "target": nutr_ctx["fat_target_g"], "kcalPerG": 9, "kind": "aim"},
-                {"key": "fiber", "label": "Fibre", "color": "#4ade80",
-                 "g": round((food_data or {}).get("fiber_g", 0), 1),
-                 "target": nutr_ctx["fiber_target_g"], "kind": "aim"},
-                {"key": "sugar", "label": "Sugar", "color": "#f472b6",
-                 "g": round((food_data or {}).get("sugar_g", 0), 1),
-                 "target": nutr_ctx["sugar_target_g"], "kind": "limit"},
-                {"key": "sodium", "label": "Sodium", "color": "#fb923c", "unit": "mg",
-                 "g": round((food_data or {}).get("sodium_mg", 0)),
-                 "target": nutr_ctx["sodium_target_mg"], "kind": "limit"},
-            ],
-        },
+        "nutrition": nutrition_data(food_data, nutr_ctx),
         "bulk": (bulk_trend | {
             "surplusGoal": surplus_target,
             "kcalPerKg": KCAL_PER_KG,
@@ -2315,7 +2151,6 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .nutr-grid{{display:grid;grid-template-columns:minmax(340px,440px) minmax(0,1fr);
             gap:34px;padding:18px 22px;align-items:start}}
 .nutr-col{{min-width:0}}
-.nutr-grid .nutr-section{{margin-top:0}}
 .nutr-grid hr.div:first-child{{display:none}}
 /* Prose set across a 1400px window is unreadable — hold it to a sane measure. */
 .nutr-grid .tips-text{{max-width:70ch;font-size:14px;line-height:1.7}}
@@ -2387,7 +2222,26 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .weight-wrap{{position:relative;height:150px}}
 .weight-wrap canvas{{position:absolute;inset:0;width:100%;height:100%}}
 .gap-slot .tips-text{{font-size:13px;line-height:1.6;max-width:none}}
-.foodlog-card .food-entry-list{{max-height:200px}}
+.insight-card{{grid-column:span 5}}
+.insight-card .tips-text{{font-size:13px;line-height:1.65;max-width:none}}
+@media (max-width:1100px){{ .insight-card{{grid-column:span 12}} }}
+
+/* Logged-today card: entries + quick-add only */
+.food-entry-list{{display:flex;flex-direction:column;max-height:230px;overflow-y:auto}}
+.food-entry-row{{display:flex;gap:8px;font-size:11.5px;padding:5px 0;border-bottom:1px solid #16213a}}
+.food-entry-time{{color:#475569;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.food-entry-desc{{color:#cbd5e1;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.food-entry-kcal{{color:#64748b;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.food-log-empty{{font-size:11.5px;color:#475569;font-style:italic;padding:2px 0 6px}}
+.food-input-row{{display:flex;gap:6px;margin-top:10px}}
+.food-input-row input{{flex:1;min-width:0;background:#0f172a;border:1px solid #334155;border-radius:5px;
+  color:#e2e8f0;font-size:12px;padding:6px 9px;font-family:inherit;outline:none}}
+.food-input-row input:focus{{border-color:#a78bfa}}
+.food-input-row button{{background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:5px;
+  padding:6px 13px;font-size:11.5px;cursor:pointer;font-family:inherit}}
+.food-input-row button:hover{{background:#334155;color:#e2e8f0}}
+.food-status{{font-size:10.5px;margin-top:6px}}
+.food-status.pending{{color:#94a3b8}} .food-status.error{{color:#f87171}}
 
 /* ── Catch-up-to-pace suggestion ──────────────────────────────────────────── */
 .gap-card{{background:#1c1008;border:1px solid #78350f;border-radius:9px;
@@ -2463,64 +2317,6 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 button{{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:5px;
         padding:4px 14px;font-size:12px;cursor:pointer}}
 button:hover{{background:#334155;color:#e2e8f0}}
-.nutr-section {{ margin-top: 2px; }}
-.nutr-cal {{ display:flex; justify-content:space-between; font-size:11px; margin-bottom:4px; }}
-.nutr-cal-num {{ color:#94a3b8; }}
-.bar-wrap {{ position:relative; height:6px; background:#1e293b; border-radius:3px; margin-bottom:6px; cursor:help; }}
-.bar-fill {{ height:100%; border-radius:3px; transition:width 0.6s ease; }}
-.bar-pace-marker {{ position:absolute; top:-2px; bottom:-2px; width:2px; background:#e2e8f0; opacity:0.85; }}
-.macro-row {{ display:flex; align-items:center; gap:6px; margin-bottom:5px; }}
-.macro-name {{ font-size:10px; color:#64748b; width:14px; flex-shrink:0; }}
-.macro-bar-wrap {{ flex:1; height:4px; background:#1e293b; border-radius:2px; overflow:hidden; }}
-.macro-bar-fill {{ height:100%; border-radius:2px; transition:width 0.6s ease; }}
-.macro-val {{ font-size:10px; color:#475569; white-space:nowrap; }}
-.nutr-toggle-btn {{ background:none; border:1px solid #334155; border-radius:3px; color:#64748b;
-  font-size:11px; line-height:1; padding:0 4px; cursor:pointer; margin:0; }}
-.nutr-toggle-btn:hover {{ background:#1e293b; color:#94a3b8; border-color:#475569; }}
-.nutr-toggle-btn.active {{ color:#a78bfa; border-color:#a78bfa; }}
-.food-list {{ margin-top:5px; }}
-.food-list summary {{ font-size:10px; color:#64748b; cursor:pointer; list-style:none; }}
-.food-list summary::-webkit-details-marker {{ display:none; }}
-.food-list summary:hover {{ color:#94a3b8; }}
-.food-entry-list {{ margin-top:4px; max-height:120px; overflow-y:auto; }}
-.food-entry-row {{ display:flex; align-items:baseline; gap:6px; font-size:10px; color:#64748b;
-  padding:2px 0; border-bottom:1px solid #16213a; }}
-.food-entry-time {{ color:#475569; flex-shrink:0; width:32px; }}
-.food-entry-desc {{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.food-entry-kcal {{ color:#475569; flex-shrink:0; }}
-.food-input-row {{ display:flex; gap:5px; margin-top:6px; }}
-.food-input-row input {{ flex:1; background:#0f172a; border:1px solid #334155; border-radius:5px;
-  color:#e2e8f0; font-size:11px; padding:4px 7px; min-width:0; }}
-.food-input-row input:focus {{ outline:none; border-color:#a78bfa; }}
-.food-input-row input:disabled {{ opacity:0.5; }}
-.food-input-row button {{ padding:4px 10px; font-size:11px; }}
-.food-status {{ font-size:10px; margin-top:4px; }}
-.food-status.pending {{ color:#94a3b8; }}
-.food-status.error {{ color:#f87171; }}
-#nutr-backdrop {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:999; }}
-.nutr-section.nutr-modal {{
-  position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
-  width:640px; max-width:92vw; max-height:85vh; overflow-y:auto;
-  background:#0f172a; border:1px solid #334155; border-radius:12px;
-  padding:26px 30px; z-index:1000; box-shadow:0 20px 60px rgba(0,0,0,.6);
-  cursor:default;
-}}
-.nutr-modal .nutr-cal {{ font-size:20px; margin-bottom:14px; }}
-.nutr-modal .bar-wrap {{ height:12px; margin-bottom:16px; }}
-.nutr-modal .macro-row {{ gap:12px; margin-bottom:14px; }}
-.nutr-modal .macro-name {{ font-size:16px; width:22px; }}
-.nutr-modal .macro-bar-wrap {{ height:8px; }}
-.nutr-modal .macro-val {{ font-size:16px; }}
-.nutr-modal .sub {{ font-size:14px; }}
-.nutr-modal .nutr-toggle-btn {{ font-size:15px; padding:2px 8px; }}
-.nutr-modal .food-list summary {{ font-size:15px; }}
-.nutr-modal .food-entry-list {{ max-height:220px; }}
-.nutr-modal .food-entry-row {{ font-size:14px; padding:5px 0; }}
-.nutr-modal .food-entry-time {{ width:44px; }}
-.nutr-modal .food-input-row {{ margin-top:14px; }}
-.nutr-modal .food-input-row input {{ font-size:15px; padding:9px 12px; }}
-.nutr-modal .food-input-row button {{ font-size:15px; padding:9px 16px; }}
-.nutr-modal .food-status {{ font-size:13px; }}
 #stale-warn {{ display:none; position:fixed; bottom:10px; right:10px; font-size:16px; cursor:default;
   z-index:9999; }}
 #stale-warn .stale-tip {{ display:none; position:absolute; bottom:24px; right:0; background:#1e293b;
@@ -2759,7 +2555,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
 
       <div class="nutr-card weight-card">
         <div class="nutr-card-h">Body weight <span class="nutr-card-sub" id="weight-sub"></span></div>
-        <div class="weight-wrap"><canvas id="c-nutr-weight"></canvas></div>
+        <div class="weight-wrap" id="weight-wrap"><canvas id="c-nutr-weight"></canvas></div>
       </div>
 
       <div class="nutr-card gap-slot">
@@ -2776,7 +2572,12 @@ button:hover{{background:#334155;color:#e2e8f0}}
 
       <div class="nutr-card foodlog-card">
         <div class="nutr-card-h">Logged today</div>
-        <div id="nutr-panel-legacy">{nutr_panel_html}</div>
+        <div id="food-log-body">{food_log_html}</div>
+      </div>
+
+      <div class="nutr-card insight-card" id="nutr-insight-card" style="display:none">
+        <div class="nutr-card-h">Weekly nutrition analysis</div>
+        <div class="tips-text" id="nutr-insight"></div>
       </div>
 
     </div>
@@ -2893,7 +2694,6 @@ button:hover{{background:#334155;color:#e2e8f0}}
      border-radius:7px;padding:8px 12px;font-size:11px;pointer-events:none;
      display:none;z-index:999;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,.4)"></div>
 <div class="stat-tooltip" id="stat-tip"></div>
-<div id="nutr-backdrop" onclick="toggleNutrModal()"></div>
 <div id="stale-warn">⚠<span class="stale-tip">Advice may be outdated — daily API quota exceeded.<br>Will refresh automatically when quota resets.</span></div>
 <script>
 const DATA = {chart_data};
@@ -3533,23 +3333,11 @@ function setCoachBrief(overview, tips) {{
   if (t) t.innerHTML = tips;
 }}
 function setNutritionInsight(text) {{
-  var el = document.getElementById('nutr-section');
-  var detail = document.getElementById('nutr-detail');
-  // Tooltip: first sentence only + click hint
-  if (el) {{
-    var clean = text.replace(/&#10;/g, ' ');
-    var first = clean.split('. ')[0] + '.';
-    el.setAttribute('data-tip', first + '\\n\\nClick for full analysis.');
-    el.addEventListener('click', function() {{
-      if (!detail) return;
-      if (detail.style.display === 'none') {{
-        detail.innerHTML = text.replace(/&#10;/g, '<br>');
-        detail.style.display = 'block';
-      }} else {{
-        detail.style.display = 'none';
-      }}
-    }});
-  }}
+  var card = document.getElementById('nutr-insight-card');
+  var body = document.getElementById('nutr-insight');
+  if (!body) return;
+  body.innerHTML = text.replace(/&#10;/g, '<br>');
+  if (card) card.style.display = 'block';
 }}
 function setNutritionCoach(text) {{
   var el = document.getElementById('brief-nutr');
@@ -3559,8 +3347,8 @@ function setNotes(html) {{
   var el = document.getElementById('notes-list');
   if (el) el.innerHTML = html;
 }}
-function setNutritionBody(html) {{
-  var el = document.getElementById('nutr-body');
+function setFoodLog(html) {{
+  var el = document.getElementById('food-log-body');
   if (el) el.innerHTML = html;
 }}
 function submitFood() {{
@@ -4117,25 +3905,6 @@ function renderCalGap() {{
 }}
 window.addEventListener('load', renderCalGap);
 
-function toggleNutrExtras() {{
-  var extras = document.querySelectorAll('.nutr-extra');
-  var btn    = document.getElementById('nutr-toggle');
-  var showing = extras[0] && extras[0].style.display !== 'none';
-  extras.forEach(function(el) {{ el.style.display = showing ? 'none' : 'flex'; }});
-  if (btn) {{ btn.textContent = showing ? '+' : '−'; btn.classList.toggle('active', !showing); }}
-}}
-
-function toggleNutrModal(forceClose) {{
-  var sec = document.getElementById('nutr-section');
-  var bd  = document.getElementById('nutr-backdrop');
-  if (!sec) return;
-  var open = forceClose ? false : !sec.classList.contains('nutr-modal');
-  sec.classList.toggle('nutr-modal', open);
-  if (bd) bd.style.display = open ? 'block' : 'none';
-}}
-document.addEventListener('keydown', function(e) {{
-  if (e.key === 'Escape') toggleNutrModal(true);
-}});
 
 function triggerRefresh() {{
   var btn = document.getElementById('refresh-btn');
@@ -4781,15 +4550,20 @@ class BriefWindow(Gtk.Window):
         self._refresh_nutrition_ui()
 
     def _refresh_nutrition_ui(self):
-        """Rebuild #nutr-body from the current food log + cached nutrition context
-        (set in _fetch_and_render) and push it into the running page."""
+        """After a food quick-add: refresh the logged-today list and re-render the
+        nutrition dashboard + Today dials from the recomputed macro data, all in
+        place, so the user never has to hit refresh."""
         ctx = getattr(self, "_nutr_ctx", None)
         if not ctx:
             return
         food_data = get_today_nutrition()
-        body_html = render_nutrition_body(food_data, ctx).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+        log_html  = render_food_log(food_data).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+        nutr_json = json.dumps(nutrition_data(food_data, ctx))
         GLib.idle_add(
-            lambda: self.wv.run_javascript(f"setNutritionBody('{body_html}')", None, None, None) or False)
+            lambda: self.wv.run_javascript(
+                f"setFoodLog('{log_html}'); DATA.nutrition={nutr_json}; "
+                f"renderNutritionDash(); renderTodayDials();",
+                None, None, None) or False)
         # Gap may have closed (or changed) — refresh the chart-hover suggestion too.
         try:
             suggestion = get_calorie_gap_suggestion(food_data, ctx)
