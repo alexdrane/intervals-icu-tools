@@ -1509,9 +1509,15 @@ def _stat(label, value, color="#e2e8f0", sub=None, tip=None):
             f'{sub_html}</div>')
 
 
-def _build_sessions_html(training_plan, today_str, activities=None):
+def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7):
     sessions = training_plan.get("sessions", [])
-    upcoming = [s for s in sessions if s.get("date", "") >= today_str]
+    # A full plan runs to hundreds of sessions; rendering all of them buries the
+    # week you can actually act on and costs ~120 KB of DOM.
+    horizon = (datetime.strptime(today_str, "%Y-%m-%d")
+               + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    pending  = [s for s in sessions if s.get("date", "") >= today_str]
+    upcoming = [s for s in pending if s["date"] <= horizon]
+    beyond   = len(pending) - len(upcoming)
 
     rows = []
 
@@ -1572,7 +1578,7 @@ def _build_sessions_html(training_plan, today_str, activities=None):
         for s in upcoming:
             by_date[s["date"]].append(s)
 
-        rows.append('<hr class="div"><div class="label" style="margin-bottom:6px">Upcoming</div>')
+        rows.append('<hr class="div"><div class="label" style="margin-bottom:6px">Next 7 days</div>')
         for date in sorted(by_date):
             if date == today_str:
                 day_label = "Today"
@@ -1597,6 +1603,12 @@ def _build_sessions_html(training_plan, today_str, activities=None):
                     f'<span style="font-size:12px;color:#94a3b8">{name}</span>'
                     f'</div>'
                 )
+
+        if beyond:
+            rows.append(
+                f'<div style="font-size:10px;color:#475569;margin-top:7px;font-style:italic">'
+                f'+{beyond} further session{"s" if beyond != 1 else ""} in the plan</div>'
+            )
 
     return "".join(rows)
 
@@ -1781,7 +1793,8 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         '</div>'
     )
 
-    stats_html = "".join([
+    # Three fragments, three homes: the KPI strip, the Nutrition tab, the Today tab.
+    kpi_html = "".join([
         _stat("Form (TSB)", f"{tsb:+.1f}" if tsb is not None else "—",
               _color_tsb(tsb),
               f"Fitness {ctl:.0f} · Fatigue {atl:.0f}" if ctl and atl else None,
@@ -1795,18 +1808,20 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         _stat("Sleep", _fmt_sleep(sleep_secs), _color_sleep(sleep_score),
               f"Score {int(sleep_score)}" if sleep_score else None,
               tip=sleep_tip),
-        '<hr class="div">',
         _stat("Sleep Avg (14d)", debt_str, debt_color, "avg vs 8h/night target", tip=debt_tip),
         clearance_stat,
-        '<hr class="div">',
         kcal_stat,
         bt_stat,
+    ])
+
+    nutr_panel_html = "".join([
         nutr_html,
         '<div id="nutr-detail" style="display:none;margin-top:8px;padding:8px 10px;'
         'background:#071a10;border:1px solid #14532d;border-radius:6px;'
         'font-size:12px;color:#86efac;line-height:1.65"></div>',
-        _build_sessions_html(training_plan, today_str_h, activities=activities),
     ])
+
+    sessions_html = _build_sessions_html(training_plan, today_str_h, activities=activities)
 
     chart_entries = [w for w in entries if w.get("ctl") or w.get("atl")]
     chart_dates   = [w["id"] for w in chart_entries]
@@ -1891,35 +1906,62 @@ body{{background:#0f172a;color:#e2e8f0;font-family:-apple-system,'Segoe UI',sans
 .header{{padding:11px 18px;border-bottom:1px solid #1e293b;display:flex;align-items:center;
          gap:10px;flex-shrink:0}}
 .header h1{{font-size:14px;font-weight:600}}
-.header .date{{font-size:12px;color:#64748b;flex:1}}
+.header .date{{font-size:12px;color:#64748b}}
 select{{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:5px;
         padding:3px 8px;font-size:12px;cursor:pointer;outline:none}}
 select:hover{{border-color:#475569}}
-.body{{display:flex;flex:1;overflow:hidden;min-height:0}}
-.stats{{width:185px;padding:12px 14px;border-right:1px solid #1e293b;overflow-y:auto;flex-shrink:0}}
-.stat{{margin-bottom:11px}}
+#periodSelect{{margin-left:auto}}
+#periodSelect[hidden]{{display:none}}
+
+/* ── tabs ─────────────────────────────────────────────────────────────────── */
+.tabs{{display:flex;gap:2px;margin-left:14px}}
+.tab{{background:none;border:1px solid transparent;border-radius:5px;color:#64748b;
+      font-family:inherit;font-size:11.5px;padding:4px 11px;cursor:pointer;
+      transition:color .15s,background .15s,border-color .15s}}
+.tab:hover{{color:#94a3b8;background:#1e293b}}
+.tab:focus-visible{{outline:2px solid #a78bfa;outline-offset:1px}}
+.tab[aria-selected="true"]{{color:#a78bfa;border-color:#a78bfa;background:#1e1b4b}}
+
+.tab-body{{flex:1;min-height:0;overflow-y:auto}}
+.panel{{display:none}}
+.panel.active{{display:block}}
+
+/* ── KPI strip (was a 185px vertical rail) ────────────────────────────────── */
+.stats{{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;
+        padding:9px 6px;border-bottom:1px solid #1e293b;flex-shrink:0}}
+.stat{{padding:0 14px;border-left:1px solid #1e293b;min-width:0}}
+.stat:first-child{{border-left:none}}
 .label{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:1px}}
-.value{{font-size:18px;font-weight:600}}
+.value{{font-size:17px;font-weight:600}}
 .sub{{font-size:11px;color:#64748b;margin-top:1px}}
 hr.div{{border:none;border-top:1px solid #1e293b;margin:8px 0 10px}}
-.right{{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}}
-.charts{{flex:1;padding:8px 10px 4px;display:grid;
-         grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr 1fr 0.5fr;
-         gap:8px;min-width:0;min-height:0}}
+.charts{{padding:12px 14px;display:grid;
+         grid-template-columns:1fr 1fr;grid-template-rows:repeat(3,170px) 200px;
+         gap:14px 12px;min-width:0}}
 .chart-cell{{display:flex;flex-direction:column;min-height:0}}
 .chart-cell.wide{{grid-column:1 / -1}}
 .chart-label{{font-size:10px;color:#64748b;text-transform:uppercase;
               letter-spacing:.06em;margin-bottom:3px;flex-shrink:0;display:flex;align-items:center;gap:8px}}
 .chart-wrap{{flex:1;min-height:0;position:relative}}
 canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
-.brief-carousel{{border-top:1px solid #1e293b;flex-shrink:0;height:170px;position:relative;overflow:hidden}}
-.brief-track{{display:flex;height:100%;transition:transform .45s cubic-bezier(.4,0,.2,1);will-change:transform}}
-.brief-panel{{min-width:100%;padding:10px 18px 24px;overflow-y:auto;box-sizing:border-box}}
-.brief-panel.tips-panel{{background:#0b1929}}
-.brief-panel.nutr-panel{{background:#071a10}}
-.brief-panel.notes-panel{{background:#0c1322;display:flex;flex-direction:column;gap:6px}}
+/* ── Today: brief on the left, the week's plan on the right ───────────────── */
+.today-grid{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);
+             gap:26px;padding:18px 22px;align-items:start}}
+.today-col{{min-width:0}}
+.today-col hr.div:first-child{{display:none}}
+
+/* ── Nutrition: the old rail widget, given room ───────────────────────────── */
+.nutr-grid{{display:grid;grid-template-columns:minmax(320px,420px) minmax(0,1fr);
+            gap:32px;padding:18px 22px;align-items:start}}
+.nutr-col{{min-width:0}}
+.nutr-grid .nutr-section{{margin-top:0}}
+.nutr-grid hr.div:first-child{{display:none}}
+
+/* ── Notes: was one carousel panel of four ────────────────────────────────── */
+.notes-panel-full{{padding:18px 22px;display:flex;flex-direction:column;gap:8px;max-width:90ch}}
 .notes-hint{{font-size:9px;color:#475569;text-transform:none;letter-spacing:0}}
-.notes-list{{flex:1;min-height:0;overflow-y:auto;font-size:12px;color:#cbd5e1;line-height:1.5}}
+.notes-list{{min-height:0;overflow-y:auto;font-size:12px;color:#cbd5e1;line-height:1.5;
+             max-height:calc(100vh - 300px)}}
 .notes-empty{{color:#475569;font-style:italic;font-size:12px}}
 .note-row{{padding:2px 0;border-bottom:1px solid #16213a}}
 .note-added{{color:#4ade80;font-size:11px;padding:3px 0}}
@@ -1936,9 +1978,6 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .brief-text{{font-size:15px;color:#94a3b8;line-height:1.65}}
 .tips-text{{color:#cbd5e1;font-size:15px;line-height:1.65}}
 .brief-loading{{color:#475569;font-style:italic}}
-.brief-dots{{position:absolute;bottom:6px;right:14px;display:flex;gap:7px;align-items:center}}
-.dot{{width:6px;height:6px;border-radius:50%;background:#1e293b;cursor:pointer;transition:background .2s}}
-.dot.active{{background:#475569}}
 .stat-tooltip{{position:fixed;background:#1e293b;border:1px solid #334155;border-radius:7px;
                padding:8px 11px;font-size:12px;color:#94a3b8;line-height:1.55;pointer-events:none;
                display:none;z-index:999;max-width:280px;
@@ -2012,9 +2051,8 @@ button:hover{{background:#334155;color:#e2e8f0}}
   white-space:nowrap; pointer-events:none; }}
 #stale-warn:hover .stale-tip {{ display:block; }}
 /* ── Performance tracker ─────────────────────────────────────────────────── */
-.tracker-view {{ display:none; flex-direction:column; overflow-y:auto; height:100%;
-  padding:10px 12px; gap:10px; }}
-.tracker-view.active {{ display:flex; }}
+.tracker-view {{ display:flex; flex-direction:column; height:auto;
+  padding:18px 22px; gap:10px; }}
 .tracker-top {{ display:flex; gap:12px; align-items:flex-start; }}
 .tracker-radar-col {{ flex-shrink:0; display:flex; flex-direction:column; align-items:center; gap:4px; }}
 .tracker-header {{ font-size:10px; color:#64748b; font-weight:600; letter-spacing:.05em;
@@ -2034,9 +2072,6 @@ button:hover{{background:#334155;color:#e2e8f0}}
 .mc-journey {{ font-size:9px; color:#475569; display:flex; justify-content:space-between;
   margin-top:3px; }}
 #c-radar {{ display:block; }}
-#tracker-btn {{ font-size:11px; padding:3px 10px; }}
-#tracker-btn.active {{ color:#a78bfa; border-color:#a78bfa; background:#1e1b4b; }}
-.charts.hidden {{ display:none; }}
 .log-form {{ display:flex; flex-wrap:wrap; gap:5px; align-items:center;
   padding:8px 10px; background:#1e293b; border-radius:7px; border:1px solid #334155; }}
 .log-form select, .log-form input {{
@@ -2057,6 +2092,13 @@ button:hover{{background:#334155;color:#e2e8f0}}
 <div class="header">
   <h1>Morning Brief</h1>
   <span class="date">{day_str}</span>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" aria-selected="false" data-panel="today">Today</button>
+    <button class="tab" role="tab" aria-selected="true"  data-panel="trends">Trends</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="nutrition">Nutrition</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="perf">Performance</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="notes">Notes</button>
+  </div>
   <select id="periodSelect" onchange="setPeriod(this.value)">
     <option value="14">14 days</option>
     <option value="30">30 days</option>
@@ -2065,11 +2107,25 @@ button:hover{{background:#334155;color:#e2e8f0}}
     <option value="365">1 year</option>
     <option value="730">2 years</option>
   </select>
-  <button id="tracker-btn" onclick="toggleTracker()">Performance</button>
 </div>
-<div class="body">
-  <div class="stats">{stats_html}</div>
-  <div class="right">
+
+<div class="stats">{kpi_html}</div>
+
+<div class="tab-body">
+
+  <section class="panel" data-panel="today">
+    <div class="today-grid">
+      <div class="today-col">
+        <div class="brief-label">Overview</div>
+        <div class="brief-text" id="brief-overview">{overview_html}</div>
+        <div class="brief-label" style="margin-top:18px">Coach's Tips</div>
+        <div class="tips-text" id="brief-tips">{tips_html}</div>
+      </div>
+      <div class="today-col">{sessions_html}</div>
+    </div>
+  </section>
+
+  <section class="panel active" data-panel="trends">
     <div class="charts">
       <div class="chart-cell">
         <div class="chart-label">Fitness (CTL) · Fatigue (ATL)</div>
@@ -2103,6 +2159,19 @@ button:hover{{background:#334155;color:#e2e8f0}}
         <div class="chart-wrap" id="w-slp"><canvas id="c-slp"></canvas></div>
       </div>
     </div>
+  </section>
+
+  <section class="panel" data-panel="nutrition">
+    <div class="nutr-grid">
+      <div class="nutr-col">{nutr_panel_html}</div>
+      <div class="nutr-col">
+        <div class="brief-label">Nutrition Coach</div>
+        <div class="tips-text" id="brief-nutr"><span class="brief-loading">Generating…</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="perf">
     <div class="tracker-view" id="tracker-view">
       <div class="tracker-top">
         <div class="tracker-radar-col">
@@ -2123,38 +2192,20 @@ button:hover{{background:#334155;color:#e2e8f0}}
           <span id="log-confirm" class="log-added"></span>
       </div>
     </div>
-    <div class="brief-carousel" id="brief-carousel">
-      <div class="brief-track" id="brief-track">
-        <div class="brief-panel">
-          <div class="brief-label">Overview</div>
-          <div class="brief-text" id="brief-overview">{overview_html}</div>
-        </div>
-        <div class="brief-panel tips-panel">
-          <div class="brief-label">Coach's Tips</div>
-          <div class="tips-text" id="brief-tips">{tips_html}</div>
-        </div>
-        <div class="brief-panel nutr-panel">
-          <div class="brief-label">Nutrition</div>
-          <div class="tips-text" id="brief-nutr"><span class="brief-loading">Generating…</span></div>
-        </div>
-        <div class="brief-panel notes-panel">
-          <div class="brief-label">Notes <span class="notes-hint">— context for the coach · persists until cleared</span></div>
-          <div class="notes-list" id="notes-list">{notes_html}</div>
-          <div class="notes-input">
-            <textarea id="note-box" rows="2" placeholder="Add context, how you feel, or an upcoming session… (Ctrl+Enter to add)"></textarea>
-            <button onclick="submitNote()">Add</button>
-            <button class="notes-clear" onclick="clearNotes()">Clear all</button>
-          </div>
-        </div>
-      </div>
-      <div class="brief-dots">
-        <span class="dot active" onclick="briefGoTo(0)"></span>
-        <span class="dot" onclick="briefGoTo(1)"></span>
-        <span class="dot" onclick="briefGoTo(2)"></span>
-        <span class="dot" onclick="briefGoTo(3)"></span>
+  </section>
+
+  <section class="panel" data-panel="notes">
+    <div class="notes-panel-full">
+      <div class="brief-label">Notes <span class="notes-hint">— context for the coach · persists until cleared</span></div>
+      <div class="notes-list" id="notes-list">{notes_html}</div>
+      <div class="notes-input">
+        <textarea id="note-box" rows="2" placeholder="Add context, how you feel, or an upcoming session… (Ctrl+Enter to add)"></textarea>
+        <button onclick="submitNote()">Add</button>
+        <button class="notes-clear" onclick="clearNotes()">Clear all</button>
       </div>
     </div>
-  </div>
+  </section>
+
 </div>
 <div class="footer">
   <button id="refresh-btn" onclick="triggerRefresh()" style="margin-right:8px">Refresh</button>
@@ -2887,50 +2938,43 @@ function setIllnessData(todayP, yesterdayP, bands, spark7d) {{
   drawIllnessSpark();
 }}
 
-// ── Brief carousel ────────────────────────────────────────────────────────────
-(function() {{
-  var cur = 0, total = 4, hovered = false, timer = null;
-  var track = document.getElementById('brief-track');
-  var carousel = document.getElementById('brief-carousel');
-  var dots = document.querySelectorAll('.dot');
-  var swipeX = 0;
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+var trackerRendered = false;
 
-  // Pause auto-advance and submit-on-Ctrl+Enter while typing a note
+function selectTab(name) {{
+  document.querySelectorAll('.tab').forEach(function(t) {{
+    t.setAttribute('aria-selected', String(t.dataset.panel === name));
+  }});
+  document.querySelectorAll('.panel').forEach(function(p) {{
+    p.classList.toggle('active', p.dataset.panel === name);
+  }});
+
+  var period = document.getElementById('periodSelect');
+  if (period) period.hidden = (name !== 'trends');
+
+  // A canvas inside a hidden panel has zero client size, so charts must be
+  // (re)drawn when their panel becomes visible, not merely on load.
+  if (name === 'trends') {{
+    requestAnimationFrame(drawAll);
+  }} else if (name === 'perf') {{
+    requestAnimationFrame(function() {{
+      if (!trackerRendered) {{ renderTracker(); trackerRendered = true; }}
+      else {{ drawRadar(); }}
+    }});
+  }}
+}}
+
+(function() {{
+  document.querySelectorAll('.tab').forEach(function(t) {{
+    t.addEventListener('click', function() {{ selectTab(t.dataset.panel); }});
+  }});
+
   var noteBox = document.getElementById('note-box');
   if (noteBox) {{
-    noteBox.addEventListener('focus', function() {{ hovered = true; }});
-    noteBox.addEventListener('blur',  function() {{ hovered = false; }});
     noteBox.addEventListener('keydown', function(e) {{
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ e.preventDefault(); submitNote(); }}
     }});
   }}
-
-  function goTo(n) {{
-    cur = ((n % total) + total) % total;
-    track.style.transform = 'translateX(-' + (cur * 100) + '%)';
-    dots.forEach(function(d, i) {{ d.classList.toggle('active', i === cur); }});
-  }}
-  window.briefGoTo = goTo;
-
-  function next() {{ if (!hovered) goTo(cur + 1); }}
-  timer = setInterval(next, 9000);
-
-  carousel.addEventListener('mouseenter', function() {{ hovered = true; }});
-  carousel.addEventListener('mouseleave', function() {{ hovered = false; }});
-
-  // Drag / swipe — but never hijack interaction with the notes input
-  function inNotesInput(e) {{ return e.target.closest && e.target.closest('.notes-input'); }}
-  track.addEventListener('mousedown', function(e) {{
-    if (inNotesInput(e)) {{ swipeX = null; return; }}
-    swipeX = e.clientX; track.style.cursor = 'grabbing';
-  }});
-  track.addEventListener('mouseup', function(e) {{
-    track.style.cursor = 'grab';
-    if (swipeX === null || inNotesInput(e)) return;
-    var dx = e.clientX - swipeX;
-    if (Math.abs(dx) > 40) goTo(dx < 0 ? cur + 1 : cur - 1);
-  }});
-  track.style.cursor = 'grab';
 }})();
 
 // Stat hover tooltips
@@ -3002,29 +3046,6 @@ function submitMetric() {{
 }}
 
 // ── Performance tracker ───────────────────────────────────────────────────────
-var trackerVisible = false;
-
-function toggleTracker() {{
-  trackerVisible = !trackerVisible;
-  var charts  = document.querySelector('.charts');
-  var tracker = document.getElementById('tracker-view');
-  var btn     = document.getElementById('tracker-btn');
-  var period  = document.getElementById('periodSelect');
-  if (trackerVisible) {{
-    if (charts)  charts.classList.add('hidden');
-    if (tracker) tracker.classList.add('active');
-    if (btn)     btn.classList.add('active');
-    if (period)  period.style.display = 'none';
-    renderTracker();
-  }} else {{
-    if (charts)  charts.classList.remove('hidden');
-    if (tracker) tracker.classList.remove('active');
-    if (btn)     btn.classList.remove('active');
-    if (period)  period.style.display = '';
-    drawAll();
-  }}
-}}
-
 function renderTracker() {{
   drawRadar();
   renderMetricCards();
