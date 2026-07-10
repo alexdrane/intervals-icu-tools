@@ -120,6 +120,24 @@ def load_test_metrics():
 
 
 DEFAULT_REP_REF = 8   # working-set rep scheme that targets/baselines are quoted at
+TIME_UNIT = "s"       # metrics in this unit are entered and displayed as m:ss
+
+
+def parse_value(v):
+    """Accept a number, or a clock string like "17:30" / "1:52.0", returning seconds.
+
+    Times are the natural way to type a 5k or a 500m split; forcing the athlete to
+    convert to seconds is how you get a 20:04 PB logged as 2004.
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if ":" in s:
+        mins, _, secs = s.partition(":")
+        return float(int(mins) * 60 + float(secs))
+    return float(s)
 
 
 def epley_1rm(weight, reps):
@@ -225,13 +243,21 @@ def mutate_metric_config(action, key, fields=None):
             raise ValueError(f"metric '{key}' already exists")
         if action == "update" and key not in metrics:
             raise KeyError(f"unknown metric '{key}'")
-        meta = metrics.setdefault(key, {"color": "#a78bfa", "unit": "", "target": 0, "tier": DEFAULT_TIER})
-        for f in ("label", "unit", "color", "tier", "notes"):
+        meta = metrics.setdefault(key, {"color": "#a78bfa", "unit": "", "tier": DEFAULT_TIER})
+        for f in ("label", "unit", "color", "tier", "notes", "lifetime_date"):
             if f in fields:
                 meta[f] = fields[f]
-        for f in ("target", "baseline", "rep_ref"):
-            if f in fields and fields[f] is not None and fields[f] != "":
-                meta[f] = float(fields[f]) if f != "rep_ref" else int(fields[f])
+        # Blank clears the field rather than writing 0 — a target of zero is a real
+        # value for a lower-is-better metric, so it cannot double as "unset".
+        for f in ("target", "baseline", "lifetime"):
+            if f in fields:
+                val = parse_value(fields[f])
+                if val is None:
+                    meta.pop(f, None)
+                else:
+                    meta[f] = val
+        if "rep_ref" in fields and fields["rep_ref"] not in (None, ""):
+            meta["rep_ref"] = int(fields["rep_ref"])
         for f in ("lower_is_better", "rep_weighted"):
             if f in fields:
                 meta[f] = bool(fields[f])
@@ -270,17 +296,24 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
     for key, meta in metric_targets.items():
         history = weight_history if (key == "bodyweight" and weight_history) else metric_history(entries, key)
         tier    = meta.get("tier", DEFAULT_TIER)
+        lower   = meta.get("lower_is_better", False)
+        unit    = meta.get("unit", "")
         if not history:
             # Still emit a card: a metric added from the UI has no results yet, and
             # without a card there is nowhere to edit it or log its first entry.
+            # A lifetime PB may exist with no logged result at all — an old best from
+            # before you started tracking is not a baseline for the current journey.
             result.append({
                 "key": key, "label": meta.get("label", key), "tier": tier,
                 "has_data": False, "value": None, "scored": None, "e1rm": None,
                 "rep_ref": None, "reps": None,
                 "start": meta.get("baseline"), "target": meta.get("target"),
-                "unit": meta.get("unit", ""), "color": meta.get("color", "#a78bfa"),
-                "journey_pct": 0, "date": None, "notes": "",
-                "lower": meta.get("lower_is_better", False),
+                "pb": meta.get("lifetime"), "pb_date": meta.get("lifetime_date"),
+                "pb_source": "lifetime" if meta.get("lifetime") is not None else None,
+                "unit": unit, "is_time": unit == TIME_UNIT,
+                "color": meta.get("color", "#a78bfa"),
+                "journey_pct": None, "date": None, "notes": "",
+                "lower": lower,
                 "rep_weighted": bool(meta.get("rep_weighted")),
                 "spark": [], "history": [],
             })
@@ -289,8 +322,7 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
         first   = history[0]
         raw     = latest["value"]
         reps    = latest.get("reps")
-        tgt     = meta["target"]
-        lower   = meta.get("lower_is_better", False)
+        tgt     = meta.get("target")
         # An explicit "baseline" overrides the first logged value — useful
         # when history predates a target change (e.g. bulk goal reset).
         start   = meta.get("baseline", first["value"])
@@ -304,11 +336,34 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
         score    = rep_normalised(raw, reps, rep_ref) if weighted else raw
         e1rm     = epley_1rm(raw, reps) if (weighted and reps) else None
 
-        # Progress bar: fraction of journey from baseline to target completed
-        gap = (start - tgt) if lower else (tgt - start)
-        moved = (start - score) if lower else (score - start)
-        journey_pct = (moved / gap * 100) if gap else 100
-        journey_pct = max(0, min(100, journey_pct))
+        # Progress bar: fraction of journey from baseline to target completed.
+        # A metric may have no target yet (a PB you are simply recording), in which
+        # case there is no journey to show rather than a meaningless 0% or 100%.
+        if tgt is None:
+            journey_pct = None
+        else:
+            gap = (start - tgt) if lower else (tgt - start)
+            moved = (start - score) if lower else (score - start)
+            journey_pct = (moved / gap * 100) if gap else 100
+            journey_pct = max(0, min(100, journey_pct))
+
+        def _scored(e):
+            return (rep_normalised(e["value"], e.get("reps"), rep_ref)
+                    if weighted else e["value"])
+
+        # Lifetime PB: the best ever, which is NOT the baseline. An old best from
+        # before the current block should not anchor the progress bar, but it is
+        # still the number worth beating. Scored, not raw: for a rep-weighted lift
+        # the best set is not simply the heaviest bar.
+        pick        = min if lower else max
+        best_entry  = pick(history, key=_scored)
+        best_logged = _scored(best_entry)
+        best_date   = best_entry["date"]
+        stated      = meta.get("lifetime")
+        if stated is not None and ((stated < best_logged) if lower else (stated > best_logged)):
+            pb, pb_date, pb_source = stated, meta.get("lifetime_date"), "lifetime"
+        else:
+            pb, pb_date, pb_source = best_logged, best_date, "logged"
 
         # Subtitle: reps, then the normalised load the progress bar actually scores,
         # so the percentage is not left unexplained against the bar weight.
@@ -323,10 +378,6 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
         subtitle = " · ".join(bits)
 
         # Sparkline follows whatever is being scored, or it would contradict the bar.
-        def _scored(e):
-            return (rep_normalised(e["value"], e.get("reps"), rep_ref)
-                    if weighted else e["value"])
-
         full = [{"date": e["date"], "value": _scored(e), "raw": e["value"],
                  "reps": e.get("reps")} for e in history]
         result.append({
@@ -342,9 +393,13 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
             "reps":         reps,
             "start":        start,
             "target":       tgt,
-            "unit":         meta["unit"],
+            "pb":           pb,
+            "pb_date":      pb_date,
+            "pb_source":    pb_source,
+            "unit":         unit,
+            "is_time":      unit == TIME_UNIT,
             "color":        meta["color"],
-            "journey_pct":  round(journey_pct, 1),
+            "journey_pct":  None if journey_pct is None else round(journey_pct, 1),
             "date":         latest["date"],
             "notes":        subtitle,
             "lower":        lower,
@@ -1397,18 +1452,25 @@ def _benchmark_lines(wellness):
         out.append("")
         out.append(f"{heading}:")
         for m in rows:
+            pb = ""
+            if m.get("pb") is not None:
+                pb = f" · lifetime PB {fmt(m, m['pb'])}"
+                if m.get("pb_date"):
+                    pb += f" ({m['pb_date']})"
             if not m["has_data"]:
-                out.append(f"  {m['label']}: no result logged yet "
-                           f"(target {fmt(m, m['target'])})")
+                tgt = f"target {fmt(m, m['target'])}" if m["target"] is not None else "no target set"
+                out.append(f"  {m['label']}: no result logged yet ({tgt}){pb}")
                 continue
             scored = ""
             if m.get("rep_weighted") and m.get("reps"):
                 scored = (f", set {m['value']:g}{m['unit']}×{m['reps']} "
                           f"= {m['scored']:g}{m['unit']} at {m['rep_ref']} reps")
-            out.append(
-                f"  {m['label']}: {fmt(m, m['value'])} on {m['date']}{scored} · "
-                f"baseline {fmt(m, m['start'])} → target {fmt(m, m['target'])} "
-                f"({m['journey_pct']:.0f}% of the way)")
+            if m["target"] is None:
+                journey = " · no target set"
+            else:
+                journey = (f" · baseline {fmt(m, m['start'])} → target {fmt(m, m['target'])} "
+                           f"({m['journey_pct']:.0f}% of the way)")
+            out.append(f"  {m['label']}: {fmt(m, m['value'])} on {m['date']}{scored}{journey}{pb}")
     return out
 
 
@@ -2348,6 +2410,11 @@ button:hover{{background:#334155;color:#e2e8f0}}
 .mc-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:6px; }}
 .mc-actions {{ display:flex; align-items:center; gap:3px; flex-shrink:0; }}
 .mc-none {{ font-size:10.5px; color:#475569; font-style:italic; margin:6px 0; }}
+.mc-pb {{ display:flex; align-items:baseline; gap:6px; margin-top:5px; font-size:10px; }}
+.pb-tag {{ color:#22d3ee; text-transform:uppercase; letter-spacing:.05em; font-size:8.5px;
+  border:1px solid #155e6b; background:#0b2b33; border-radius:3px; padding:1px 4px; }}
+.pb-val {{ color:#67e8f9; font-weight:600; font-variant-numeric:tabular-nums; }}
+.pb-date {{ color:#475569; margin-left:auto; font-variant-numeric:tabular-nums; }}
 .metric-card.stored {{ opacity:.62; }}
 .metric-card.stored:hover {{ opacity:1; }}
 .metric-card.empty {{ border-style:dashed; }}
@@ -3532,9 +3599,22 @@ function triggerRefresh() {{
   document.title = '__refresh__';
 }}
 
+/** "17:30" -> 1050. Plain numbers pass through. */
+function parseClock(raw) {{
+  var s = String(raw).trim();
+  if (s.indexOf(':') < 0) return parseFloat(s);
+  var p = s.split(':');
+  var mins = parseInt(p[0], 10), secs = parseFloat(p[1]);
+  if (isNaN(mins) || isNaN(secs)) return NaN;
+  return mins * 60 + secs;
+}}
+
 function submitMetric() {{
   var metric = document.getElementById('log-metric').value;
-  var value  = parseFloat(document.getElementById('log-value').value);
+  var raw    = document.getElementById('log-value').value;
+  var m      = metricByKey(metric);
+  // A 5k typed as "20:04" must not be logged as 2004 seconds.
+  var value  = (m && m.is_time) ? parseClock(raw) : parseFloat(raw);
   var reps   = parseInt(document.getElementById('log-reps').value) || null;
   var notes  = document.getElementById('log-notes').value.trim();
   if (!metric || isNaN(value)) {{ return; }}
@@ -3580,6 +3660,40 @@ function metricByKey(key) {{
   return (DATA.metrics || []).filter(function(m) {{ return m.key === key; }})[0];
 }}
 
+// Units the athlete can pick from. "s" renders and accepts m:ss, which is how a 5k
+// time or a 500m split is actually written down.
+var UNIT_PRESETS = [
+  ['kg', 'kg — weight'],
+  ['lb', 'lb — weight'],
+  ['W',  'W — power'],
+  ['s',  'time / split (m:ss)'],
+  ['m',  'm — distance'],
+  ['km', 'km — distance'],
+  ['bpm','bpm — heart rate'],
+  ['%',  '% — percent'],
+  ['',   '(none)']
+];
+
+function unitSelect(id, current) {{
+  var known = UNIT_PRESETS.some(function(u) {{ return u[0] === current; }});
+  var opts = UNIT_PRESETS.map(function(u) {{
+    return '<option value="' + escAttr(u[0]) + '"' + (u[0] === current ? ' selected' : '') +
+           '>' + u[1] + '</option>';
+  }}).join('');
+  if (!known && current) {{
+    opts += '<option value="' + escAttr(current) + '" selected>' + escAttr(current) + ' — custom</option>';
+  }}
+  return '<label>Unit<select id="' + id + '">' + opts + '</select></label>';
+}}
+
+/** Values in a time unit are typed as m:ss; everything else is a plain number. */
+function valInput(id, value, isTime) {{
+  var shown = (value == null || value === '') ? ''
+            : (isTime ? formatTime(value, 's') : value);
+  return '<input id="' + id + '" type="text" inputmode="' + (isTime ? 'text' : 'decimal') +
+         '" placeholder="' + (isTime ? 'm:ss' : 'number') + '" value="' + escAttr(shown) + '">';
+}}
+
 /** Inline editor, rendered into the card so the value stays next to the field. */
 function openMetricEdit(key) {{
   var m = metricByKey(key);
@@ -3587,12 +3701,16 @@ function openMetricEdit(key) {{
   var host = document.getElementById('edit-' + key);
   if (!host) return;
   if (host.style.display === 'block') {{ host.style.display = 'none'; return; }}
+  var t = m.is_time;
   host.style.display = 'block';
   host.innerHTML =
     '<label>Label<input id="ed-label-' + key + '" type="text" value="' + escAttr(m.label) + '"></label>' +
-    '<label>Baseline<input id="ed-base-' + key + '" type="number" step="any" value="' + escAttr(m.start) + '"></label>' +
-    '<label>Target<input id="ed-tgt-' + key + '" type="number" step="any" value="' + escAttr(m.target) + '"></label>' +
-    '<label>Unit<input id="ed-unit-' + key + '" type="text" value="' + escAttr(m.unit) + '"></label>' +
+    '<label>Baseline' + valInput('ed-base-' + key, m.start, t) + '</label>' +
+    '<label>Target' + valInput('ed-tgt-' + key, m.target, t) + '</label>' +
+    '<label>Lifetime PB' + valInput('ed-pb-' + key, m.pb_source === 'lifetime' ? m.pb : null, t) + '</label>' +
+    '<label>PB date<input id="ed-pbd-' + key + '" type="text" placeholder="YYYY-MM-DD" value="' +
+      escAttr(m.pb_source === 'lifetime' ? (m.pb_date || '') : '') + '"></label>' +
+    unitSelect('ed-unit-' + key, m.unit) +
     (m.rep_weighted
       ? '<label>Ref reps<input id="ed-ref-' + key + '" type="number" step="1" value="' + escAttr(m.rep_ref || 8) + '"></label>'
       : '') +
@@ -3612,9 +3730,11 @@ function saveMetricEdit(key) {{
   var refEl = g('ed-ref-');
   metricCfg('update', key, {{
     label:           g('ed-label-').value.trim(),
-    baseline:        g('ed-base-').value,
-    target:          g('ed-tgt-').value,
-    unit:            g('ed-unit-').value.trim(),
+    baseline:        g('ed-base-').value.trim(),
+    target:          g('ed-tgt-').value.trim(),
+    lifetime:        g('ed-pb-').value.trim(),
+    lifetime_date:   g('ed-pbd-').value.trim(),
+    unit:            g('ed-unit-').value,
     rep_ref:         refEl ? refEl.value : null,
     rep_weighted:    g('ed-rw-').checked,
     lower_is_better: g('ed-lb-').checked
@@ -3630,16 +3750,38 @@ function removeMetric(key) {{
   if (window.confirm(warn)) metricCfg('remove', key);
 }}
 
+function slugify(s) {{
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}}
+
+/** A time unit implies lower-is-better and m:ss entry. */
+function addUnitChanged() {{
+  var isTime = document.getElementById('am-unit').value === 's';
+  ['am-base', 'am-tgt', 'am-pb'].forEach(function(id) {{
+    var el = document.getElementById(id);
+    if (el) el.placeholder = isTime ? 'm:ss' : 'number';
+  }});
+  if (isTime) document.getElementById('am-lb').checked = true;
+}}
+
+function syncAddKey() {{
+  var keyEl = document.getElementById('am-key');
+  if (keyEl && !keyEl.dataset.touched) {{
+    keyEl.value = slugify(document.getElementById('am-label').value);
+  }}
+}}
+
 function openAddMetric() {{
   var host = document.getElementById('add-metric-form');
   if (host.style.display === 'block') {{ host.style.display = 'none'; return; }}
   host.style.display = 'block';
   host.innerHTML =
-    '<label>Key<input id="am-key" type="text" placeholder="run_5k"></label>' +
-    '<label>Label<input id="am-label" type="text" placeholder="5k run"></label>' +
-    '<label>Unit<input id="am-unit" type="text" placeholder="s"></label>' +
-    '<label>Baseline<input id="am-base" type="number" step="any"></label>' +
-    '<label>Target<input id="am-tgt" type="number" step="any"></label>' +
+    '<label>Name<input id="am-label" type="text" placeholder="5k run" oninput="syncAddKey()"></label>' +
+    unitSelect('am-unit', '') +
+    '<label>Baseline<input id="am-base" type="text" placeholder="number"></label>' +
+    '<label>Target<input id="am-tgt" type="text" placeholder="number"></label>' +
+    '<label>Lifetime PB<input id="am-pb" type="text" placeholder="number"></label>' +
+    '<label>PB date<input id="am-pbd" type="text" placeholder="YYYY-MM-DD"></label>' +
     '<label>Tier<select id="am-tier">' +
       '<option value="bank" selected>Stored</option>' +
       '<option value="key">Key metric</option>' +
@@ -3647,23 +3789,30 @@ function openAddMetric() {{
     '</select></label>' +
     '<label class="chk"><input id="am-lb" type="checkbox"> lower is better</label>' +
     '<label class="chk"><input id="am-rw" type="checkbox"> rep-weighted</label>' +
+    '<label>Key<input id="am-key" type="text" placeholder="auto from name" ' +
+      'onchange="this.dataset.touched=1"></label>' +
     '<div class="metric-form-actions">' +
       '<button class="log-btn" onclick="submitAddMetric()">Add</button>' +
       '<button onclick="openAddMetric()">Cancel</button>' +
     '</div>';
+  document.getElementById('am-unit').addEventListener('change', addUnitChanged);
 }}
 
 function submitAddMetric() {{
-  var key = document.getElementById('am-key').value.trim();
+  var label = document.getElementById('am-label').value.trim();
+  var key   = document.getElementById('am-key').value.trim() || slugify(label);
+  if (!label) {{ metricError('Give the metric a name.'); return; }}
   if (!/^[a-z0-9_]+$/.test(key)) {{
     metricError('Key must be lowercase letters, digits and underscores (e.g. run_5k).');
     return;
   }}
   metricCfg('add', key, {{
-    label:           document.getElementById('am-label').value.trim() || key,
-    unit:            document.getElementById('am-unit').value.trim(),
-    baseline:        document.getElementById('am-base').value,
-    target:          document.getElementById('am-tgt').value,
+    label:           label,
+    unit:            document.getElementById('am-unit').value,
+    baseline:        document.getElementById('am-base').value.trim(),
+    target:          document.getElementById('am-tgt').value.trim(),
+    lifetime:        document.getElementById('am-pb').value.trim(),
+    lifetime_date:   document.getElementById('am-pbd').value.trim(),
     tier:            document.getElementById('am-tier').value,
     lower_is_better: document.getElementById('am-lb').checked,
     rep_weighted:    document.getElementById('am-rw').checked
@@ -3713,8 +3862,9 @@ function drawGoalChart(m) {{
 
   var PAD = {{top:10, right:12, bottom:20, left:44}};
   var vals = hist.map(function(e) {{ return e.value; }});
-  var lo = Math.min.apply(null, vals.concat([m.target, m.start]));
-  var hi = Math.max.apply(null, vals.concat([m.target, m.start]));
+  var refs = [m.target, m.start, m.pb].filter(function(v) {{ return v != null; }});
+  var lo = Math.min.apply(null, vals.concat(refs));
+  var hi = Math.max.apply(null, vals.concat(refs));
   var padv = (hi - lo) * 0.12 || 1;
   lo -= padv; hi += padv;
 
@@ -3735,7 +3885,9 @@ function drawGoalChart(m) {{
     ctx.fillText(m.lower ? formatTime(v, m.unit) : v.toFixed(0), PAD.left - 6, y);
   }}
 
-  [[m.start, '#475569', 'baseline'], [m.target, '#4ade80', 'target']].forEach(function(t) {{
+  [[m.start, '#475569', 'baseline'],
+   [m.pb_source === 'lifetime' ? m.pb : null, '#22d3ee', 'lifetime PB'],
+   [m.target, '#4ade80', 'target']].forEach(function(t) {{
     if (t[0] == null || t[0] < lo || t[0] > hi) return;
     var y = Math.round(yOf(t[0])) + 0.5;
     ctx.strokeStyle = t[1]; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
@@ -3878,33 +4030,51 @@ function drawRadar() {{
   }}
 }}
 
+function fmtVal(m, v) {{ return v == null ? '—' : formatTime(v, m.unit); }}
+
+function pbRow(m) {{
+  if (m.pb == null) return '';
+  var tag = m.pb_source === 'lifetime' ? 'lifetime PB' : 'PB';
+  return '<div class="mc-pb"><span class="pb-tag">' + tag + '</span>' +
+         '<span class="pb-val">' + fmtVal(m, m.pb) + '</span>' +
+         (m.pb_date ? '<span class="pb-date">' + m.pb_date + '</span>' : '') + '</div>';
+}}
+
 function metricCard(m) {{
-  var jpct     = Math.max(0, Math.min(100, m.journey_pct));
-  var color    = m.color || '#a78bfa';
-  var jpctCol  = jpct >= 66 ? '#4ade80' : jpct >= 33 ? '#fbbf24' : '#f87171';
-  var fmt      = function(v) {{ return m.lower ? formatTime(v, m.unit) : (v + m.unit); }};
+  var color = m.color || '#a78bfa';
 
   if (!m.has_data) {{
     return '<div class="metric-card empty">' +
       '<div class="mc-head"><div class="mc-label">' + m.label + '</div>' +
         '<div class="mc-actions">' + tierButtons(m) + editButton(m) + '</div></div>' +
-      '<div class="mc-none">No results logged yet</div>' +
-      '<div class="mc-journey"><span>' + (m.start == null ? '—' : fmt(m.start)) +
-        '</span><span>→ ' + (m.target == null ? '—' : fmt(m.target)) + '</span></div>' +
+      pbRow(m) +
+      '<div class="mc-none">No result logged yet — the first will set the baseline</div>' +
+      '<div class="mc-journey"><span>' + fmtVal(m, m.start) +
+        '</span><span>→ ' + fmtVal(m, m.target) + '</span></div>' +
       '<div class="metric-form" id="edit-' + m.key + '" style="display:none"></div>' +
       '</div>';
   }}
 
+  var hasJourney = m.journey_pct != null;
+  var jpct    = hasJourney ? Math.max(0, Math.min(100, m.journey_pct)) : 0;
+  var jpctCol = jpct >= 66 ? '#4ade80' : jpct >= 33 ? '#fbbf24' : '#f87171';
   var repsStr = (m.reps && !m.lower) ? (' <span style="font-size:11px;color:#475569">×' + m.reps + '</span>') : '';
+  var pctStr  = hasJourney
+    ? ' <span style="font-size:10px;color:' + jpctCol + '">' + Math.round(jpct) + '%</span>'
+    : ' <span style="font-size:10px;color:#475569">no target</span>';
+
   return '<div class="metric-card' + (m.tier === 'bank' ? ' stored' : '') + '">' +
     '<div class="mc-head"><div class="mc-label">' + m.label + '</div>' +
       '<div class="mc-actions">' + tierButtons(m) + editButton(m) + '</div></div>' +
-    '<div><span class="mc-val" style="color:' + color + '">' + fmt(m.value) + '</span>' +
-    repsStr + ' <span style="font-size:10px;color:' + jpctCol + '">' + Math.round(jpct) + '%</span></div>' +
-    '<div class="mc-bar-wrap">' +
-      '<div class="mc-bar-fill" style="width:' + jpct + '%;background:' + color + '"></div>' +
-    '</div>' +
-    '<div class="mc-journey"><span>' + fmt(m.start) + '</span><span>→ ' + fmt(m.target) + '</span></div>' +
+    '<div><span class="mc-val" style="color:' + color + '">' + fmtVal(m, m.value) + '</span>' +
+    repsStr + pctStr + '</div>' +
+    (hasJourney
+      ? '<div class="mc-bar-wrap"><div class="mc-bar-fill" style="width:' + jpct +
+        '%;background:' + color + '"></div></div>' +
+        '<div class="mc-journey"><span>' + fmtVal(m, m.start) + '</span><span>→ ' +
+        fmtVal(m, m.target) + '</span></div>'
+      : '') +
+    pbRow(m) +
     (m.notes ? '<div class="mc-notes">' + m.notes + '</div>' : '') +
     '<div class="mc-date">Tested ' + m.date + '</div>' +
     renderSparkSVG(m.spark, m.lower, color) +
