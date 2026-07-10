@@ -963,18 +963,30 @@ def get_nutrition_insight():
 
 
 def get_calorie_gap_suggestion(food_data, ctx):
-    """If today is meaningfully short of its calorie target, returns a one-line
-    meal suggestion (haiku model, cached per day/consumed-total) sized to close
-    the remaining kcal/protein/carbs/fat gap. Returns None if on/ahead of target.
-    Cheap and cached — safe to call on every render, no per-hover network call."""
-    consumed = (food_data or {}).get("calories", 0)
-    gap_kcal = ctx["kcal_total"] - consumed
+    """A one-line meal suggestion sized to bring today back onto the eating pace.
+
+    The gap is measured against the *pace marker* — what you should have eaten by
+    now — not the end-of-day total. Sizing a snack to the whole remaining day tells
+    you to eat 2,000 kcal at breakfast, which is not advice.
+
+    Returns None when at or ahead of pace. Cheap and cached per day/consumed/gap,
+    so it is safe to call on every render.
+    """
+    consumed  = (food_data or {}).get("calories", 0)
+    pace_kcal = ctx["expected_so_far"]
+    gap_kcal  = pace_kcal - consumed
     if gap_kcal <= 50:
         return None
 
-    remaining_p = max(round(ctx["protein_target_g"] - (food_data or {}).get("protein_g", 0)), 0)
-    remaining_c = max(round(ctx["carbs_target_g"]   - (food_data or {}).get("carbs_g",   0)), 0)
-    remaining_f = max(round(ctx["fat_target_g"]     - (food_data or {}).get("fat_g",     0)), 0)
+    # Macro shortfalls are pro-rated to the same point in the day as the kcal gap;
+    # comparing intake-so-far against a full-day macro target overstates every one.
+    frac = ctx["day_frac"] or 1.0
+    def short(target_key, eaten_key):
+        return max(round(ctx[target_key] * frac - (food_data or {}).get(eaten_key, 0)), 0)
+
+    remaining_p = short("protein_target_g", "protein_g")
+    remaining_c = short("carbs_target_g",   "carbs_g")
+    remaining_f = short("fat_target_g",     "fat_g")
 
     today_str   = datetime.now().strftime("%Y-%m-%d")
     input_hash  = _data_hash(f"{today_str}|{round(consumed)}|{round(gap_kcal)}")
@@ -984,11 +996,13 @@ def get_calorie_gap_suggestion(food_data, ctx):
 
     prompt = (
         "You are a sports nutritionist advising a solo rower on a lean bulk "
-        "(~2g protein/kg, ~300 kcal/day surplus target). It is late in the day and they "
-        f"are short of today's targets by {round(gap_kcal)} kcal "
-        f"({remaining_p}g protein, {remaining_c}g carbs, {remaining_f}g fat still remaining).\n\n"
-        "Suggest ONE realistic meal or snack, with rough quantities, that would close this gap. "
-        "One sentence, no markdown, no greetings."
+        "(~2g protein/kg, ~300 kcal/day surplus target). They are behind their eating "
+        f"pace for the time of day by {round(gap_kcal)} kcal "
+        f"({remaining_p}g protein, {remaining_c}g carbs, {remaining_f}g fat behind pace). "
+        f"Their full-day target is {round(ctx['kcal_total'])} kcal and they have eaten "
+        f"{round(consumed)} kcal so far.\n\n"
+        "Suggest ONE realistic meal or snack, with rough quantities, sized to close the "
+        "gap to pace — not the whole remaining day. One sentence, no markdown, no greetings."
     )
     try:
         suggestion = _claude_p(prompt, timeout=90)
@@ -2132,6 +2146,9 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         "illness7dDates": illness_7d_dates, "illness7dVals": illness_7d_vals,
         "illnessAllDates": illness_all_dates, "illnessAllVals": illness_all_vals,
         "illnessRhr": illness_rhr, "illnessMeta": illness_meta,
+        # Gap to the pace marker, not to the end-of-day total.
+        "calGapKcal": round(nutr_ctx["expected_so_far"] - (food_data or {}).get("calories", 0)),
+        "calPaceKcal": round(nutr_ctx["expected_so_far"]),
         "metrics": build_metrics_data(load_test_metrics().get("entries", []), benchmark_cfg["metrics"],
                                        weight_history=[{"date": d, "value": v} for d, v in zip(weight_dates, weight_vals)]),
     })
@@ -2212,6 +2229,14 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .nutr-grid hr.div:first-child{{display:none}}
 /* Prose set across a 1400px window is unreadable — hold it to a sane measure. */
 .nutr-grid .tips-text{{max-width:70ch;font-size:14px;line-height:1.7}}
+
+/* ── Catch-up-to-pace suggestion ──────────────────────────────────────────── */
+.gap-card{{background:#1c1008;border:1px solid #78350f;border-radius:9px;
+           padding:12px 14px;margin-bottom:18px;max-width:70ch}}
+.gap-head{{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:6px}}
+.gap-head .brief-label{{color:#fbbf24}}
+.gap-amount{{font-size:15px;font-weight:700;color:#fbbf24;font-variant-numeric:tabular-nums}}
+.gap-text{{font-size:13.5px;line-height:1.65;color:#fcd34d}}
 
 /* ── Cards: give panel content edges so it does not float in dead space ───── */
 .card{{background:#131c2f;border:1px solid #1e293b;border-radius:9px;padding:14px 16px}}
@@ -2521,6 +2546,14 @@ button:hover{{background:#334155;color:#e2e8f0}}
     <div class="nutr-grid">
       <div class="nutr-col">{nutr_panel_html}</div>
       <div class="nutr-col">
+        <div class="gap-card" id="cal-gap-card" style="display:none">
+          <div class="gap-head">
+            <span class="brief-label" style="margin:0">Catch up to pace</span>
+            <span class="gap-amount" id="cal-gap-amount"></span>
+          </div>
+          <div class="gap-text" id="cal-gap-text"><span class="brief-loading">Sizing a snack…</span></div>
+        </div>
+
         <div class="brief-label">Nutrition Coach</div>
         <div class="tips-text" id="brief-nutr"><span class="brief-loading">Generating…</span></div>
       </div>
@@ -3573,6 +3606,22 @@ function showStaleWarning() {{
   if (el) el.style.display = 'block';
 }}
 
+/** Behind the pace marker? Show what to eat to catch up. Hidden when on pace. */
+function renderCalGap() {{
+  var card = document.getElementById('cal-gap-card');
+  if (!card) return;
+  var gap = DATA.calGapKcal;
+  if (!(gap > 50)) {{ card.style.display = 'none'; return; }}
+  card.style.display = 'block';
+  document.getElementById('cal-gap-amount').textContent =
+    Math.round(gap).toLocaleString() + ' kcal behind pace';
+  var txt = document.getElementById('cal-gap-text');
+  txt.innerHTML = DATA.calGapSuggestion
+    ? DATA.calGapSuggestion
+    : '<span class="brief-loading">Sizing a snack…</span>';
+}}
+window.addEventListener('load', renderCalGap);
+
 function toggleNutrExtras() {{
   var extras = document.querySelectorAll('.nutr-extra');
   var btn    = document.getElementById('nutr-toggle');
@@ -4237,8 +4286,11 @@ class BriefWindow(Gtk.Window):
         try:
             suggestion = get_calorie_gap_suggestion(food_data, ctx)
             js_val = ("'" + suggestion.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "&#10;") + "'") if suggestion else "null"
+            gap = round(ctx["expected_so_far"] - (food_data or {}).get("calories", 0))
             GLib.idle_add(
-                lambda: self.wv.run_javascript(f"DATA.calGapSuggestion={js_val}", None, None, None) or False)
+                lambda: self.wv.run_javascript(
+                    f"DATA.calGapSuggestion={js_val}; DATA.calGapKcal={gap}; renderCalGap();",
+                    None, None, None) or False)
         except Exception:
             log.exception("calorie gap suggestion refresh failed")
 
@@ -4375,9 +4427,10 @@ class BriefWindow(Gtk.Window):
             except Exception:
                 log.exception("nutrition insight failed")
 
-        # Feeds the calorie-chart hover tooltip: if today is meaningfully behind
-        # target, precompute a haiku meal suggestion so hovering is instant rather
-        # than firing a network call per mousemove.
+        # Feeds both the calorie-chart hover tooltip and the Nutrition tab's
+        # catch-up card: if today is behind the eating pace, precompute a haiku
+        # meal suggestion so hovering is instant rather than firing a network
+        # call per mousemove.
         def gap_worker():
             try:
                 ctx = getattr(self, "_nutr_ctx", None)
@@ -4385,7 +4438,7 @@ class BriefWindow(Gtk.Window):
                     return
                 suggestion = get_calorie_gap_suggestion(food_data, ctx)
                 if suggestion:
-                    _js(f"DATA.calGapSuggestion='{esc_tip(suggestion)}'")
+                    _js(f"DATA.calGapSuggestion='{esc_tip(suggestion)}'; renderCalGap()")
             except Exception:
                 log.exception("calorie gap suggestion failed")
 
