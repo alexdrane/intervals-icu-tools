@@ -119,8 +119,24 @@ def load_test_metrics():
         return json.load(f)
 
 
+DEFAULT_REP_REF = 8   # working-set rep scheme that targets/baselines are quoted at
+
+
 def epley_1rm(weight, reps):
     return round(weight * (1 + reps / 30), 1) if reps else weight
+
+
+def rep_normalised(weight, reps, rep_ref=DEFAULT_REP_REF):
+    """Weight a set by its reps, expressed as the equivalent load at `rep_ref` reps.
+
+    Raw working weight ranks 100kg×7 above 90kg×12, which is backwards: by Epley
+    those are e1RM 123.3 and 126.0. Going through e1RM and back down to a fixed rep
+    count keeps targets and baselines meaning "a working-set weight" rather than
+    silently becoming 1RM figures.
+    """
+    if not reps:
+        return weight
+    return round(epley_1rm(weight, reps) / (1 + rep_ref / 30), 1)
 
 
 def latest_metric(entries, metric):
@@ -202,21 +218,46 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
         # An explicit "baseline" overrides the first logged value — useful
         # when history predates a target change (e.g. bulk goal reset).
         start   = meta.get("baseline", first["value"])
+
+        # Rep weighting: score the *normalised* load, not the bar weight, so a
+        # heavier single-rep-scheme set does not read as progress over a lighter
+        # set for more reps. Opt-in per metric; never applied to lower-is-better
+        # timed tests, where reps are meaningless.
+        rep_ref  = meta.get("rep_ref", DEFAULT_REP_REF)
+        weighted = bool(meta.get("rep_weighted")) and not lower
+        score    = rep_normalised(raw, reps, rep_ref) if weighted else raw
+        e1rm     = epley_1rm(raw, reps) if (weighted and reps) else None
+
         # Progress bar: fraction of journey from baseline to target completed
         gap = (start - tgt) if lower else (tgt - start)
-        moved = (start - raw) if lower else (raw - start)
+        moved = (start - score) if lower else (score - start)
         journey_pct = (moved / gap * 100) if gap else 100
         journey_pct = max(0, min(100, journey_pct))
-        # Subtitle: reps + notes
+
+        # Subtitle: reps, then the normalised load the progress bar actually scores,
+        # so the percentage is not left unexplained against the bar weight.
         notes = latest.get("notes", "")
-        subtitle = (f"×{reps} · {notes}" if reps and notes
-                    else f"×{reps}" if reps else notes)
-        # Historical sparkline
-        spark = [{"date": e["date"], "value": e["value"]} for e in history[-12:]]
+        bits = []
+        if reps:
+            bits.append(f"×{reps}")
+        if weighted and reps:
+            bits.append(f"{score:g}{meta['unit']} @{rep_ref}")
+        if notes:
+            bits.append(notes)
+        subtitle = " · ".join(bits)
+
+        # Sparkline follows whatever is being scored, or it would contradict the bar.
+        spark = [{"date": e["date"],
+                  "value": (rep_normalised(e["value"], e.get("reps"), rep_ref)
+                            if weighted else e["value"])}
+                 for e in history[-12:]]
         result.append({
             "key":          key,
             "label":        meta["label"],
             "value":        raw,
+            "scored":       score,
+            "e1rm":         e1rm,
+            "rep_ref":      rep_ref if weighted else None,
             "reps":         reps,
             "start":        start,
             "target":       tgt,
