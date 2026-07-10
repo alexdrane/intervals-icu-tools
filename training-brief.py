@@ -2071,7 +2071,10 @@ button:hover{{background:#334155;color:#e2e8f0}}
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .mc-journey {{ font-size:9px; color:#475569; display:flex; justify-content:space-between;
   margin-top:3px; }}
-#c-radar {{ display:block; }}
+/* The blanket `canvas{{position:absolute;top:0;left:0}}` rule is meant for the
+   chart canvases, which sit inside a position:relative .chart-wrap. The radar has
+   no positioned ancestor, so it would anchor to the viewport and cover the header. */
+#c-radar {{ display:block; position:static; }}
 .log-form {{ display:flex; flex-wrap:wrap; gap:5px; align-items:center;
   padding:8px 10px; background:#1e293b; border-radius:7px; border:1px solid #334155; }}
 .log-form select, .log-form input {{
@@ -2090,7 +2093,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
 </style></head>
 <body>
 <div class="header">
-  <h1>Morning Brief</h1>
+  <h1>Training Dashboard</h1>
   <span class="date">{day_str}</span>
   <div class="tabs" role="tablist">
     <button class="tab" role="tab" aria-selected="false" data-panel="today">Today</button>
@@ -3216,7 +3219,7 @@ _ICON_PATH = os.path.expanduser("~/.local/share/icons/training-brief.svg")
 
 class BriefWindow(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Morning Brief")
+        super().__init__(title="Training Dashboard")
         self.set_default_size(WINDOW_W, WINDOW_H)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(True)
