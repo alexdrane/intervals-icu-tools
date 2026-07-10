@@ -405,6 +405,35 @@ def _bands_from_dict(by_date):
     return bands
 
 
+def get_model_meta():
+    """Fitted hyperparameters and run metadata, for the diagnostics tab.
+
+    Reads the cache only — never runs the model. Returns None if nothing is cached.
+    GP params are stored in log space for warm-starting; unpack them here so callers
+    do not have to know that.
+    """
+    cache = _load_cache()
+    p = cache.get("gp_params")
+    if not p:
+        return None
+    log_A, log_l, log_sn, mu0, beta = p
+    return {
+        "amplitude":     float(np.exp(log_A)),   # bpm
+        "lengthscale":   float(np.exp(log_l)),   # days
+        "noise":         float(np.exp(log_sn)),  # bpm
+        "baseline_rhr":  float(mu0),             # bpm at mean ATL
+        "atl_coef":      float(beta),            # bpm per 1 SD of ATL
+        "atl_mean":      (cache.get("atl_stats") or [None, None])[0],
+        "atl_sd":        (cache.get("atl_stats") or [None, None])[1],
+        "last_full_run": cache.get("last_full_run"),
+        "last_warm_run": cache.get("last_warm_run"),
+        "n_days":        len(cache.get("illness", {})),
+        "train_days":    TRAIN_DAYS,
+        "warmup_days":   WARMUP_DAYS,
+        "sick_thresh":   SICK_THRESH,
+    }
+
+
 def get_cached_result():
     """Return the last cached result without running the model. Safe to call at startup."""
     cache = _load_cache()

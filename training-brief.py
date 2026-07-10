@@ -24,7 +24,7 @@ from gi.repository import Gtk, WebKit2, GLib, GdkPixbuf
 import requests
 
 try:
-    from illness_model import get_illness_data, get_cached_result
+    from illness_model import get_illness_data, get_cached_result, get_model_meta
     _ILLNESS_AVAILABLE = True
 except ImportError:
     _ILLNESS_AVAILABLE = False
@@ -1716,11 +1716,16 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         proj_sub = ""
         if bulk_trend["today_projected"] is not None:
             proj_sub = f" · today proj. {bulk_trend['today_projected']:+,} kcal"
+        # Keep the tile scannable: one line of label, one of sub. The window size,
+        # logging coverage and today's projection live in the hover tip.
         bt_stat = _stat(
-            f"Bulk Trend ({bulk_trend['window']}d avg, prior days)",
+            "Bulk Trend",
             f"{bulk_trend['avg_surplus']:+,} kcal/day",
             bt_color,
-            f"→ {bulk_trend['kg_per_week']:+.2f} kg/wk proj. · {bulk_trend['logged_days']}/{bulk_trend['window']} days logged · {bulk_trend['state']}{proj_sub}",
+            f"{bulk_trend['kg_per_week']:+.2f} kg/wk · {bulk_trend['state']}",
+            tip=(f"{bulk_trend['window']}-day average over prior days · "
+                 f"{bulk_trend['logged_days']}/{bulk_trend['window']} days logged"
+                 f"{proj_sub}"),
         )
     else:
         bt_stat = ""
@@ -1855,6 +1860,15 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     illness_by_date  = illness.by_date if illness else {}
     illness_7d_vals  = [round(illness_by_date.get(d, 0.0), 4) for d in illness_7d_dates]
 
+    # Full posterior series + fitted hyperparameters, for the Illness tab.
+    illness_all_dates = sorted(illness_by_date)
+    illness_all_vals  = [illness_by_date[d] for d in illness_all_dates]
+    illness_meta      = get_model_meta() if _ILLNESS_AVAILABLE else None
+    sick_thresh_str   = f"{illness_meta['sick_thresh']:.1f}" if illness_meta else "0.4"
+    # Resting HR over the same days, so risk can be read against its driver.
+    rhr_by_date       = {w["id"]: w.get("restingHR") for w in entries if w.get("id")}
+    illness_rhr       = [rhr_by_date.get(d) for d in illness_all_dates]
+
     benchmark_cfg = load_benchmark_config()
     # "bodyweight" is auto-sourced from the wellness weight log (see
     # weight_history below), not manually logged, so leave it off the form.
@@ -1883,6 +1897,8 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         "weightValsFull": weight_vals_full,
         "illnessBands": illness.bands if illness else [],
         "illness7dDates": illness_7d_dates, "illness7dVals": illness_7d_vals,
+        "illnessAllDates": illness_all_dates, "illnessAllVals": illness_all_vals,
+        "illnessRhr": illness_rhr, "illnessMeta": illness_meta,
         "metrics": build_metrics_data(load_test_metrics().get("entries", []), benchmark_cfg["metrics"],
                                        weight_history=[{"date": d, "value": v} for d, v in zip(weight_dates, weight_vals)]),
     })
@@ -1927,13 +1943,18 @@ select:hover{{border-color:#475569}}
 .panel.active{{display:block}}
 
 /* ── KPI strip (was a 185px vertical rail) ────────────────────────────────── */
-.stats{{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;
-        padding:9px 6px;border-bottom:1px solid #1e293b;flex-shrink:0}}
+.stats{{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;align-items:start;
+        padding:10px 6px;border-bottom:1px solid #1e293b;flex-shrink:0}}
 .stat{{padding:0 14px;border-left:1px solid #1e293b;min-width:0}}
 .stat:first-child{{border-left:none}}
-.label{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:1px}}
-.value{{font-size:17px;font-weight:600}}
-.sub{{font-size:11px;color:#64748b;margin-top:1px}}
+.label{{font-size:9.5px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;
+        margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.value{{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+/* Tiles are ~1/10th of the window now, not a 185px column. Clamp the sub to two
+   lines so one verbose stat cannot set the height of the whole strip. */
+.sub{{font-size:10.5px;color:#64748b;margin-top:2px;line-height:1.35;
+      display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
 hr.div{{border:none;border-top:1px solid #1e293b;margin:8px 0 10px}}
 .charts{{padding:12px 14px;display:grid;
          grid-template-columns:1fr 1fr;grid-template-rows:repeat(3,170px) 200px;
@@ -1951,11 +1972,50 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .today-col hr.div:first-child{{display:none}}
 
 /* ── Nutrition: the old rail widget, given room ───────────────────────────── */
-.nutr-grid{{display:grid;grid-template-columns:minmax(320px,420px) minmax(0,1fr);
-            gap:32px;padding:18px 22px;align-items:start}}
+.nutr-grid{{display:grid;grid-template-columns:minmax(340px,440px) minmax(0,1fr);
+            gap:34px;padding:18px 22px;align-items:start}}
 .nutr-col{{min-width:0}}
 .nutr-grid .nutr-section{{margin-top:0}}
 .nutr-grid hr.div:first-child{{display:none}}
+/* Prose set across a 1400px window is unreadable — hold it to a sane measure. */
+.nutr-grid .tips-text{{max-width:70ch;font-size:14px;line-height:1.7}}
+
+/* ── Cards: give panel content edges so it does not float in dead space ───── */
+.card{{background:#131c2f;border:1px solid #1e293b;border-radius:9px;padding:14px 16px}}
+
+/* ── Illness (experimental) ───────────────────────────────────────────────── */
+.ill-panel{{padding:16px 22px;display:flex;flex-direction:column;gap:14px}}
+.ill-head{{display:flex;align-items:center;justify-content:space-between}}
+.badge-exp{{margin-left:9px;font-size:8.5px;letter-spacing:.08em;color:#fbbf24;
+            background:#2a2110;border:1px solid #4a3a12;border-radius:4px;padding:2px 6px;
+            text-transform:uppercase;vertical-align:1px}}
+.ill-today{{font-size:12px;color:#64748b;font-variant-numeric:tabular-nums}}
+.ill-today b{{font-size:20px;font-weight:600;margin-right:7px}}
+
+.ill-charts{{display:grid;grid-template-columns:1fr 1fr;gap:14px 16px}}
+.ill-charts .chart-wrap{{height:190px}}
+.swatch-x{{color:#475569;letter-spacing:0;text-transform:none;font-size:9.5px}}
+
+.ill-lower{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:30px;
+            align-items:start}}
+.ill-stats{{display:grid;grid-template-columns:repeat(auto-fill,minmax(146px,1fr));gap:8px}}
+.ill-stat{{background:#131c2f;border:1px solid #1e293b;border-radius:7px;padding:8px 10px}}
+.ill-stat .k{{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.06em}}
+.ill-stat .v{{font-size:15px;font-weight:600;color:#e2e8f0;margin-top:2px;
+              font-variant-numeric:tabular-nums}}
+.ill-stat .u{{font-size:10px;color:#475569;font-weight:400;margin-left:2px}}
+
+.ill-episodes{{display:flex;flex-direction:column;gap:5px;max-height:150px;overflow-y:auto}}
+.ill-ep{{display:flex;align-items:baseline;gap:10px;font-size:11.5px;color:#94a3b8;
+         padding:5px 9px;background:#131c2f;border:1px solid #1e293b;border-radius:6px;
+         font-variant-numeric:tabular-nums}}
+.ill-ep .dur{{margin-left:auto;color:#475569;font-size:10.5px}}
+.ill-ep .pk{{color:#f87171}}
+
+.ill-about{{max-width:74ch}}
+.ill-about p{{font-size:12.5px;line-height:1.65;color:#94a3b8;margin-bottom:9px}}
+.ill-about em{{color:#cbd5e1;font-style:normal;font-weight:500}}
+.ill-warn{{border-left:2px solid #78350f;padding-left:10px;color:#a8a29e !important}}
 
 /* ── Notes: was one carousel panel of four ────────────────────────────────── */
 .notes-panel-full{{padding:18px 22px;display:flex;flex-direction:column;gap:8px;max-width:90ch}}
@@ -2100,6 +2160,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
     <button class="tab" role="tab" aria-selected="true"  data-panel="trends">Trends</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="nutrition">Nutrition</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="perf">Performance</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="illness">Illness</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="notes">Notes</button>
   </div>
   <select id="periodSelect" onchange="setPeriod(this.value)">
@@ -2193,6 +2254,65 @@ button:hover{{background:#334155;color:#e2e8f0}}
           <input id="log-notes" type="text" placeholder="Notes (optional)">
           <button class="log-btn" onclick="submitMetric()">Add</button>
           <span id="log-confirm" class="log-added"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="illness">
+    <div class="ill-panel">
+      <div class="ill-head">
+        <div class="brief-label" style="margin:0">Illness Risk<span class="badge-exp">Experimental</span></div>
+        <div class="ill-today" id="ill-today"></div>
+      </div>
+
+      <div class="ill-charts">
+        <div class="chart-cell">
+          <div class="chart-label">P(sick) posterior · full history
+            <span class="swatch-x" style="color:#f87171">─ risk</span>
+            <span class="swatch-x" style="color:#475569">┈ p = {sick_thresh_str} episode threshold</span>
+          </div>
+          <div class="chart-wrap" id="w-ill-risk"><canvas id="c-ill-risk"></canvas></div>
+        </div>
+        <div class="chart-cell">
+          <div class="chart-label">Resting HR — the only signal the model reads
+            <span class="swatch-x" style="color:#fb923c">─ RHR</span>
+            <span class="swatch-x" style="color:#f87171">▮ detected episode</span>
+          </div>
+          <div class="chart-wrap" id="w-ill-rhr"><canvas id="c-ill-rhr"></canvas></div>
+        </div>
+      </div>
+
+      <div class="ill-lower">
+        <div>
+          <div class="brief-label">Key statistics</div>
+          <div class="ill-stats" id="ill-stats"></div>
+          <div class="brief-label" style="margin-top:16px">Detected episodes</div>
+          <div class="ill-episodes" id="ill-episodes"></div>
+        </div>
+
+        <div class="ill-about">
+          <div class="brief-label">How it works</div>
+          <p>A Gaussian process fits a slowly-varying <em>healthy baseline</em> for your resting
+          heart rate, using training load (ATL) as a covariate so that a hard block does not read
+          as illness. A two-state hidden Markov model then asks, for each day, whether the
+          residual above that baseline is better explained by a <em>healthy</em> or a
+          <em>sick</em> state. The two are fitted together: days the HMM calls sick are held out,
+          the baseline is refit on the rest, and the loop repeats.</p>
+
+          <p>Runs are cached. A warm start re-fits from yesterday's hyperparameters each morning;
+          a full global search re-runs weekly.</p>
+
+          <div class="brief-label" style="margin-top:14px">Known limitations</div>
+          <p class="ill-warn">The model reads <em>resting HR only</em> — HRV and sleep never enter
+          it, so a night of good recovery will not move this number on its own.</p>
+          <p class="ill-warn">The sick state is a plain Gaussian, and EM lets it grow a wider
+          spread than the healthy state. It therefore absorbs outliers in <em>both</em>
+          directions: a resting HR well <em>below</em> your baseline can nudge risk upward, which
+          is backwards. Constraining it naively suppresses real multi-week episodes, because the
+          outer loop relies on that width to mask sick days before refitting the baseline. Fixing
+          this properly needs a lengthscale floor on the GP as well, so the baseline cannot track
+          an illness. Until then, treat small day-to-day moves as noise and watch the episodes.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -2941,8 +3061,139 @@ function setIllnessData(todayP, yesterdayP, bands, spark7d) {{
   drawIllnessSpark();
 }}
 
+// ── Illness tab (experimental) ────────────────────────────────────────────────
+function illBands(ctx, dates, xOf, yTop, hgt) {{
+  (DATA.illnessBands || []).forEach(function(b) {{
+    var si = dates.findIndex(function(d) {{ return d >= b.start; }});
+    var ei = dates.findIndex(function(d) {{ return d > b.end; }});
+    if (si < 0) return;
+    if (ei < 0) ei = dates.length - 1;
+    if (ei <= si) ei = si + 1;
+    ctx.fillStyle = 'rgba(239,68,68,0.15)';
+    ctx.fillRect(xOf(si), yTop, xOf(ei) - xOf(si), hgt);
+  }});
+}}
+
+function drawIllnessRisk() {{
+  var g = setupCanvas('c-ill-risk', 'w-ill-risk');
+  if (!g) return;
+  var ctx = g.ctx, W = g.W, H = g.H;
+  var dates = DATA.illnessAllDates || [], vals = DATA.illnessAllVals || [];
+  if (!dates.length) return;
+  var PAD = {{top:8, right:10, bottom:20, left:34}};
+  var cW = W - PAD.left - PAD.right, cH = H - PAD.top - PAD.bottom;
+  var xOf = function(i) {{ return PAD.left + (i / Math.max(dates.length - 1, 1)) * cW; }};
+  var yOf = function(v) {{ return PAD.top + (1 - v) * cH; }};
+
+  illBands(ctx, dates, xOf, PAD.top, cH);
+  chartAxes(ctx, W, H, 0, 1, 4, PAD, dates);
+
+  var thr = (DATA.illnessMeta && DATA.illnessMeta.sick_thresh) || 0.4;
+  ctx.strokeStyle = '#475569'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+  ctx.beginPath(); ctx.moveTo(PAD.left, yOf(thr)); ctx.lineTo(W - PAD.right, yOf(thr));
+  ctx.stroke(); ctx.setLineDash([]);
+
+  ctx.fillStyle = 'rgba(248,113,113,.13)';
+  ctx.beginPath(); ctx.moveTo(xOf(0), yOf(0));
+  vals.forEach(function(v, i) {{ ctx.lineTo(xOf(i), yOf(v)); }});
+  ctx.lineTo(xOf(vals.length - 1), yOf(0)); ctx.closePath(); ctx.fill();
+
+  plotSeries(ctx, xOf, yOf, vals, '#f87171', 1.4);
+  ctx.fillStyle = '#f87171';
+  ctx.beginPath(); ctx.arc(xOf(vals.length - 1), yOf(vals[vals.length - 1]), 2.6, 0, 7); ctx.fill();
+}}
+
+function drawIllnessRhr() {{
+  var g = setupCanvas('c-ill-rhr', 'w-ill-rhr');
+  if (!g) return;
+  var ctx = g.ctx, W = g.W, H = g.H;
+  var dates = DATA.illnessAllDates || [], rhr = DATA.illnessRhr || [];
+  var seen = rhr.filter(function(v) {{ return v != null; }});
+  if (!seen.length) return;
+  var PAD = {{top:8, right:10, bottom:20, left:34}};
+  var lo = Math.min.apply(null, seen) - 2, hi = Math.max.apply(null, seen) + 2;
+  var cW = W - PAD.left - PAD.right, cH = H - PAD.top - PAD.bottom;
+  var xOf = function(i) {{ return PAD.left + (i / Math.max(dates.length - 1, 1)) * cW; }};
+  var yOf = function(v) {{ return PAD.top + (1 - (v - lo) / (hi - lo)) * cH; }};
+
+  illBands(ctx, dates, xOf, PAD.top, cH);
+  chartAxes(ctx, W, H, lo, hi, 4, PAD, dates);
+
+  var meta = DATA.illnessMeta;
+  if (meta && meta.baseline_rhr >= lo && meta.baseline_rhr <= hi) {{
+    ctx.strokeStyle = '#334155'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(PAD.left, yOf(meta.baseline_rhr));
+    ctx.lineTo(W - PAD.right, yOf(meta.baseline_rhr)); ctx.stroke(); ctx.setLineDash([]);
+  }}
+  plotSeries(ctx, xOf, yOf, rhr, '#fb923c', 1.3);
+}}
+
+function renderIllnessTab() {{
+  var meta  = DATA.illnessMeta;
+  var vals  = DATA.illnessAllVals || [];
+  var bands = DATA.illnessBands || [];
+  var today = vals.length ? vals[vals.length - 1] : null;
+
+  var head = document.getElementById('ill-today');
+  if (head) {{
+    if (today == null) {{
+      head.innerHTML = '<b style="color:#64748b">—</b> awaiting data for today';
+    }} else {{
+      var col = today < 0.20 ? '#4ade80' : today < 0.50 ? '#fbbf24' : '#f87171';
+      head.innerHTML = '<b style="color:' + col + '">' + (today * 100).toFixed(1) +
+                       '%</b> posterior probability of illness today';
+    }}
+  }}
+
+  function stat(k, v, u) {{
+    return '<div class="ill-stat"><div class="k">' + k + '</div>' +
+           '<div class="v">' + v + (u ? '<span class="u">' + u + '</span>' : '') + '</div></div>';
+  }}
+  var recent = vals.slice(-7);
+  var mean7  = recent.length ? recent.reduce(function(a,b){{return a+b;}},0)/recent.length : null;
+  var peak   = vals.length ? Math.max.apply(null, vals) : null;
+  var over   = meta ? vals.filter(function(v) {{ return v > meta.sick_thresh; }}).length : 0;
+
+  var rows = [
+    stat('7-day mean risk', mean7 == null ? '—' : (mean7*100).toFixed(1), '%'),
+    stat('Peak risk on record', peak == null ? '—' : (peak*100).toFixed(0), '%'),
+    stat('Days above threshold', over, ' of ' + vals.length),
+    stat('Episodes detected', bands.length),
+  ];
+  if (meta) {{
+    rows.push(
+      stat('GP lengthscale', meta.lengthscale.toFixed(1), ' d'),
+      stat('GP amplitude', meta.amplitude.toFixed(2), ' bpm'),
+      stat('Observation noise', meta.noise.toFixed(2), ' bpm'),
+      stat('Baseline resting HR', meta.baseline_rhr.toFixed(1), ' bpm'),
+      stat('ATL coefficient', (meta.atl_coef >= 0 ? '+' : '') + meta.atl_coef.toFixed(3), ' bpm/SD'),
+      stat('Training window', meta.train_days, ' d'),
+      stat('Last full re-fit', meta.last_full_run || '—'),
+      stat('Last warm re-fit', meta.last_warm_run || '—')
+    );
+  }}
+  document.getElementById('ill-stats').innerHTML = rows.join('');
+
+  var byDate = {{}};
+  (DATA.illnessAllDates || []).forEach(function(d, i) {{ byDate[d] = vals[i]; }});
+  var eps = bands.slice().reverse().map(function(b) {{
+    var d0 = new Date(b.start), d1 = new Date(b.end);
+    var days = Math.round((d1 - d0) / 86400000) + 1;
+    var pk = 0;
+    Object.keys(byDate).forEach(function(d) {{
+      if (d >= b.start && d <= b.end && byDate[d] > pk) pk = byDate[d];
+    }});
+    return '<div class="ill-ep"><span>' + b.start + ' → ' + b.end + '</span>' +
+           '<span class="pk">peak ' + (pk*100).toFixed(0) + '%</span>' +
+           '<span class="dur">' + days + 'd</span></div>';
+  }});
+  document.getElementById('ill-episodes').innerHTML =
+    eps.length ? eps.join('') : '<div class="notes-empty">No episodes detected.</div>';
+}}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 var trackerRendered = false;
+var illnessRendered = false;
 
 function selectTab(name) {{
   document.querySelectorAll('.tab').forEach(function(t) {{
@@ -2963,6 +3214,12 @@ function selectTab(name) {{
     requestAnimationFrame(function() {{
       if (!trackerRendered) {{ renderTracker(); trackerRendered = true; }}
       else {{ drawRadar(); }}
+    }});
+  }} else if (name === 'illness') {{
+    requestAnimationFrame(function() {{
+      if (!illnessRendered) {{ renderIllnessTab(); illnessRendered = true; }}
+      drawIllnessRisk();
+      drawIllnessRhr();
     }});
   }}
 }}
@@ -3072,19 +3329,25 @@ function drawRadar() {{
   // way both used to collapse to 0, making unmeasured axes indistinguishable
   // from measured-but-stalled ones.
   var vals = axes.map(function(ax) {{
-    var pcts = ax.keys.map(function(k) {{ return byKey[k] ? byKey[k].pct : null; }}).filter(function(v){{return v!==null;}});
+    // build_metrics_data emits `journey_pct`, not `pct`. Reading the wrong field
+    // yielded undefined, which `v !== null` does not filter out, so the average
+    // came back NaN and the polygon collapsed to nothing.
+    var pcts = ax.keys.map(function(k) {{ return byKey[k] ? byKey[k].journey_pct : null; }})
+                      .filter(function(v) {{ return v !== null && v !== undefined && isFinite(v); }});
     return pcts.length ? pcts.reduce(function(a,b){{return a+b;}},0)/pcts.length : null;
   }});
 
   var dpr = window.devicePixelRatio || 1;
-  var S = 180;
+  var S = 260;
   canvas.style.width  = S + 'px';
   canvas.style.height = S + 'px';
   canvas.width  = S * dpr;
   canvas.height = S * dpr;
   var ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
   var W = S, H = S;
-  var cx = W/2, cy = H/2, r = W/2 - 28;
+  // Leave room for the axis labels, which sit outside the outermost ring —
+  // at r = W/2 - 28 the longer ones ("Row Threshold") ran off the canvas.
+  var cx = W/2, cy = H/2, r = W/2 - 52;
   var n = axes.length;
 
   // Background fill
