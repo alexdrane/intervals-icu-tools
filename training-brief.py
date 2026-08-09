@@ -672,15 +672,20 @@ def compute_nutrition_context(activities, calorie_target):
 
 def render_food_log_list(food_data):
     """Just the logged-meals rows (no input row) — safe to swap in on a refresh
-    without disturbing whatever the user is mid-typing in the food-box."""
+    without disturbing whatever the user is mid-typing in the food-box. Each row
+    carries its entry as a data-entry JSON blob so editFood() can populate an
+    inline edit form without a round trip to Python."""
     import html as _html
     entries = (food_data or {}).get("entries", [])
     if entries:
         rows = "".join(
-            '<div class="food-entry-row">'
+            f'<div class="food-entry-row" id="food-row-{_html.escape(e.get("id", ""))}" '
+            f'data-entry="{_html.escape(json.dumps({k: e.get(k, 0 if k not in ("id","time","description") else "") for k in ("id","time","description","calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg")}), quote=True)}">'
             f'<span class="food-entry-time">{_html.escape(e.get("time", ""))}</span>'
             f'<span class="food-entry-desc">{_html.escape(e.get("description") or "")}</span>'
             f'<span class="food-entry-kcal">{e.get("calories", 0):.0f} kcal</span>'
+            f'<button class="food-entry-btn" onclick="editFood(\'{e.get("id")}\')" title="Edit">&#9998;</button>'
+            f'<button class="food-entry-btn" onclick="delFood(\'{e.get("id")}\')" title="Delete">&#10005;</button>'
             '</div>'
             for e in entries
         )
@@ -784,6 +789,40 @@ def load_food_log():
             return json.load(f)
     except Exception:
         return {}
+
+
+def delete_food_entry(entry_id):
+    """Remove one entry (by id) from today's food log. There's no agentic
+    claude -p to ask for a fix anymore, so this + update_food_entry are the
+    in-dashboard replacement for manually correcting a logged meal."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_data = load_food_log()
+    log_data[today] = [e for e in log_data.get(today, []) if e.get("id") != entry_id]
+    save_food_log(log_data)
+
+
+def update_food_entry(entry_id, fields):
+    """Apply hand-edited time/description/macro totals to today's entry with
+    this id. Collapses items to a single item matching the new totals, so the
+    entry stays internally consistent and find_similar_food_entries continues
+    to surface the corrected numbers for future similar meals."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_data = load_food_log()
+    for e in log_data.get(today, []):
+        if e.get("id") != entry_id:
+            continue
+        for k in ("time", "description", "calories", "protein_g", "carbs_g", "fat_g"):
+            if k in fields:
+                e[k] = fields[k]
+        e["items"] = [{
+            "name": e.get("description") or "meal",
+            "calories": e.get("calories", 0), "protein_g": e.get("protein_g", 0),
+            "carbs_g": e.get("carbs_g", 0), "fat_g": e.get("fat_g", 0),
+            "fiber_g": e.get("fiber_g", 0), "sugar_g": e.get("sugar_g", 0),
+            "sodium_mg": e.get("sodium_mg", 0),
+        }]
+        break
+    save_food_log(log_data)
 
 
 def get_today_nutrition():
@@ -2402,6 +2441,19 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .food-entry-time{{color:#475569;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
 .food-entry-desc{{color:#cbd5e1;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .food-entry-kcal{{color:#64748b;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.food-entry-btn{{background:none;border:none;color:#334155;font-size:11px;cursor:pointer;padding:0 2px;
+  flex-shrink:0;line-height:1}}
+.food-entry-btn:hover{{color:#a78bfa}}
+.food-entry-edit-form{{display:flex;gap:4px;width:100%;align-items:center}}
+.food-entry-edit-form input{{background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;
+  font-size:11px;padding:3px 5px;font-family:inherit;outline:none;min-width:0}}
+.food-entry-edit-form input:focus{{border-color:#a78bfa}}
+.food-entry-edit-form .fe-time{{width:42px;flex-shrink:0}}
+.food-entry-edit-form .fe-desc{{flex:1;min-width:0}}
+.food-entry-edit-form .fe-num{{width:44px;flex-shrink:0}}
+.food-entry-edit-form button{{background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:4px;
+  font-size:11px;padding:3px 7px;cursor:pointer;flex-shrink:0}}
+.food-entry-edit-form button:hover{{background:#334155;color:#e2e8f0}}
 .food-log-empty{{font-size:11.5px;color:#475569;font-style:italic;padding:2px 0 6px}}
 .week-day{{border-bottom:1px solid #16213a}}
 .week-day:last-child{{border-bottom:none}}
@@ -3554,6 +3606,48 @@ function submitFood() {{
   // side serializes them through a single worker so food-log.json never races.
   box.value = '';
   document.title = '__logfood__' + Date.now() + '|' + encodeURIComponent(v);
+}}
+var _foodEditBackup = {{}};
+function editFood(id) {{
+  var row = document.getElementById('food-row-' + id);
+  if (!row) return;
+  var data = JSON.parse(row.getAttribute('data-entry'));
+  _foodEditBackup[id] = row.innerHTML;
+  function esc(s) {{ return String(s).replace(/"/g, '&quot;'); }}
+  row.innerHTML =
+    '<div class="food-entry-edit-form">' +
+    '<input class="fe-time" value="' + esc(data.time) + '">' +
+    '<input class="fe-desc" value="' + esc(data.description) + '">' +
+    '<input class="fe-num fe-cal" type="number" value="' + data.calories + '" title="kcal">' +
+    '<input class="fe-num fe-prot" type="number" value="' + data.protein_g + '" title="protein g">' +
+    '<input class="fe-num fe-carb" type="number" value="' + data.carbs_g + '" title="carbs g">' +
+    '<input class="fe-num fe-fat" type="number" value="' + data.fat_g + '" title="fat g">' +
+    '<button onclick="saveFoodEdit(\'' + id + '\')">Save</button>' +
+    '<button onclick="cancelFoodEdit(\'' + id + '\')">Cancel</button>' +
+    '</div>';
+}}
+function cancelFoodEdit(id) {{
+  var row = document.getElementById('food-row-' + id);
+  if (row && _foodEditBackup[id] !== undefined) row.innerHTML = _foodEditBackup[id];
+}}
+function saveFoodEdit(id) {{
+  var row = document.getElementById('food-row-' + id);
+  if (!row) return;
+  var payload = {{
+    id: id,
+    time: row.querySelector('.fe-time').value,
+    description: row.querySelector('.fe-desc').value,
+    calories: parseFloat(row.querySelector('.fe-cal').value) || 0,
+    protein_g: parseFloat(row.querySelector('.fe-prot').value) || 0,
+    carbs_g: parseFloat(row.querySelector('.fe-carb').value) || 0,
+    fat_g: parseFloat(row.querySelector('.fe-fat').value) || 0,
+  }};
+  delete _foodEditBackup[id];
+  document.title = '__editfood__' + Date.now() + '|' + encodeURIComponent(JSON.stringify(payload));
+}}
+function delFood(id) {{
+  if (!confirm('Delete this entry?')) return;
+  document.title = '__delfood__' + Date.now() + '|' + id;
 }}
 var _foodModelWarmUntil = 0;
 function warmFoodModel() {{
@@ -4744,6 +4838,23 @@ class BriefWindow(Gtk.Window):
                     f"setFoodQueued({n})", None, None, None) or False)
         elif t.startswith("__warmfood__"):
             threading.Thread(target=warm_local_model, daemon=True).start()
+        elif t.startswith("__delfood__"):
+            _nonce, _, entry_id = t[len("__delfood__"):].partition("|")
+            try:
+                delete_food_entry(entry_id)
+                self._refresh_nutrition_ui()
+            except Exception:
+                log.exception("delete food entry failed")
+        elif t.startswith("__editfood__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t[len("__editfood__"):].partition("|")
+            try:
+                payload = json.loads(_up.unquote(enc))
+                entry_id = payload.pop("id")
+                update_food_entry(entry_id, payload)
+                self._refresh_nutrition_ui()
+            except Exception:
+                log.exception("edit food entry failed")
 
     def _push_metrics(self):
         """Rebuild the metrics payload from disk and re-render the tracker in place."""
