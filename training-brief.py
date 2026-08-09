@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Morning training brief — loading screen, retries, charts, coach brief."""
 
+import difflib
 import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
+import queue
 import re
-import subprocess
 import sys
 import time
 import threading
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, date
 
@@ -38,8 +40,11 @@ CACHE_FILE         = os.path.expanduser("~/.cache/training-brief/cache.json")
 NUTR_CACHE_FILE    = os.path.expanduser("~/.cache/training-brief/nutrition-cache.json")
 CAL_GAP_CACHE_FILE = os.path.expanduser("~/.cache/training-brief/calorie-gap-cache.json")
 FOOD_LOG_FILE      = os.path.expanduser("~/.local/share/training-brief/food-log.json")
+CLAUDE_USAGE_LOG    = os.path.expanduser("~/.local/share/training-brief/claude-usage.jsonl")
 STRETCH_LOG_FILE   = os.path.expanduser("~/.local/share/training-brief/stretch-log.json")
 NOTES_LOG_FILE     = os.path.expanduser("~/.local/share/training-brief/notes-log.json")
+OLLAMA_CHAT_URL    = "http://localhost:11434/api/chat"
+LOCAL_MODEL     = "qwen2.5:7b"
 BASE_URL           = "https://intervals.icu/api/v1"
 WINDOW_W, WINDOW_H = 1440, 860
 EATING_START_H, EATING_END_H = 7, 22   # window used to pace-adjust today's calorie target
@@ -493,51 +498,144 @@ def render_notes_html():
     return "".join(rows)
 
 
-# ── Food log — quick-add via claude -p ──────────────────────────────────────
+# ── Food log & LLM calls — local Qwen via Ollama ────────────────────────────
 
-def log_food_via_claude(description):
-    """Append one meal entry to today's food-log.json by delegating to a
-    sandboxed `claude -p` call, restricted to Read/Edit and to the food-log's
-    own directory so it cannot touch anything else on the machine.
-    Returns (ok, error_message)."""
+def _log_ollama_usage(source, duration_ms, parsed_ok):
+    """Append one line of timing info for a local Ollama call to CLAUDE_USAGE_LOG.
+    Best-effort — never raises."""
+    try:
+        entry = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "model": LOCAL_MODEL,
+            "backend": "ollama",
+            "duration_ms": duration_ms,
+            "ok": parsed_ok,
+        }
+        os.makedirs(os.path.dirname(CLAUDE_USAGE_LOG), exist_ok=True)
+        with open(CLAUDE_USAGE_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        log.exception("failed to log ollama usage for source=%s", source)
+
+
+def find_similar_food_entries(description, limit=3, days_back=60, min_ratio=0.55):
+    """Look back through the food log for entries whose description closely
+    matches the given one, most-recent first. Their stored macros reflect any
+    manual corrections the user has made since the original model guess,
+    so surfacing them lets a repeat entry reuse the corrected numbers instead
+    of re-deriving (and repeating) the same estimation mistake."""
+    log_data = load_food_log()
+    cutoff = datetime.now().date() - timedelta(days=days_back)
+    desc_norm = description.strip().lower()
+    scored = []
+    for day, entries in log_data.items():
+        try:
+            day_date = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day_date < cutoff:
+            continue
+        for e in entries:
+            other = (e.get("description") or "").strip().lower()
+            if not other:
+                continue
+            ratio = difflib.SequenceMatcher(None, desc_norm, other).ratio()
+            if ratio >= min_ratio:
+                scored.append((ratio, day, e))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [(day, e) for _, day, e in scored[:limit]]
+
+
+def save_food_log(log_data):
+    os.makedirs(os.path.dirname(FOOD_LOG_FILE), exist_ok=True)
+    with open(FOOD_LOG_FILE, "w") as f:
+        json.dump(log_data, f, indent=2)
+
+
+def log_food_via_qwen(description):
+    """Append one meal entry to today's food-log.json using a local Qwen model
+    (via Ollama) to estimate macros, with this process doing the actual file
+    write and totals — the model only ever returns a JSON snippet, it never
+    touches the filesystem. Returns (ok, error_message)."""
     today = datetime.now().strftime("%Y-%m-%d")
     now_t = datetime.now().strftime("%H:%M")
-    food_log_dir = os.path.dirname(FOOD_LOG_FILE)
-    prompt = (
-        f'Append ONE new meal entry to {FOOD_LOG_FILE} under the date key "{today}" '
-        f'(create the key, or the file, if missing). Do not modify any existing '
-        f'entries or other dates.\n\n'
-        'Schema for each entry in the date\'s list:\n'
-        '{"id": "<uuid4>", "time": "HH:MM", "description": "<free text summary>", '
-        '"items": [{"name": "...", "calories": N, "protein_g": N, "carbs_g": N, '
-        '"fat_g": N, "fiber_g": N, "sugar_g": N, "sodium_mg": N}], '
-        '"calories": <sum of items>, "protein_g": <sum>, "carbs_g": <sum>, '
-        '"fat_g": <sum>, "fiber_g": <sum>, "sugar_g": <sum>, "sodium_mg": <sum>}\n\n'
-        f'Use time "{now_t}" unless the description implies otherwise. Split into one '
-        'item per distinct food, estimate realistic macros with standard nutrition '
-        'knowledge (pasta/rice/oats quantities are dry weight unless said to be cooked), '
-        'and make sure entry-level totals equal the sum of items.\n\n'
-        f'Food description: "{description}"\n\n'
-        'Only edit this one file. Do not print anything or ask questions — just make the edit.'
-    )
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt,
-             "--model", "claude-haiku-4-5-20251001",
-             "--tools", "Read,Edit",
-             "--add-dir", food_log_dir,
-             "--permission-mode", "acceptEdits",
-             "--no-session-persistence",
-             "--strict-mcp-config"],
-            cwd=food_log_dir, capture_output=True, text=True, timeout=90,
+
+    similar = find_similar_food_entries(description)
+    if similar:
+        examples = []
+        for day, e in similar:
+            items_str = "; ".join(
+                f'{i.get("name")}: {i.get("calories")} kcal, '
+                f'{i.get("protein_g")}P/{i.get("carbs_g")}C/{i.get("fat_g")}F g'
+                for i in e.get("items", [])
+            )
+            examples.append(f'- [{day}] "{e.get("description")}" -> {items_str}')
+        reference_block = (
+            "\n\nYou have logged similar meals before. These figures may include "
+            "corrections the user made afterwards, so treat them as ground truth "
+            "for any matching item and reuse the same per-item macros rather than "
+            "re-estimating from scratch. Only deviate where this description "
+            "clearly specifies a different food or quantity:\n" + "\n".join(examples)
         )
-    except subprocess.TimeoutExpired:
-        log.error("food log claude call timed out")
-        return False, "Timed out logging food — try again."
-    if result.returncode != 0:
-        log.error("food log claude call failed (%d): %s", result.returncode, result.stderr[-2000:])
+    else:
+        reference_block = ""
+
+    prompt = (
+        'Estimate macros for ONE meal and respond with JSON only, no other text.\n\n'
+        'JSON schema:\n'
+        '{"time": "HH:MM", "items": [{"name": "...", "calories": N, "protein_g": N, '
+        '"carbs_g": N, "fat_g": N, "fiber_g": N, "sugar_g": N, "sodium_mg": N}]}\n\n'
+        f'Use time "{now_t}" unless the description implies otherwise. Split into one '
+        'item per distinct food, and estimate realistic macros with standard nutrition '
+        'knowledge (pasta/rice/oats quantities are dry weight unless said to be cooked).'
+        f'{reference_block}\n\n'
+        f'Food description: "{description}"'
+    )
+
+    t0 = time.monotonic()
+    try:
+        resp = requests.post(
+            OLLAMA_CHAT_URL,
+            json={
+                "model": LOCAL_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "format": "json",
+                "stream": False,
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        log.exception("food log ollama call failed")
+        _log_ollama_usage("food_log", int((time.monotonic() - t0) * 1000), False)
+        return False, "Failed to log food — is Ollama running?"
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    try:
+        content = resp.json()["message"]["content"]
+        parsed = json.loads(content)
+        items = parsed.get("items") or []
+        if not items:
+            raise ValueError("no items in response")
+    except (KeyError, ValueError, json.JSONDecodeError):
+        log.error("food log ollama call returned unusable output: %s", resp.text[-500:])
+        _log_ollama_usage("food_log", duration_ms, False)
         return False, "Failed to log food — try again."
-    log.info("food logged via claude -p: %s", description[:80])
+    _log_ollama_usage("food_log", duration_ms, True)
+
+    entry = {
+        "id": str(uuid.uuid4()),
+        "time": parsed.get("time") or now_t,
+        "description": description,
+        "items": items,
+        **{k: sum(i.get(k, 0) or 0 for i in items)
+           for k in ("calories", "protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g", "sodium_mg")},
+    }
+    log_data = load_food_log()
+    log_data.setdefault(today, []).append(entry)
+    save_food_log(log_data)
+    log.info("food logged via qwen: %s", description[:80])
     return True, None
 
 
@@ -572,10 +670,9 @@ def compute_nutrition_context(activities, calorie_target):
     }
 
 
-def render_food_log(food_data):
-    """Just today's logged meals and the quick-add input — the whole content of the
-    Nutrition tab's "Logged today" card. The calorie bar and macro rows the old
-    widget also drew now live in their own dashboard cards, so this stays lean."""
+def render_food_log_list(food_data):
+    """Just the logged-meals rows (no input row) — safe to swap in on a refresh
+    without disturbing whatever the user is mid-typing in the food-box."""
     import html as _html
     entries = (food_data or {}).get("entries", [])
     if entries:
@@ -587,18 +684,63 @@ def render_food_log(food_data):
             '</div>'
             for e in entries
         )
-        list_html = f'<div class="food-entry-list">{rows}</div>'
-    else:
-        list_html = '<div class="food-log-empty">No meals logged yet today.</div>'
+        return f'<div class="food-entry-list">{rows}</div>'
+    return '<div class="food-log-empty">No meals logged yet today.</div>'
+
+
+def render_food_log(food_data):
+    """The whole content of the Nutrition tab's "Logged today" card: today's
+    logged meals plus the quick-add input. Used only for the initial page
+    build — refreshes after a queued entry go through setFoodLogList instead
+    so the input row (and whatever the user is typing into it) is untouched."""
     return (
-        f'<div id="food-log-list">{list_html}</div>'
+        f'<div id="food-log-list">{render_food_log_list(food_data)}</div>'
         '<div class="food-input-row">'
         '<input type="text" id="food-box" placeholder="Log food… (Enter to add)" '
+        '''onfocus="warmFoodModel()" '''
         '''onkeydown="if(event.key==='Enter'){event.preventDefault();submitFood();}">'''
         '<button id="food-add-btn" onclick="submitFood()">Add</button>'
         '</div>'
         '<div class="food-status" id="food-status" style="display:none"></div>'
     )
+
+
+def render_weekly_food_log(days_back=6):
+    """Last `days_back`+1 days as collapsible per-day sections (today expanded,
+    the rest collapsed) so mislogged/duplicate/misdated entries — like the jacket
+    potato that turned out to belong to a different day — are easy to spot by eye
+    instead of only surfacing when the numbers look off."""
+    import html as _html
+    log_data = load_food_log()
+    today = datetime.now().date()
+    blocks = []
+    for i in range(days_back, -1, -1):
+        d = today - timedelta(days=i)
+        day_str = d.strftime("%Y-%m-%d")
+        entries = log_data.get(day_str, [])
+        total = sum(e.get("calories", 0) for e in entries)
+        if entries:
+            rows = "".join(
+                '<div class="week-entry-row">'
+                f'<span class="food-entry-time">{_html.escape(e.get("time", ""))}</span>'
+                f'<span class="food-entry-desc">{_html.escape(e.get("description") or "")}</span>'
+                f'<span class="food-entry-kcal">{e.get("calories", 0):.0f} kcal</span>'
+                '</div>'
+                for e in entries
+            )
+        else:
+            rows = '<div class="food-log-empty">Not logged</div>'
+        is_today = i == 0
+        label_cls = " is-today" if is_today else ""
+        label = "Today" if is_today else d.strftime("%A %d %b")
+        blocks.append(
+            f'<details class="week-day"{" open" if is_today else ""}>'
+            f'<summary><span class="week-day-label{label_cls}">{label}</span>'
+            f'<span class="week-day-total">{total:.0f} kcal</span></summary>'
+            f'<div class="week-day-entries">{rows}</div>'
+            '</details>'
+        )
+    return "".join(blocks)
 
 
 def nutrition_data(food_data, ctx):
@@ -781,17 +923,43 @@ def get_bulk_trend(dates, consumed, targets, surplus_goal: int = 300, window: in
         "today_projected": today_projected,
     }
 
-def _claude_p(prompt: str, timeout: int = 90) -> str:
-    """Call claude -p with the given prompt and return stripped stdout."""
-    result = subprocess.run(
-        ["claude", "-p", "--model", "claude-haiku-4-5-20251001"],
-        input=prompt, capture_output=True, text=True, timeout=timeout
-    )
-    if result.returncode != 0:
-        err = result.stderr.strip() or result.stdout.strip() or "claude -p failed"
-        log.error("claude -p failed (rc=%d): %s", result.returncode, err)
-        raise RuntimeError(err)
-    return result.stdout.strip()
+def warm_local_model():
+    """Best-effort, fire-and-forget: ask Ollama to load LOCAL_MODEL into memory
+    (and hold it there for 5min) ahead of an expected call. Sending a /api/generate
+    request with no prompt loads the model without generating anything. Meant to be
+    called on its own thread — swallows errors since this is purely an optimization."""
+    try:
+        requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": LOCAL_MODEL, "keep_alive": "5m"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        pass
+
+
+def _ollama_p(prompt: str, timeout: int = 240, source: str = "unknown") -> str:
+    """Call the local Qwen model (via Ollama) with the given prompt and return the
+    stripped reply text. Logs timing to CLAUDE_USAGE_LOG under `source`."""
+    t0 = time.monotonic()
+    try:
+        resp = requests.post(
+            OLLAMA_CHAT_URL,
+            json={
+                "model": LOCAL_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        _log_ollama_usage(source, int((time.monotonic() - t0) * 1000), False)
+        log.error("ollama call failed for source=%s: %s", source, e)
+        raise RuntimeError(f"local model call failed: {e}")
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    _log_ollama_usage(source, duration_ms, True)
+    return resp.json()["message"]["content"].strip()
 
 def _load_cache(path: str) -> dict:
     if os.path.exists(path):
@@ -854,7 +1022,7 @@ def get_nutrition_insight():
         "Write exactly 3 sentences. Be specific about which days/foods you are referencing. "
         "No fluff, no generic advice, no greetings, no markdown formatting."
     )
-    insight = _claude_p(prompt)
+    insight = _ollama_p(prompt, source="nutrition_insight")
     _save_cache(NUTR_CACHE_FILE, {"hash": input_hash, "insight": insight})
     return insight, False
 
@@ -902,7 +1070,7 @@ def get_calorie_gap_suggestion(food_data, ctx):
         "gap to pace — not the whole remaining day. One sentence, no markdown, no greetings."
     )
     try:
-        suggestion = _claude_p(prompt, timeout=90)
+        suggestion = _ollama_p(prompt, source="calorie_gap_suggestion")
     except Exception:
         log.exception("calorie gap suggestion failed")
         return None
@@ -1385,7 +1553,7 @@ def _benchmark_lines(wellness):
     return out
 
 
-def get_claude_summary(data_text):
+def get_training_summary(data_text):
     """Returns ({"overview": ..., "tips": ...}, is_stale)."""
     input_hash = _data_hash(data_text)
     cache      = _load_cache(CACHE_FILE)
@@ -1435,9 +1603,9 @@ def get_claude_summary(data_text):
         "Each section plain prose. Overview ≤90 words, Tips ≤140 words.\n\n"
         + data_text
     )
-    text = _claude_p(prompt)
+    text = _ollama_p(prompt, source="training_summary")
     if not text.strip():
-        raise RuntimeError("claude -p returned empty output")
+        raise RuntimeError("local model returned empty output")
     if "---TIPS---" in text:
         overview, tips = text.split("---TIPS---", 1)
         overview = overview.strip(); tips = tips.strip()
@@ -1498,7 +1666,7 @@ def extract_sessions_from_notes(active_notes):
         "If no clear upcoming session is described, output exactly: []"
     )
 
-    raw = _claude_p(prompt).strip()
+    raw = _ollama_p(prompt, source="extract_sessions").strip()
     # Extract the first JSON array, tolerating code fences or trailing prose
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if not match:
@@ -1615,7 +1783,7 @@ def get_nutrition_coach(activities, training_plan, coach_summary=None):
         "Last 7 days of eating:\n" + "\n".join(weekly) + "\n\n"
         "Be specific: name actual foods and quantities. No generic advice."
     )
-    brief = _claude_p(prompt)
+    brief = _ollama_p(prompt, source="nutrition_coach")
     _save_cache(NUTR_COACH_CACHE, {"hash": input_hash, "brief": brief})
     return brief, False
 
@@ -1936,7 +2104,8 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
 
     # The "Logged today" card content — entries + quick-add only. The calorie bar
     # and macro rows the old widget drew are now their own dashboard cards.
-    food_log_html = render_food_log(food_data)
+    food_log_html   = render_food_log(food_data)
+    weekly_log_html = render_weekly_food_log()
 
     # Three fragments, three homes: the KPI strip, the Nutrition tab, the Today tab.
     kpi_html = "".join([
@@ -2167,9 +2336,10 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .weight-card{{grid-column:span 7}}
 .gap-slot{{grid-column:span 7}}
 .foodlog-card{{grid-column:span 5}}
+.weeklog-card{{grid-column:span 7}}
 @media (max-width:1100px){{
   .cal-ring-card, .nutr-card:nth-child(2), .macro-break-card, .bulk-card,
-  .weight-card, .gap-slot, .foodlog-card {{ grid-column:span 12 }}
+  .weight-card, .gap-slot, .foodlog-card, .weeklog-card {{ grid-column:span 12 }}
 }}
 .nutr-card-h{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;
               margin-bottom:10px}}
@@ -2233,6 +2403,21 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .food-entry-desc{{color:#cbd5e1;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .food-entry-kcal{{color:#64748b;flex-shrink:0;font-variant-numeric:tabular-nums}}
 .food-log-empty{{font-size:11.5px;color:#475569;font-style:italic;padding:2px 0 6px}}
+.week-day{{border-bottom:1px solid #16213a}}
+.week-day:last-child{{border-bottom:none}}
+.week-day summary{{display:flex;align-items:center;justify-content:space-between;gap:8px;
+                    padding:7px 0;cursor:pointer;list-style:none;font-size:12px}}
+.week-day summary::-webkit-details-marker{{display:none}}
+.week-day summary::before{{content:'\\25b8';color:#475569;margin-right:6px;font-size:10px}}
+.week-day[open] summary::before{{content:'\\25be'}}
+.week-day-label{{color:#cbd5e1;flex:1}}
+.week-day-label.is-today{{color:#a78bfa}}
+.week-day-total{{color:#64748b;font-variant-numeric:tabular-nums;flex-shrink:0}}
+.week-day-entries{{padding:0 0 8px 16px}}
+.week-entry-row{{display:flex;gap:8px;font-size:11px;padding:3px 0;color:#94a3b8}}
+.week-entry-row .food-entry-time{{color:#475569;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.week-entry-row .food-entry-desc{{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.week-entry-row .food-entry-kcal{{color:#64748b;flex-shrink:0;font-variant-numeric:tabular-nums}}
 .food-input-row{{display:flex;gap:6px;margin-top:10px}}
 .food-input-row input{{flex:1;min-width:0;background:#0f172a;border:1px solid #334155;border-radius:5px;
   color:#e2e8f0;font-size:12px;padding:6px 9px;font-family:inherit;outline:none}}
@@ -2573,6 +2758,11 @@ button:hover{{background:#334155;color:#e2e8f0}}
       <div class="nutr-card foodlog-card">
         <div class="nutr-card-h">Logged today</div>
         <div id="food-log-body">{food_log_html}</div>
+      </div>
+
+      <div class="nutr-card weeklog-card">
+        <div class="nutr-card-h">This week <span class="nutr-card-sub">tap a day to expand</span></div>
+        <div id="weekly-log-body">{weekly_log_html}</div>
       </div>
 
       <div class="nutr-card insight-card" id="nutr-insight-card" style="display:none">
@@ -3347,28 +3537,48 @@ function setNotes(html) {{
   var el = document.getElementById('notes-list');
   if (el) el.innerHTML = html;
 }}
-function setFoodLog(html) {{
-  var el = document.getElementById('food-log-body');
+function setFoodLogList(html) {{
+  var el = document.getElementById('food-log-list');
+  if (el) el.innerHTML = html;
+}}
+function setWeeklyLog(html) {{
+  var el = document.getElementById('weekly-log-body');
   if (el) el.innerHTML = html;
 }}
 function submitFood() {{
   var box = document.getElementById('food-box');
-  var btn = document.getElementById('food-add-btn');
   if (!box) return;
   var v = box.value.trim();
   if (!v) return;
-  box.disabled = true;
-  if (btn) btn.disabled = true;
-  var status = document.getElementById('food-status');
-  if (status) {{ status.style.display = 'block'; status.textContent = 'Logging…'; status.className = 'food-status pending'; }}
+  // Box stays enabled so entries can be queued up back-to-back — the Python
+  // side serializes them through a single worker so food-log.json never races.
+  box.value = '';
   document.title = '__logfood__' + Date.now() + '|' + encodeURIComponent(v);
 }}
-function setFoodError(msg) {{
-  var box = document.getElementById('food-box');
-  var btn = document.getElementById('food-add-btn');
+var _foodModelWarmUntil = 0;
+function warmFoodModel() {{
+  // Fired on focusing the food box: ask Ollama to load the model into RAM now,
+  // so the load happens while the user is typing instead of after they hit
+  // Enter. Re-pinging while already warm just extends keep_alive, so throttle
+  // to once per 60s rather than once per focus event.
+  var now = Date.now();
+  if (now < _foodModelWarmUntil) return;
+  _foodModelWarmUntil = now + 60000;
+  document.title = '__warmfood__' + now;
+}}
+function setFoodQueued(n) {{
   var status = document.getElementById('food-status');
-  if (box) box.disabled = false;
-  if (btn) btn.disabled = false;
+  if (!status) return;
+  if (n > 0) {{
+    status.style.display = 'block';
+    status.textContent = n === 1 ? 'Logging…' : 'Logging… (' + n + ' queued)';
+    status.className = 'food-status pending';
+  }} else {{
+    status.style.display = 'none';
+  }}
+}}
+function setFoodError(msg) {{
+  var status = document.getElementById('food-status');
   if (status) {{ status.style.display = 'block'; status.textContent = msg; status.className = 'food-status error'; }}
 }}
 function submitNote() {{
@@ -4467,6 +4677,14 @@ class BriefWindow(Gtk.Window):
         self.wv.load_html(LOADING_HTML, "file:///")
         threading.Thread(target=self._fetch_and_render, daemon=True).start()
 
+        # Food entries are processed one at a time by a single worker so
+        # concurrent local-model calls never race each other writing food-log.json;
+        # the queue lets the UI accept new entries immediately instead of
+        # blocking on the ~20s Ollama round trip.
+        self._food_queue = queue.Queue()
+        self._food_queue_depth = 0
+        threading.Thread(target=self._food_worker, daemon=True).start()
+
     def _on_title_changed(self, wv, _):
         t = wv.get_title() or ""
         if t == "__close__":
@@ -4519,7 +4737,13 @@ class BriefWindow(Gtk.Window):
             import urllib.parse as _up
             _nonce, _, enc = t[len("__logfood__"):].partition("|")
             description = _up.unquote(enc)
-            threading.Thread(target=self._log_food, args=(description,), daemon=True).start()
+            self._food_queue_depth += 1
+            self._food_queue.put(description)
+            GLib.idle_add(
+                lambda n=self._food_queue_depth: self.wv.run_javascript(
+                    f"setFoodQueued({n})", None, None, None) or False)
+        elif t.startswith("__warmfood__"):
+            threading.Thread(target=warm_local_model, daemon=True).start()
 
     def _push_metrics(self):
         """Rebuild the metrics payload from disk and re-render the tracker in place."""
@@ -4534,20 +4758,29 @@ class BriefWindow(Gtk.Window):
         GLib.idle_add(lambda: self.wv.run_javascript(
             f"DATA.metrics={metrics_json}; renderTracker();", None, None, None) or False)
 
-    def _log_food(self, description):
-        """Runs off the GTK thread: delegates the food entry to claude -p, then
-        refreshes #nutr-body in place so the user never has to hit refresh."""
-        try:
-            ok, err = log_food_via_claude(description)
-        except Exception:
-            log.exception("food log failed")
-            ok, err = False, "Failed to log food — try again."
-        if not ok:
-            msg = (err or "Failed to log food — try again.").replace("\\", "\\\\").replace("'", "\\'")
-            GLib.idle_add(
-                lambda: self.wv.run_javascript(f"setFoodError('{msg}')", None, None, None) or False)
-            return
-        self._refresh_nutrition_ui()
+    def _food_worker(self):
+        """Runs for the lifetime of the app on its own thread: pulls queued food
+        descriptions one at a time and delegates each to the local model in turn,
+        so entries are never processed concurrently (which would race writing
+        food-log.json) while the UI stays free to accept more entries meanwhile."""
+        while True:
+            description = self._food_queue.get()
+            try:
+                ok, err = log_food_via_qwen(description)
+            except Exception:
+                log.exception("food log failed")
+                ok, err = False, "Failed to log food — try again."
+            self._food_queue_depth = max(0, self._food_queue_depth - 1)
+            if not ok:
+                msg = (err or "Failed to log food — try again.").replace("\\", "\\\\").replace("'", "\\'")
+                GLib.idle_add(
+                    lambda m=msg: self.wv.run_javascript(f"setFoodError('{m}')", None, None, None) or False)
+            else:
+                self._refresh_nutrition_ui()
+                GLib.idle_add(
+                    lambda n=self._food_queue_depth: self.wv.run_javascript(
+                        f"setFoodQueued({n})", None, None, None) or False)
+            self._food_queue.task_done()
 
     def _refresh_nutrition_ui(self):
         """After a food quick-add: refresh the logged-today list and re-render the
@@ -4557,11 +4790,13 @@ class BriefWindow(Gtk.Window):
         if not ctx:
             return
         food_data = get_today_nutrition()
-        log_html  = render_food_log(food_data).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+        log_html  = render_food_log_list(food_data).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+        week_html = render_weekly_food_log().replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
         nutr_json = json.dumps(nutrition_data(food_data, ctx))
         GLib.idle_add(
             lambda: self.wv.run_javascript(
-                f"setFoodLog('{log_html}'); DATA.nutrition={nutr_json}; "
+                f"setFoodLogList('{log_html}'); setWeeklyLog('{week_html}'); "
+                f"DATA.nutrition={nutr_json}; "
                 f"renderNutritionDash(); renderTodayDials();",
                 None, None, None) or False)
         # Gap may have closed (or changed) — refresh the chart-hover suggestion too.
@@ -4685,7 +4920,7 @@ class BriefWindow(Gtk.Window):
         def coach_worker():
             coach_summary = None
             try:
-                coach_summary, _ = get_claude_summary(
+                coach_summary, _ = get_training_summary(
                     build_data_text(wellness, activities, training_plan, illness=illness))
                 _js(f"setCoachBrief('{esc(coach_summary.get('overview', ''))}', "
                     f"'{esc(coach_summary.get('tips', ''))}')")
@@ -4737,8 +4972,11 @@ class BriefWindow(Gtk.Window):
             except Exception:
                 log.exception("session extraction failed")
 
-        # Run the independent LLM calls concurrently — each claude -p call is ~4-5s,
-        # so this cuts a full regenerate from ~4 calls in series to ~2 on the critical path.
+        # Fire the independent LLM calls on separate threads. NOTE: with the local
+        # Ollama model this no longer buys real parallelism the way concurrent
+        # claude -p API calls did — Ollama serializes requests against one CPU-bound
+        # model instance, so wall time here is closer to the sum of all 4 calls than
+        # the max. Kept threaded so the UI thread isn't blocked either way.
         workers = [threading.Thread(target=w, daemon=True)
                    for w in (coach_worker, insight_worker, extract_worker, gap_worker)]
         for w in workers: w.start()
