@@ -10,6 +10,7 @@ import math
 import os
 import queue
 import re
+import statistics
 import sys
 import time
 import threading
@@ -24,6 +25,30 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, WebKit2, GLib, GdkPixbuf
 
 import requests
+
+sys.path.insert(0, os.path.expanduser("~/app-hub"))
+try:
+    import apphub
+except Exception:      # the hub is optional
+    apphub = None
+try:
+    import focus as _focus
+except Exception:  # Focus tab is optional
+    _focus = None
+try:
+    import sleep as _sleep
+except Exception:  # Sleep view is optional
+    _sleep = None
+try:
+    import life as _life
+except Exception:  # Life tab is optional
+    _life = None
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "one-year-ago"))
+try:
+    import one_year_ago as _oya
+except Exception:  # Vs Last Year tab is optional
+    _oya = None
 
 try:
     from illness_model import get_illness_data, get_cached_result, get_model_meta
@@ -44,7 +69,11 @@ CLAUDE_USAGE_LOG    = os.path.expanduser("~/.local/share/training-brief/claude-u
 STRETCH_LOG_FILE   = os.path.expanduser("~/.local/share/training-brief/stretch-log.json")
 NOTES_LOG_FILE     = os.path.expanduser("~/.local/share/training-brief/notes-log.json")
 OLLAMA_CHAT_URL    = "http://localhost:11434/api/chat"
-LOCAL_MODEL     = "qwen2.5:7b"
+LOCAL_MODEL        = "qwen2.5:7b"
+LOCAL_MODEL_FAST   = "qwen2.5:3b"   # for long/narrative prompts where 7B is too slow on CPU
+NOTE_CONTEXT_DAYS  = 21             # notes older than this are stale context, not "recent"
+KEY_DATE_HORIZON_DAYS = 14             # fixtures further out than this don't steer the tips
+REFERENCE_WINDOW_DAYS = 365         # history used to judge whether today's numbers are good
 BASE_URL           = "https://intervals.icu/api/v1"
 WINDOW_W, WINDOW_H = 1440, 860
 EATING_START_H, EATING_END_H = 7, 22   # window used to pace-adjust today's calorie target
@@ -63,14 +92,14 @@ log = logging.getLogger("training-brief")
 
 LOADING_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0f172a;display:flex;align-items:center;justify-content:center;
+body{background:#1b1c1e;display:flex;align-items:center;justify-content:center;
      height:100vh;font-family:-apple-system,'Segoe UI',sans-serif}
 .wrap{text-align:center}
-.spinner{width:38px;height:38px;border:3px solid #1e293b;border-top-color:#22d3ee;
+.spinner{width:38px;height:38px;border:3px solid #2a2c2f;border-top-color:#b79cf0;
          border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.msg{color:#475569;font-size:13px;margin-bottom:6px}
-.sub{color:#334155;font-size:11px;min-height:16px}
+.msg{color:#56585a;font-size:13px;margin-bottom:6px}
+.sub{color:#424446;font-size:11px;min-height:16px}
 </style></head><body>
 <div class="wrap">
   <div class="spinner"></div>
@@ -82,13 +111,13 @@ body{background:#0f172a;display:flex;align-items:center;justify-content:center;
 def error_html(msg):
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#0f172a;display:flex;align-items:center;justify-content:center;
+body{{background:#1b1c1e;display:flex;align-items:center;justify-content:center;
      height:100vh;font-family:-apple-system,'Segoe UI',sans-serif}}
 .wrap{{text-align:center;max-width:420px;padding:24px}}
 .icon{{font-size:32px;margin-bottom:16px}}
-.msg{{color:#f87171;font-size:13px;margin-bottom:8px;font-weight:600}}
-.detail{{color:#475569;font-size:11px;line-height:1.6;margin-bottom:20px}}
-button{{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;
+.msg{{color:#e8837a;font-size:13px;margin-bottom:8px;font-weight:600}}
+.detail{{color:#56585a;font-size:11px;line-height:1.6;margin-bottom:20px}}
+button{{background:#2a2c2f;color:#a3a6a9;border:1px solid #424446;border-radius:6px;
         padding:6px 16px;font-size:12px;cursor:pointer}}
 </style></head><body>
 <div class="wrap">
@@ -170,8 +199,11 @@ def parse_value(v):
     return float(s)
 
 
+EPLEY_MAX_REPS = 10   # Epley extrapolates optimistically past ~10 reps; sets above are scored as 10
+
+
 def epley_1rm(weight, reps):
-    return round(weight * (1 + reps / 30), 1) if reps else weight
+    return round(weight * (1 + min(reps, EPLEY_MAX_REPS) / 30), 1) if reps else weight
 
 
 def rep_normalised(weight, reps, rep_ref=DEFAULT_REP_REF):
@@ -209,11 +241,11 @@ DEFAULT_TIER = "bank"
 
 DEFAULT_BENCHMARKS = {
     "metrics": {
-        "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#a78bfa",
+        "back_squat": {"label": "Back squat (working set)", "target": 100, "unit": "kg", "color": "#88dcfd",
                        "tier": "key", "rep_weighted": True},
-        "row_2k":     {"label": "2k row",                   "target": 420, "unit": "s",  "color": "#f59e0b",
+        "row_2k":     {"label": "2k row",                   "target": 420, "unit": "s",  "color": "#e3b95f",
                        "tier": "goal", "lower_is_better": True},
-        "bodyweight": {"label": "Body weight",              "target": 80,  "unit": "kg", "color": "#94a3b8",
+        "bodyweight": {"label": "Body weight",              "target": 80,  "unit": "kg", "color": "#a3a6a9",
                        "tier": "key"},
     },
 }
@@ -273,7 +305,7 @@ def mutate_metric_config(action, key, fields=None):
             raise ValueError(f"metric '{key}' already exists")
         if action == "update" and key not in metrics:
             raise KeyError(f"unknown metric '{key}'")
-        meta = metrics.setdefault(key, {"color": "#a78bfa", "unit": "", "tier": DEFAULT_TIER})
+        meta = metrics.setdefault(key, {"color": "#88dcfd", "unit": "", "tier": DEFAULT_TIER})
         for f in ("label", "unit", "color", "tier", "notes", "lifetime_date"):
             if f in fields:
                 meta[f] = fields[f]
@@ -303,7 +335,14 @@ def add_metric_entry(entry_dict):
     """Append a new test result to METRICS_FILE."""
     from datetime import date as _date
     data = load_test_metrics()
-    new_entry = {"date": _date.today().isoformat(), "metric": entry_dict["metric"],
+    when = _date.today().isoformat()
+    try:
+        d = entry_dict.get("date")
+        if d and _date.fromisoformat(d) <= _date.today():
+            when = d
+    except ValueError:
+        pass
+    new_entry = {"date": when, "metric": entry_dict["metric"],
                  "value": float(entry_dict["value"])}
     if entry_dict.get("reps"):
         new_entry["reps"] = int(entry_dict["reps"])
@@ -341,7 +380,7 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
                 "pb": meta.get("lifetime"), "pb_date": meta.get("lifetime_date"),
                 "pb_source": "lifetime" if meta.get("lifetime") is not None else None,
                 "unit": unit, "is_time": unit == TIME_UNIT,
-                "color": meta.get("color", "#a78bfa"),
+                "color": meta.get("color", "#88dcfd"),
                 "journey_pct": None, "date": None, "notes": "",
                 "lower": lower,
                 "rep_weighted": bool(meta.get("rep_weighted")),
@@ -441,6 +480,24 @@ def build_metrics_data(entries, metric_targets, weight_history=None):
 
 # ── Food log ─────────────────────────────────────────────────────────────────
 
+def note_age_days(note):
+    return (datetime.now().date() - datetime.strptime(note["ts"][:10], "%Y-%m-%d").date()).days
+
+
+def fresh_notes(notes):
+    """Notes inside the context window. Notes stay "active" until explicitly cleared,
+    so without this a note from months ago is still handed to the model as current
+    context — which is how a June taper ended up being described as today's plan."""
+    out = []
+    for n in notes:
+        try:
+            if note_age_days(n) <= NOTE_CONTEXT_DAYS:
+                out.append(n)
+        except (KeyError, ValueError):
+            out.append(n)   # unparseable timestamp: keep it rather than silently drop
+    return out
+
+
 def load_notes():
     """Notes log: {"active": [{"ts","text"}], "archive": [...]}.
     Active notes feed the LLM prompt and persist until explicitly cleared."""
@@ -500,14 +557,14 @@ def render_notes_html():
 
 # ── Food log & LLM calls — local Qwen via Ollama ────────────────────────────
 
-def _log_ollama_usage(source, duration_ms, parsed_ok):
+def _log_ollama_usage(source, duration_ms, parsed_ok, model=LOCAL_MODEL):
     """Append one line of timing info for a local Ollama call to CLAUDE_USAGE_LOG.
     Best-effort — never raises."""
     try:
         entry = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "source": source,
-            "model": LOCAL_MODEL,
+            "model": model,
             "backend": "ollama",
             "duration_ms": duration_ms,
             "ok": parsed_ok,
@@ -517,6 +574,17 @@ def _log_ollama_usage(source, duration_ms, parsed_ok):
             f.write(json.dumps(entry) + "\n")
     except Exception:
         log.exception("failed to log ollama usage for source=%s", source)
+
+
+# Qwen took over food estimation on this date. Its unedited guesses must not be fed
+# back as "ground truth" for later meals — an apple logged at its per-100 g 52 kcal
+# kept every later apple at 52-70. Only hand corrections and the earlier
+# (Claude-estimated) entries are trusted.
+QWEN_FOOD_SINCE = "2026-08-09"
+
+
+def _trusted_food_entry(day, e):
+    return bool(e.get("edited")) or day < QWEN_FOOD_SINCE
 
 
 def find_similar_food_entries(description, limit=3, days_back=60, min_ratio=0.55):
@@ -538,7 +606,7 @@ def find_similar_food_entries(description, limit=3, days_back=60, min_ratio=0.55
             continue
         for e in entries:
             other = (e.get("description") or "").strip().lower()
-            if not other:
+            if not other or not _trusted_food_entry(day, e):
                 continue
             ratio = difflib.SequenceMatcher(None, desc_norm, other).ratio()
             if ratio >= min_ratio:
@@ -547,19 +615,274 @@ def find_similar_food_entries(description, limit=3, days_back=60, min_ratio=0.55
     return [(day, e) for _, day, e in scored[:limit]]
 
 
+FOOD_EXCLUDED_FILE = os.path.expanduser("~/.local/share/training-brief/food-excluded.json")
+
+
+def load_excluded_days():
+    """Dates the user flagged as not tracked properly. Their entries stay in the log;
+    averages, the calorie chart and the coach just treat the day as missing data."""
+    try:
+        with open(FOOD_EXCLUDED_FILE) as f:
+            d = json.load(f)
+        return set(d) if isinstance(d, list) else set()
+    except (OSError, ValueError):
+        return set()
+
+
+def toggle_excluded_day(day):
+    datetime.strptime(day, "%Y-%m-%d")
+    days = load_excluded_days()
+    days.symmetric_difference_update({day})
+    os.makedirs(os.path.dirname(FOOD_EXCLUDED_FILE), exist_ok=True)
+    tmp = FOOD_EXCLUDED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(days), f)
+    os.replace(tmp, FOOD_EXCLUDED_FILE)
+    return day in days
+
+
+FOOD_PENDING_FILE = os.path.expanduser("~/.local/share/training-brief/food-pending.json")
+FOOD_DRAFT_FILE   = os.path.expanduser("~/.local/share/training-brief/food-draft.txt")
+_pending_lock = threading.Lock()
+
+
+def _load_pending_unlocked():
+    try:
+        with open(FOOD_PENDING_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_pending_unlocked(items):
+    os.makedirs(os.path.dirname(FOOD_PENDING_FILE), exist_ok=True)
+    tmp = FOOD_PENDING_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(items, f)
+    os.replace(tmp, FOOD_PENDING_FILE)
+
+
+def pending_add(item):
+    """Entries are written here the moment they are submitted and only removed once logged
+    (or rejected as not-food), so a restart or crash can never silently drop one."""
+    with _pending_lock:
+        _save_pending_unlocked(_load_pending_unlocked() + [item])
+
+
+def pending_update(item_id, **fields):
+    with _pending_lock:
+        items = _load_pending_unlocked()
+        for it in items:
+            if it.get("id") == item_id:
+                it.update(fields)
+        _save_pending_unlocked(items)
+
+
+def pending_remove(item_id):
+    with _pending_lock:
+        _save_pending_unlocked([i for i in _load_pending_unlocked() if i.get("id") != item_id])
+
+
+def load_pending():
+    with _pending_lock:
+        return _load_pending_unlocked()
+
+
+def save_food_draft(text):
+    """Unsent food-box text, so a page reload or restart does not wipe a dictated entry."""
+    try:
+        os.makedirs(os.path.dirname(FOOD_DRAFT_FILE), exist_ok=True)
+        if text:
+            with open(FOOD_DRAFT_FILE, "w") as f:
+                f.write(text)
+        elif os.path.exists(FOOD_DRAFT_FILE):
+            os.remove(FOOD_DRAFT_FILE)
+    except OSError:
+        log.exception("could not save food draft")
+
+
+def load_food_draft():
+    try:
+        with open(FOOD_DRAFT_FILE) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def save_food_log(log_data):
     os.makedirs(os.path.dirname(FOOD_LOG_FILE), exist_ok=True)
     with open(FOOD_LOG_FILE, "w") as f:
         json.dump(log_data, f, indent=2)
 
 
-def log_food_via_qwen(description):
+# A spoken recap ("so today I've had X followed by Y and I've also had Z") is several
+# meals, but the macro prompt treats its input as ONE meal, so it all landed in a
+# single entry. Meals are split here, deterministically, at the words people use to
+# move from one eating occasion to the next; each piece is then estimated on its own.
+_MEAL_BREAK = re.compile(
+    r"(?:(?<=[.!?])\s+)"                                             # sentence boundary
+    r"|\b(?:followed by|and then|then|later on|later|afterwards|after that|after this"
+    r"|on top of that|i(?:'ve| have) also had|also had)\b"
+    r"|\bafter (?:the|my|a|an|that) [\w' -]{1,30}? i (?:had|ate)\b"
+    r"|(?=\bfor (?:breakfast|brunch|lunch|dinner|tea|supper|pudding|dessert|a snack)\b)",
+    re.I)
+_MEAL_LABEL = re.compile(r"^for (breakfast|brunch|lunch|dinner|tea|supper|pudding|dessert|a snack)\b[,\s]*", re.I)
+_MEAL_TIMES = {"breakfast": "08:30", "brunch": "11:00", "lunch": "13:00", "tea": "18:30",
+               "dinner": "19:00", "supper": "19:00", "pudding": "20:00", "dessert": "20:00"}
+_MEAL_FILLER = re.compile(
+    r"^(?:\s|[,.;:]|\b(?:so|and|also|then|ok(?:ay)?|um+|uh+|er+|right|today|tonight|this "
+    r"(?:morning|afternoon|evening)|i(?:'ve| have)?\s*(?:had|eaten)|i ate|i've got|i've)\b)+", re.I)
+
+
+# Words that carry no food ("just now", "earlier", "ok"): an entry made only of these is
+# a mis-typed time or chatter, and the model will happily invent a food for it.
+_NON_FOOD_WORDS = {
+    "just", "now", "earlier", "today", "tonight", "yesterday", "later", "ok", "okay", "yes",
+    "yeah", "no", "thanks", "thank", "you", "and", "then", "also", "the", "it", "that", "this",
+    "some", "something", "more", "too", "well", "um", "uh", "hi", "hello", "test", "x"}
+
+
+def _stem(w):
+    return w[:-2] if w.endswith("es") and len(w) > 4 else w[:-1] if w.endswith("s") and len(w) > 3 else w
+
+
+# Dishes whose ingredients the model names instead (a "sandwich" comes back as bread).
+_MEAL_NOUNS = {
+    "sandwich", "sarnie", "toastie", "burger", "wrap", "sub", "butty", "bap", "pizza", "curry",
+    "stew", "soup", "salad", "smoothie", "shake", "cereal", "porridge", "meal", "breakfast",
+    "brunch", "lunch", "dinner", "supper", "snack", "takeaway", "fry", "roast", "pie", "pasty",
+    "kebab", "burrito", "taco", "noodles", "stirfry", "sushi", "omelette", "scramble"}
+
+
+def _content_words(text):
+    return [w for w in re.findall(r"[a-z']+", (text or "").lower())
+            if len(w) >= 3 and w not in _NON_FOOD_WORDS]
+
+
+def split_meals(text):
+    """[(description, time or None)] — one per eating occasion. Text that doesn't
+    split (a normal typed entry) comes back as a single meal, unchanged."""
+    out = []
+    for piece in _MEAL_BREAK.split(text or ""):
+        piece = (piece or "").strip()
+        time_hint = None
+        m = _MEAL_LABEL.match(piece)
+        if m:
+            label = m.group(1).lower().replace("a snack", "snack")
+            time_hint = _MEAL_TIMES.get(label)
+            piece = piece[m.end():]
+        piece = _MEAL_FILLER.sub("", piece)
+        piece = re.sub(r"(?:[\s,;]|\band\b)+$", "", piece, flags=re.I).strip(" .")
+        if len(re.sub(r"\W", "", piece)) >= 3:
+            out.append((piece[0].upper() + piece[1:], time_hint))
+    if len(out) <= 1:
+        return [(text.strip(), None)]
+    return out
+
+
+# Per-100 g nutrition for the foods he actually eats (UK CoFID 2021 by food code,
+# USDA / product labels where CoFID has none) plus unit weights — built by
+# build_food_table.py. Qwen's own macro guesses were run-to-run noise (one slice of
+# toast came out at 65 kcal in one run and 260 in the next), so the model now only
+# names each food and its amount; the numbers come from this table.
+FOOD_TABLE_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "food_table.json")
+_FOOD_TABLE_CACHE = {"mtime": None, "table": {}, "alias": {}}
+_FOOD_KEYS = ("calories", "protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g", "sodium_mg")
+
+
+def load_food_table():
+    try:
+        mtime = os.path.getmtime(FOOD_TABLE_FILE)
+    except OSError:
+        return {}, {}
+    if _FOOD_TABLE_CACHE["mtime"] != mtime:
+        with open(FOOD_TABLE_FILE) as f:
+            table = json.load(f)
+        alias = {}
+        for key, food in table.items():
+            for name in [key, *food.get("aliases", [])]:
+                alias.setdefault(name.lower(), key)
+        _FOOD_TABLE_CACHE.update(mtime=mtime, table=table, alias=alias)
+    return _FOOD_TABLE_CACHE["table"], _FOOD_TABLE_CACHE["alias"]
+
+
+def _resolve_table_item(item, table, alias, description=None):
+    """Macros for one model-named item from the table, or None if it isn't a table
+    food (or the amount is implausible), in which case the model's estimate stands."""
+    key = _match_food_key(item, alias)
+    if not key:
+        return None
+    food = table[key]
+    units = food["units"]
+    unit = str(item.get("unit") or food["default_unit"]).strip().lower()
+    if unit not in units:
+        unit = next((u for u in (unit.rstrip("s"), unit.replace("grams", "g"))
+                     if u in units), food["default_unit"])
+    try:
+        amount = float(item.get("amount") or 1)
+    except (TypeError, ValueError):
+        amount = 1.0
+    # A single-serving dish with a "whole" size (a pizza) is eaten whole unless the text says a part:
+    # the model once logged "Hawaiian pizza" as one 50 g slice (136 kcal) when it was the whole thing.
+    if (description and food["default_unit"] == "whole" and "whole" in units and unit != "whole"
+            and not re.search(r"\b(slice|slices|piece|pieces|half|halves|quarter|bit|some|few|bite|bites|share|shared)\b|\d\s*g\b|\bgrams?\b",
+                              description.lower())):
+        unit, amount = "whole", 1.0
+    grams = amount * units[unit]
+    if not 0 < grams <= 3000:
+        return None
+    per = food["per100"]
+    out = {"name": item.get("name") or key, "grams": round(grams),
+           "source": f"table: {key} ({food['source']})"}
+    for k in _FOOD_KEYS:
+        out[k] = round(per["kcal" if k == "calories" else k] * grams / 100, 1)
+    return out
+
+
+def _match_food_key(item, alias):
+    """Table key for a model-named item. The model often writes a near-miss of the
+    key ("back bacon" for "back bacon (grilled)"), and an exact-match miss silently
+    dropped the bacon from a bacon sandwich to 0 kcal, so this also tries the key
+    without its bracketed note, then a close fuzzy match, on both the food and the
+    item's own name."""
+    for raw in (item.get("food"), item.get("name")):
+        text = str(raw or "").strip().lower()
+        if not text or text == "other":
+            continue
+        if text in alias:
+            return alias[text]
+        bare = {re.sub(r"\s*\(.*?\)", "", a): k for a, k in alias.items()}
+        text_bare = re.sub(r"\s*\(.*?\)", "", text)
+        if text_bare in bare:
+            return bare[text_bare]
+        close = difflib.get_close_matches(text_bare, list(bare), n=1, cutoff=0.8)
+        if close:
+            return bare[close[0]]
+    return None
+
+
+def _food_menu(table):
+    return "\n".join(f"  {key}: {', '.join(u for u in food['units'] if u != 'g')}"
+                      for key, food in table.items())
+
+
+def log_food_via_qwen(description, time_hint=None, day=None):
     """Append one meal entry to today's food-log.json using a local Qwen model
     (via Ollama) to estimate macros, with this process doing the actual file
     write and totals — the model only ever returns a JSON snippet, it never
     touches the filesystem. Returns (ok, error_message)."""
+    if not _content_words(description):
+        return False, "That doesn't look like a food — describe what you ate (use the date box for a past day)."
+
     today = datetime.now().strftime("%Y-%m-%d")
-    now_t = datetime.now().strftime("%H:%M")
+    if day and day != today:
+        # Backlog: a past day has no "now", so default to midday unless the meal word
+        # (breakfast/dinner...) or the description says otherwise.
+        now_t = time_hint or "12:00"
+    else:
+        day = today
+        now_t = time_hint or datetime.now().strftime("%H:%M")
 
     similar = find_similar_food_entries(description)
     if similar:
@@ -581,14 +904,32 @@ def log_food_via_qwen(description):
     else:
         reference_block = ""
 
+    table, alias = load_food_table()
+    # Static part first and byte-identical on every call (instructions + the food
+    # list), so Ollama reuses its processed prefix; only the tail below changes.
     prompt = (
-        'Estimate macros for ONE meal and respond with JSON only, no other text.\n\n'
+        'List what was eaten in ONE meal. Respond with JSON only, no other text.\n\n'
         'JSON schema:\n'
-        '{"time": "HH:MM", "items": [{"name": "...", "calories": N, "protein_g": N, '
-        '"carbs_g": N, "fat_g": N, "fiber_g": N, "sugar_g": N, "sodium_mg": N}]}\n\n'
-        f'Use time "{now_t}" unless the description implies otherwise. Split into one '
-        'item per distinct food, and estimate realistic macros with standard nutrition '
-        'knowledge (pasta/rice/oats quantities are dry weight unless said to be cooked).'
+        '{"time": "HH:MM", "items": [{"name": "the food as described", "food": "<exact key '
+        'from FOOD LIST, or other>", "amount": N, "unit": "<one of that food\'s units, or g/ml>", '
+        '"calories": N, "protein_g": N, "carbs_g": N, "fat_g": N}]}\n\n'
+        '- A named dish on the FOOD LIST (pizza, a Hawaiian, a curry) is ONE item: never list its toppings or ingredients separately. '
+        'With no quantity stated, a pizza is one whole pizza (unit "whole"), not a slice.\n'
+        '- One item per distinct food. "X on toast" needs a separate bread item each time it is '
+        'said; a sandwich, toastie or bap has 2 slices of bread (or 1 roll); named cooking fat '
+        '(butter, oil) is its own item.\n'
+        '- food: the closest FOOD LIST key; "other" only when nothing on the list is that food.\n'
+        '- amount + unit: the quantity described. If none is given, amount 1 of the food\'s first '
+        'listed unit. Fractions are amounts: "a third of a packet" = 0.33 packet, "half a tin" = 0.5 '
+        'tin. Pasta/rice/oats in grams are dry weight unless said to be cooked.\n'
+        '- calories/protein_g/carbs_g/fat_g: only needed for "other" foods — your estimate for '
+        'the whole portion eaten, never per 100 g. Use 0 for listed foods.\n\n'
+        'Example: "2 slices of cheddar on sourdough toast" -> items: '
+        '[{"name": "cheddar", "food": "cheddar", "amount": 2, "unit": "slice"}, '
+        '{"name": "sourdough toast", "food": "sourdough", "amount": 1, "unit": "slice"}]\n\n'
+        f'FOOD LIST (key: units):\n{_food_menu(table)}\n\n'
+        '----\n'
+        f'Time: use "{now_t}" unless the description implies otherwise.'
         f'{reference_block}\n\n'
         f'Food description: "{description}"'
     )
@@ -603,7 +944,9 @@ def log_food_via_qwen(description):
                 "format": "json",
                 "stream": False,
             },
-            timeout=90,
+            # Queued in the background, and Ollama serialises requests: behind a dashboard
+            # refresh (tips + insight calls, several minutes on CPU) 90s wasn't enough.
+            timeout=300,
         )
         resp.raise_for_status()
     except requests.RequestException:
@@ -624,16 +967,66 @@ def log_food_via_qwen(description):
         return False, "Failed to log food — try again."
     _log_ollama_usage("food_log", duration_ms, True)
 
+    # The model sometimes invents a food when the text names none (or leaks one from the
+    # similar-meals examples). At least one returned item must be traceable to the words
+    # actually typed; implied extras (the bread in a sandwich) can still ride along.
+    typed_words = _content_words(description)
+    typed = {_stem(w) for w in typed_words}
+    if not (any(_stem(w) in _MEAL_NOUNS or w in _MEAL_NOUNS for w in typed_words)
+            or any(_stem(w) in typed for it in items
+                   for w in _content_words(str(it.get("name", "")) + " " + str(it.get("food", ""))))):
+        log.warning("food log rejected %r: model returned %s", description[:60],
+                    [it.get("name") for it in items])
+        _log_ollama_usage("food_log", duration_ms, False)
+        return False, "Couldn't match any food in that — try describing what you ate."
+
+    # The model sometimes adds an invented catch-all line ("protein shake", 500 kcal) on top of
+    # the ingredients it was asked to itemise, double counting them. Drop such a bucket when
+    # real ingredients are listed alongside it.
+    if len(items) >= 3:
+        kept = [it for it in items
+                if not (str(it.get("food", "")).lower() in ("other", "")
+                        and re.search(r"\b(shake|smoothie|mix|meal|plate|combo|platter)\b", str(it.get("name", "")).lower()))]
+        if kept:
+            items = kept
+
+    # A named dish that is in the food table (a pizza) is ONE item. The model also lists its toppings
+    # ("Hawaiian pizza" -> pizza + pineapple + cheese), which counts them twice; drop those unless "extra" was said.
+    dish_keys = [_match_food_key(it, alias) for it in items]
+    if any(k and k.startswith("pizza") for k in dish_keys) and "extra" not in description.lower():
+        toppings = re.compile(r"\b(pineapple|ham|cheese|mozzarella|tomato|pepperoni|mushrooms?|peppers?|onions?|olives?|sweetcorn|chicken|bacon|sauce)\b", re.I)
+        items = [it for it, k in zip(items, dish_keys) if (k and k.startswith("pizza")) or not toppings.search(str(it.get("name", "")))]
+
+    resolved = []
+    for it in items:
+        row = _resolve_table_item(it, table, alias, description)
+        if row is None:
+            row = {"name": it.get("name") or "food", "source": "qwen estimate",
+                   **{k: it.get(k, 0) or 0 for k in _FOOD_KEYS}}
+        resolved.append(row)
+    items = resolved
+
+    # A sandwich is bread plus filling, and the model forgets the bread (a "pulled lamb
+    # sandwich" once logged as lamb and butter only). Add two slices when none was itemised.
+    if (re.search(r"\b(sandwich|sarnie|toastie|butty)\b", description.lower())
+            and not any(re.search(r"bread|toast|roll|bun|bap|bagel|baguette|pitta|wrap|tortilla|sourdough|panini|ciabatta",
+                                  str(i.get("name", "")).lower()) for i in items)):
+        bread = _resolve_table_item({"name": "bread (2 slices, assumed)", "food": "white bread",
+                                     "amount": 2, "unit": "slice"}, table, alias)
+        if bread:
+            items.append(bread)
+
     entry = {
         "id": str(uuid.uuid4()),
         "time": parsed.get("time") or now_t,
         "description": description,
+        "source": "qwen",
         "items": items,
         **{k: sum(i.get(k, 0) or 0 for i in items)
            for k in ("calories", "protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g", "sodium_mg")},
     }
     log_data = load_food_log()
-    log_data.setdefault(today, []).append(entry)
+    log_data.setdefault(day, []).append(entry)
     save_food_log(log_data)
     log.info("food logged via qwen: %s", description[:80])
     return True, None
@@ -698,12 +1091,17 @@ def render_food_log(food_data):
     logged meals plus the quick-add input. Used only for the initial page
     build — refreshes after a queued entry go through setFoodLogList instead
     so the input row (and whatever the user is typing into it) is untouched."""
+    import html as _html
     return (
         f'<div id="food-log-list">{render_food_log_list(food_data)}</div>'
         '<div class="food-input-row">'
-        '<input type="text" id="food-box" placeholder="Log food… (Enter to add)" '
+        f'<input type="text" id="food-box" value="{_html.escape(load_food_draft(), quote=True)}" placeholder="Log food… (Enter to add)" '
         '''onfocus="warmFoodModel()" '''
         '''onkeydown="if(event.key==='Enter'){event.preventDefault();submitFood();}">'''
+        '<input type="date" id="food-date" title="Backlog: log to this day instead of today (clear for today)" '
+        '''onchange="this.style.borderColor=this.value?'#e3b95f':''"'''
+        ' style="background:#2a2c2f;color:#d4d6d8;border:1px solid #424446;border-radius:5px;padding:4px">'
+        '<button id="food-mic-btn" class="mic-btn" onclick="toggleVoice(\'food\')" title="Speak what you ate">&#127908;</button>'
         '<button id="food-add-btn" onclick="submitFood()">Add</button>'
         '</div>'
         '<div class="food-status" id="food-status" style="display:none"></div>'
@@ -717,6 +1115,7 @@ def render_weekly_food_log(days_back=6):
     instead of only surfacing when the numbers look off."""
     import html as _html
     log_data = load_food_log()
+    excluded_days = load_excluded_days()
     today = datetime.now().date()
     blocks = []
     for i in range(days_back, -1, -1):
@@ -724,6 +1123,7 @@ def render_weekly_food_log(days_back=6):
         day_str = d.strftime("%Y-%m-%d")
         entries = log_data.get(day_str, [])
         total = sum(e.get("calories", 0) for e in entries)
+        excluded = day_str in excluded_days
         if entries:
             rows = "".join(
                 '<div class="week-entry-row">'
@@ -735,13 +1135,17 @@ def render_weekly_food_log(days_back=6):
             )
         else:
             rows = '<div class="food-log-empty">Not logged</div>'
+        if entries and i > 0:
+            rows += (f'<div class="week-day-actions"><button onclick="toggleExcludeDay(&quot;{day_str}&quot;)">'
+                     + ("Count this day again" if excluded else "Don&rsquo;t count this day in averages")
+                     + '</button></div>')
         is_today = i == 0
         label_cls = " is-today" if is_today else ""
         label = "Today" if is_today else d.strftime("%A %d %b")
         blocks.append(
             f'<details class="week-day"{" open" if is_today else ""}>'
             f'<summary><span class="week-day-label{label_cls}">{label}</span>'
-            f'<span class="week-day-total">{total:.0f} kcal</span></summary>'
+            f'<span class="week-day-total">{"not counted · " if excluded else ""}{total:.0f} kcal</span></summary>'
             f'<div class="week-day-entries">{rows}</div>'
             '</details>'
         )
@@ -761,21 +1165,28 @@ def nutrition_data(food_data, ctx):
         "target": round(kcal_total),
         "base": kcal_base, "sessionKcal": session_kcal,
         "paceExpected": round(ctx["expected_so_far"]), "dayFrac": round(ctx["day_frac"], 3),
+        "eatStart": EATING_START_H, "eatEnd": EATING_END_H,
+        "meals": sorted(({
+            "time": e.get("time", ""), "desc": e.get("description") or "",
+            "kcal": round(e.get("calories", 0)), "p": round(e.get("protein_g", 0), 1),
+            "c": round(e.get("carbs_g", 0), 1), "f": round(e.get("fat_g", 0), 1),
+            "items": [i.get("name", "") for i in e.get("items", []) if i.get("name")],
+        } for e in fd.get("entries", [])), key=lambda m: m["time"]),
         "macros": [
-            {"key": "protein", "label": "Protein", "color": "#a78bfa",
+            {"key": "protein", "label": "Protein", "color": "#88dcfd",
              "g": round(fd.get("protein_g", 0), 1), "target": ctx["protein_target_g"],
              "kcalPerG": 4, "kind": "aim"},
-            {"key": "carbs", "label": "Carbs", "color": "#22d3ee",
+            {"key": "carbs", "label": "Carbs", "color": "#b79cf0",
              "g": round(fd.get("carbs_g", 0), 1), "target": ctx["carbs_target_g"],
              "kcalPerG": 4, "kind": "aim"},
-            {"key": "fat", "label": "Fat", "color": "#fbbf24",
+            {"key": "fat", "label": "Fat", "color": "#e3b95f",
              "g": round(fd.get("fat_g", 0), 1), "target": ctx["fat_target_g"],
              "kcalPerG": 9, "kind": "aim"},
-            {"key": "fiber", "label": "Fibre", "color": "#4ade80",
+            {"key": "fiber", "label": "Fibre", "color": "#6fcf97",
              "g": round(fd.get("fiber_g", 0), 1), "target": ctx["fiber_target_g"], "kind": "aim"},
-            {"key": "sugar", "label": "Sugar", "color": "#f472b6",
+            {"key": "sugar", "label": "Sugar", "color": "#88dcfd",
              "g": round(fd.get("sugar_g", 0), 1), "target": ctx["sugar_target_g"], "kind": "limit"},
-            {"key": "sodium", "label": "Sodium", "color": "#fb923c", "unit": "mg",
+            {"key": "sodium", "label": "Sodium", "color": "#e3b95f", "unit": "mg",
              "g": round(fd.get("sodium_mg", 0)), "target": ctx["sodium_target_mg"], "kind": "limit"},
         ],
     }
@@ -814,6 +1225,7 @@ def update_food_entry(entry_id, fields):
         for k in ("time", "description", "calories", "protein_g", "carbs_g", "fat_g"):
             if k in fields:
                 e[k] = fields[k]
+        e["edited"] = True
         e["items"] = [{
             "name": e.get("description") or "meal",
             "calories": e.get("calories", 0), "protein_g": e.get("protein_g", 0),
@@ -844,7 +1256,7 @@ def get_weekly_food_summary():
     for i in range(6, -1, -1):
         d         = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
         day_label = (datetime.now() - timedelta(days=i)).strftime("%A %d %b")
-        entries   = log.get(d, [])
+        entries   = [] if d in load_excluded_days() else log.get(d, [])
         if entries:
             def _entry_foods(e):
                 items = e.get("items", [])
@@ -896,6 +1308,7 @@ def _data_hash(s: str) -> str:
 def get_calorie_history(calorie_base: int, days: int = 14, activities: list = None):
     """Returns (dates, consumed_list, target_list) with per-day training-adjusted targets."""
     log = load_food_log()
+    excluded = load_excluded_days()
     # Build per-day session calorie burn from activities
     session_kcal_by_day: dict = {}
     for a in (activities or []):
@@ -906,7 +1319,7 @@ def get_calorie_history(calorie_base: int, days: int = 14, activities: list = No
     for i in range(days - 1, -1, -1):
         d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
         entries = log.get(d, [])
-        kcal = sum(e.get("calories", 0) for e in entries) if entries else None
+        kcal = sum(e.get("calories", 0) for e in entries) if entries and d not in excluded else None
         dates.append(d)
         consumed.append(round(kcal) if kcal is not None else None)
         targets.append(calorie_base + session_kcal_by_day.get(d, 0))
@@ -962,6 +1375,95 @@ def get_bulk_trend(dates, consumed, targets, surplus_goal: int = 300, window: in
         "today_projected": today_projected,
     }
 
+# ── Voice food logging — recordCLI-style Whisper, then the usual Qwen parse ──
+
+VOICE_MODEL       = "small.en"   # already cached by recordCLI; ~2-4s per clip on CPU
+VOICE_SAMPLERATE  = 16000
+VOICE_MAX_SECONDS = 90           # a forgotten-open mic stops itself
+
+
+class VoiceFoodRecorder:
+    """Mic → faster-whisper transcript for the food box. Same capture and model
+    setup as recordCLI (sounddevice 16 kHz mono float32, int8 CPU Whisper), but a
+    single clip per press rather than a live stream. The transcript goes into the
+    food box rather than straight to the log: a misheard "15g" as "50g" silently
+    skews the day's totals, so it gets a glance before Enter."""
+
+    def __init__(self):
+        self._model = None
+        self._model_lock = threading.Lock()
+        self._chunks = []
+        self._stream = None
+        self._started = 0.0
+
+    def _load_model(self):
+        with self._model_lock:
+            if self._model is None:
+                from faster_whisper import WhisperModel
+                self._model = WhisperModel(VOICE_MODEL, device="cpu", compute_type="int8")
+            return self._model
+
+    @property
+    def recording(self):
+        return self._stream is not None
+
+    def start(self, on_timeout):
+        import sounddevice as sd
+        self._chunks = []
+
+        def cb(indata, frames, t, status):
+            self._chunks.append(indata[:, 0].copy())
+            if time.monotonic() - self._started > VOICE_MAX_SECONDS:
+                GLib.idle_add(lambda: on_timeout() or False)
+
+        self._stream = sd.InputStream(samplerate=VOICE_SAMPLERATE, channels=1,
+                                      dtype="float32", blocksize=1024, callback=cb)
+        self._started = time.monotonic()
+        self._stream.start()
+        # Load Whisper while he's still talking, so stop → text is just the transcribe.
+        threading.Thread(target=self._load_model, daemon=True).start()
+
+    def stop(self):
+        """Stop capture and return the audio; transcribe() is the slow part."""
+        import numpy as np
+        stream, self._stream = self._stream, None
+        if stream:
+            stream.stop()
+            stream.close()
+        return np.concatenate(self._chunks) if self._chunks else np.zeros(0, dtype="float32")
+
+    def transcribe(self, audio, prompt=""):
+        if len(audio) < VOICE_SAMPLERATE // 2:
+            return ""
+        segments, _ = self._load_model().transcribe(
+            audio, beam_size=5, language="en", vad_filter=True,
+            initial_prompt=prompt or None)
+        return " ".join(seg.text.strip() for seg in segments).strip()
+
+
+# Whisper hint for the week planner: the words he plans with, so "3 by 10" and
+# "RDL" come out as written rather than as near-homophones.
+VOICE_PLAN_PROMPT = ("Training plan. Today 60 minute easy bike, tomorrow gym lower, Monday 3x10 "
+                     "erg at threshold, Tuesday easy row, Peloton ride, WaterRower, RDL, hip thrust, "
+                     "squat, 2k pace, rest day.")
+
+
+def _voice_food_prompt():
+    """Whisper's initial_prompt biases it toward vocabulary it has just "heard", so
+    feeding it his recent meal descriptions is the food-log equivalent of recordCLI's
+    glossary: brand names and odd foods he actually eats come out spelled right."""
+    food_log, seen, out = load_food_log(), set(), []
+    for day in sorted(food_log, reverse=True)[:21]:
+        for e in reversed(food_log[day]):
+            d = (e.get("description") or "").strip()
+            if d and d.lower() not in seen:
+                seen.add(d.lower())
+                out.append(d)
+    # Whisper keeps only the last ~224 tokens of the prompt, so stay well inside it.
+    text = "Food log. " + ". ".join(out)
+    return text[:700]
+
+
 def warm_local_model():
     """Best-effort, fire-and-forget: ask Ollama to load LOCAL_MODEL into memory
     (and hold it there for 5min) ahead of an expected call. Sending a /api/generate
@@ -977,15 +1479,17 @@ def warm_local_model():
         pass
 
 
-def _ollama_p(prompt: str, timeout: int = 240, source: str = "unknown") -> str:
-    """Call the local Qwen model (via Ollama) with the given prompt and return the
-    stripped reply text. Logs timing to CLAUDE_USAGE_LOG under `source`."""
+def _ollama_p(prompt: str, timeout: int = 240, source: str = "unknown", model: str = LOCAL_MODEL) -> str:
+    """Call a local Qwen model (via Ollama) with the given prompt and return the
+    stripped reply text. Logs timing to CLAUDE_USAGE_LOG under `source`. Defaults
+    to the 7B model; pass model=LOCAL_MODEL_FAST for long/narrative prompts where
+    7B's generation time is impractical on CPU."""
     t0 = time.monotonic()
     try:
         resp = requests.post(
             OLLAMA_CHAT_URL,
             json={
-                "model": LOCAL_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
             },
@@ -993,11 +1497,11 @@ def _ollama_p(prompt: str, timeout: int = 240, source: str = "unknown") -> str:
         )
         resp.raise_for_status()
     except requests.RequestException as e:
-        _log_ollama_usage(source, int((time.monotonic() - t0) * 1000), False)
+        _log_ollama_usage(source, int((time.monotonic() - t0) * 1000), False, model=model)
         log.error("ollama call failed for source=%s: %s", source, e)
         raise RuntimeError(f"local model call failed: {e}")
     duration_ms = int((time.monotonic() - t0) * 1000)
-    _log_ollama_usage(source, duration_ms, True)
+    _log_ollama_usage(source, duration_ms, True, model=model)
     return resp.json()["message"]["content"].strip()
 
 def _load_cache(path: str) -> dict:
@@ -1013,6 +1517,61 @@ def _save_cache(path: str, data: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f)
+
+
+# The food log is partial by nature (meals get forgotten, days go unlogged). The model used
+# to read gaps as eating failures or lecture about logging; it should treat the log as a
+# limited sample and say so, never police it.
+LOGGING_NOTE = (
+    "ABOUT THE DATA: the food log is an incomplete sample — unlogged days and meals are "
+    "missing data, NOT days or meals Alex skipped. Never criticise, remind or comment on his "
+    "logging habits or on missing entries. Where a conclusion rests on the log, frame it "
+    "briefly as \"based on the limited data we have\" and keep it tentative; never present "
+    "a gap in the log as a gap in his eating.\n\n"
+)
+
+
+# Fruit/veg presence is computed here, not by the model: counting "days with veg" across a
+# week is exactly what the small local model gets wrong (it once claimed a gap on "4 of 7
+# days" when only 2 days were logged and both held berries, beetroot and kale).
+_FRUIT_VEG_WORDS = (
+    "apple", "pear", "banana", "orange", "satsuma", "clementine", "mandarin", "grape", "melon", "mango",
+    "pineapple", "kiwi", "peach", "plum", "cherry", "cherries", "berry", "berries", "blueberr", "raspberr",
+    "blackberr", "strawberr", "lemon", "lime", "fig", "date", "raisin", "avocado", "tomato", "onion", "garlic",
+    "carrot", "beetroot", "kale", "spinach", "cabbage", "broccoli", "cauliflower", "lettuce", "salad", "rocket",
+    "cucumber", "courgette", "pepper", "mushroom", "pea", "sweetcorn", "leek", "celery", "asparagus", "aubergine",
+    "squash", "pumpkin", "sprout", "greens", "veg", "vegetable", "radish", "turnip", "parsnip", "swede", "fennel",
+    "bean", "lentil", "chickpea", "sweet potato")
+_FRUIT_VEG_NOT = ("oil", "juice", "jam", "sauce", "ketchup", "crisps", "peanut", "peanut butter", "chickpea flour",
+                  "bean sprout flour", "pepper steak", "date syrup", "tomato ketchup", "lemon curd", "fig roll")
+
+
+def _is_fruit_veg(name):
+    n = (name or "").lower()
+    return any(w in n for w in _FRUIT_VEG_WORDS) and not any(x in n for x in _FRUIT_VEG_NOT)
+
+
+def fruit_veg_summary(days=7):
+    """(logged_days, [(day, [fruit/veg item names])]) over the last `days`, excluding days
+    flagged as not tracked. A day counts as logged if it has any entries."""
+    log = load_food_log()
+    excluded = load_excluded_days()
+    out = []
+    for i in range(days - 1, -1, -1):
+        d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        entries = log.get(d, [])
+        if not entries or d in excluded:
+            continue
+        names = []
+        for e in entries:
+            for it in e.get("items", []):
+                if _is_fruit_veg(it.get("name")) and it["name"] not in names:
+                    names.append(it["name"])
+        out.append((d, names))
+    return out
+
+
+MIN_DAYS_FOR_PATTERN = 4   # fewer logged days than this and no "consistent gap" can be claimed
 
 
 def get_nutrition_insight():
@@ -1039,13 +1598,28 @@ def get_nutrition_insight():
     if cache.get("hash") == input_hash:
         return cache.get("insight", ""), False
 
+    fv = fruit_veg_summary()
+    if 0 < len(fv) < MIN_DAYS_FOR_PATTERN:
+        with_fv = [(d, n) for d, n in fv if n]
+        items = sorted({x for _, n in with_fv for x in n})
+        text = (f"Based on the limited data we have ({len(fv)} logged day{'s' if len(fv) != 1 else ''} this week), "
+                f"there isn't enough to call any pattern yet. ")
+        if with_fv:
+            text += (f"Fruit or veg showed up on {len(with_fv)} of those {len(fv)} days"
+                     f" ({', '.join(items[:8])}{'…' if len(items) > 8 else ''}).")
+        else:
+            text += "No fruit or veg has shown up in what's been logged so far, which may just reflect what was logged."
+        _save_cache(NUTR_CACHE_FILE, {"hash": input_hash, "insight": text})
+        return text, False
+
     if not logged and today_data["entry_count"] == 0:
-        return "No meals logged this week — log food with `food add` to get nutritional insights.", False
+        return "There isn't enough food data yet this week for an assessment.", False
 
     prompt = (
         "You are a sports nutritionist advising a solo rower targeting a 2k erg from 6:29 to 6:10 "
         "over a year, with a lean mass gain goal of 83→90kg (~300 kcal/day surplus, ~2g protein/kg). "
         "Review the last 7 days of food logs and give an honest, balanced weekly assessment.\n\n"
+        + LOGGING_NOTE +
         "Rules:\n"
         "- Only flag a nutrient or food group as a genuine concern if it is CONSISTENTLY absent or "
         "  underrepresented across MOST days (4+ out of 7) — not just today or one day.\n"
@@ -1057,6 +1631,9 @@ def get_nutrition_insight():
         "if one exists. If there is no clear consistent gap, say so and suggest something to maintain "
         "the current pattern.\n\n"
         f"{time_context}\n{today_str}\n\n"
+        "VERIFIED FACTS (computed, do not contradict): fruit or veg appeared on "
+        f"{sum(1 for _, n in fv if n)} of {len(fv)} logged days"
+        + (" (" + "; ".join(f"{d}: {', '.join(n) or 'none'}" for d, n in fv) + ")") + ".\n\n"
         "Last 7 days:\n" + "\n".join(weekly) + "\n\n"
         "Write exactly 3 sentences. Be specific about which days/foods you are referencing. "
         "No fluff, no generic advice, no greetings, no markdown formatting."
@@ -1106,7 +1683,8 @@ def get_calorie_gap_suggestion(food_data, ctx):
         f"Their full-day target is {round(ctx['kcal_total'])} kcal and they have eaten "
         f"{round(consumed)} kcal so far.\n\n"
         "Suggest ONE realistic meal or snack, with rough quantities, sized to close the "
-        "gap to pace — not the whole remaining day. One sentence, no markdown, no greetings."
+        "gap to pace — not the whole remaining day. One sentence, no markdown, no greetings. "
+        "The log may simply be incomplete, so do not remark on logging."
     )
     try:
         suggestion = _ollama_p(prompt, source="calorie_gap_suggestion")
@@ -1152,6 +1730,15 @@ def fetch_activities(athlete_id, api_key, days=790):
     acts = r.json()
     acts.sort(key=lambda a: a.get("start_date_local") or a.get("start_date") or "")
     return acts
+
+
+def fetch_sport_settings(athlete_id, api_key):
+    """Per-sport HR zones and thresholds. The brief invites heart-rate advice, so
+    without these the model has to invent the very numbers it is being asked to give."""
+    r = requests.get(f"{BASE_URL}/athlete/{athlete_id}/sport-settings",
+                     auth=("API_KEY", api_key), timeout=12)
+    r.raise_for_status()
+    return r.json()
 
 
 # ── Computed series ──────────────────────────────────────────────────────────
@@ -1359,7 +1946,7 @@ def sleep_debt_clearance(current_debt, tau=5, target_hours=8.0, threshold=0.1,
     next_exam_days: if provided, adds a line showing required h/night to clear by that date.
     """
     if current_debt >= -threshold:
-        return "Clear", "no active debt", "#4ade80", "Sleep debt EMA is at or above zero — no recovery needed."
+        return "Clear", "no active debt", "#6fcf97", "Sleep debt EMA is at or above zero — no recovery needed."
 
     decay = math.exp(-1 / tau)
     debt = abs(current_debt)
@@ -1377,7 +1964,7 @@ def sleep_debt_clearance(current_debt, tau=5, target_hours=8.0, threshold=0.1,
     extra_7  = extra_to_clear(7)
     extra_14 = extra_to_clear(14)
 
-    color = "#f87171" if debt > 1.0 else "#fbbf24"
+    color = "#e8837a" if debt > 1.0 else "#e3b95f"
     value_str = f"~{days_at_target} nights at {target_hours:.0f}h"
 
     lines = [
@@ -1407,134 +1994,150 @@ def sleep_debt_clearance(current_debt, tau=5, target_hours=8.0, threshold=0.1,
     return value_str, sub_str, color, tip_str
 
 
-# ── Gemini coach brief ───────────────────────────────────────────────────────
+# ── Coach brief ──────────────────────────────────────────────────────────────
 
-def build_data_text(wellness, activities, training_plan=None, food_data=None, illness=None):
+def _reference_stats(wellness):
+    """Anchors for today's wellness numbers, drawn from his own history.
+
+    A bare "Fitness (CTL): 23" tells the model nothing about whether 23 is good, so
+    it guesses — and it guessed "high" and "a strong foundation" for what is actually
+    his lowest fitness in over a year. Deliberately his own distribution rather than
+    population norms: no invented reference values, and it stays true as he changes.
+
+    Returns {"ctl": {...}, "hrv"/"sleep"/"rhr": {"lo","hi","now","verdict"}} with
+    raw numbers, shared by the deterministic overview and the model's data text.
+    """
     entries = sorted([w for w in wellness if w.get("id")], key=lambda w: w["id"])
-    today   = next((w for w in reversed(entries) if w.get("ctl") or w.get("hrv")), {})
-    recent  = entries[-7:]
+    # Capped at roughly a year. The full history reaches back to when he first
+    # started logging and CTL was still ramping from nothing, which drags the floor
+    # down far enough that a genuine low reads as merely "below usual".
+    entries = entries[-REFERENCE_WINDOW_DAYS:]
+    if len(entries) < 30:
+        return {}
+    out = {}
 
-    ctl = today.get("ctl"); atl = today.get("atl")
-    tsb = round(ctl - atl, 1) if ctl and atl else None
-    hrv = today.get("hrv"); rhr = today.get("restingHR")
-    sleep_score = today.get("sleepScore"); sleep_secs = today.get("sleepSecs")
+    def stats(key, window=None):
+        rows = entries[-window:] if window else entries
+        vals = [w[key] for w in rows if w.get(key)]
+        return vals if len(vals) >= 15 else None
 
-    hrv_vals     = [w.get("hrv") for w in recent if w.get("hrv")]
-    hrv_baseline = sum(hrv_vals[:-1]) / len(hrv_vals[:-1]) if len(hrv_vals) > 1 else None
+    ctl_all = stats("ctl")
+    if ctl_all:
+        now, lo, hi = ctl_all[-1], min(ctl_all), max(ctl_all)
+        med = statistics.median(ctl_all)
+        where = ("the lowest in this whole period" if now <= lo + 0.5 else
+                 "the highest in this whole period" if now >= hi - 0.5 else
+                 "well below usual" if now < med - 3 else
+                 "well above usual" if now > med + 3 else "about usual")
+        out["ctl"] = {"lo": lo, "hi": hi, "med": med, "span": len(ctl_all), "where": where}
 
-    # Sleep-debt EMA (τ=5d, 8h target): negative = in debt, positive = surplus
-    _sd_dates, _sd_vals = compute_sleep_balance(wellness)
-    sleep_debt = _sd_vals[-1] if _sd_vals else None
+    # An explicit band rather than a bare median: given only "90-day median 48" the
+    # model manufactures a range around it (it produced "a normal range of 48 to 70").
+    def band(key, label, higher_is_better):
+        vals = stats(key, 90)
+        if not vals:
+            return
+        q = statistics.quantiles(vals, n=4)
+        lo, hi, now = q[0], q[2], vals[-1]
+        if round(lo) <= round(now) <= round(hi):
+            verdict = "normal"
+        elif (now > hi) == higher_is_better:
+            verdict = "better"
+        else:
+            verdict = "worse"
+        out[label] = {"lo": lo, "hi": hi, "now": now, "verdict": verdict}
 
-    week_start = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("%Y-%m-%d")
-    week_rows  = [a for a in activities if "Row" in a.get("type", "")
-                  and (a.get("start_date_local") or a.get("start_date") or "")[:10] >= week_start]
-    zone_totals = [0] * 7
-    for a in week_rows:
-        for i, t in enumerate((a.get("icu_hr_zone_times") or [])[:7]):
-            zone_totals[i] += t
-    zone_str = "  ".join(f"Z{i+1}:{zone_totals[i]//60}m" for i in range(7) if zone_totals[i] > 60)
+    band("hrv", "hrv", higher_is_better=True)
+    band("sleepScore", "sleep", higher_is_better=True)
+    band("restingHR", "rhr", higher_is_better=False)
+    return out
 
-    def fmt_sleep(s):
-        if not s: return "unknown"
-        h, m = divmod(int(s) // 60, 60)
-        return f"{h}h {m:02d}m"
 
-    lines = [
-        f"Date: {datetime.now().strftime('%A %d %B %Y')}",
-        f"Fitness (CTL): {ctl:.0f}" if ctl else "Fitness (CTL): unknown",
-        f"Fatigue (ATL): {atl:.0f}" if atl else "Fatigue (ATL): unknown",
-        f"Form (TSB): {tsb:+.1f}" if tsb is not None else "Form (TSB): unknown",
-        f"HRV: {int(hrv)}" + (f"  (7-day avg: {hrv_baseline:.0f})" if hrv_baseline else "") if hrv else "HRV: unknown",
-        f"Resting HR: {int(rhr)} bpm" if rhr else "Resting HR: unknown",
-        f"Sleep: {fmt_sleep(sleep_secs)}" + (f", score {int(sleep_score)}" if sleep_score else ""),
-        (f"Sleep debt (EMA τ=5d vs 8h target): {sleep_debt:+.1f}h "
-         f"({'in deficit — prioritise recovery sleep' if sleep_debt < -0.5 else 'surplus' if sleep_debt > 0.5 else 'roughly balanced'})"
-         if sleep_debt is not None else "Sleep debt: unknown"),
-        f"This week zone time: {zone_str}" if zone_str else "This week: no rowing yet",
-        f"Sessions last 14 days: {len(activities)}",
-    ]
+# intervals.icu files rowing under "Other", so that group carries the WaterRower
+# zones. Only the sports he actually trains are rendered; swim settings exist but
+# would just be noise in the prompt.
+_ZONE_GROUPS = (("Rowing / WaterRower", "Other"), ("Cycling", "Ride"), ("Running", "Run"))
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # Sessions already logged in intervals.icu today
-    done_today = [a for a in activities
-                  if (a.get("start_date_local") or a.get("start_date") or "")[:10] == today_str]
-    if done_today:
-        lines.append("\nSessions COMPLETED TODAY (logged in intervals.icu — infer which planned session each matches):")
-        for a in done_today:
-            atype  = a.get("type", "unknown")
-            mins   = int((a.get("elapsed_time") or a.get("moving_time") or 0) / 60)
-            dist_m = a.get("distance") or 0
-            dist   = f"{dist_m/1000:.1f}km" if dist_m > 100 else ""
-            tss    = a.get("icu_training_load") or a.get("training_load") or 0
-            zones  = a.get("icu_hr_zone_times") or []
-            z4plus = int(sum(zones[i] for i in range(3, min(7, len(zones)))) / 60) if zones else 0
-            parts  = [atype]
-            if mins:   parts.append(f"{mins}min")
-            if dist:   parts.append(dist)
-            if tss:    parts.append(f"TSS {tss:.0f}")
-            if z4plus: parts.append(f"{z4plus}min Z4+")
-            lines.append(f"  {' · '.join(parts)}")
-        lines.append("  (Match each completed session to a planned session by type, duration, and intensity.)")
-    else:
-        lines.append("\nNothing logged in intervals.icu yet today.")
+def _hr_zone_lines(sport_settings):
+    """Named HR zones, so heart-rate advice is quoted from his settings rather than
+    guessed. Asking for "pace by heart rate" without these produced a confident
+    "160-170 bpm" for an easy row, when his aerobic band is actually 141-156."""
+    if not sport_settings:
+        return []
+    by_type = {}
+    for ss in sport_settings:
+        for t in ss.get("types") or []:
+            by_type[t] = ss
 
-    sessions       = (training_plan or {}).get("sessions", [])
-    today_planned  = [s for s in sessions if s.get("date", "") == today_str]
-    future_planned = [s for s in sessions if s.get("date", "") > today_str]
+    lines = []
+    for label, key in _ZONE_GROUPS:
+        ss = by_type.get(key)
+        zones, names = ss and ss.get("hr_zones"), ss and ss.get("hr_zone_names")
+        if not zones:
+            continue
+        lthr = ss.get("lthr")
+        bands, low = [], 0
+        for i, top in enumerate(zones):
+            nm = (names[i] if names and i < len(names) else f"Z{i+1}")
+            bands.append(f"{nm} {low}-{top}")
+            low = top + 1
+        detail = f" (LTHR {lthr})" if lthr else ""
+        lines.append(f"  {label}{detail}: " + " · ".join(bands[:5]))
+    if not lines:
+        return []
+    return (["\nHEART-RATE ZONES — if you give a bpm figure it must come from this list, and no "
+             "other. Name the ONE band that fits the session and give its range; never list the "
+             "zones back, and never pair two bands as a single target:"] + lines)
 
-    if today_planned:
-        lines.append("\nToday's planned sessions (cross-reference with completed list above to determine what's still to do):")
-        for s in today_planned:
-            lines.append(f"  \"{s['name']}\"")
 
-    if future_planned:
-        lines.append("\nUpcoming sessions (future days):")
-        by_date = defaultdict(list)
-        for s in future_planned:
-            by_date[s["date"]].append(s)
-        for date in sorted(by_date):
-            day_label = datetime.strptime(date, "%Y-%m-%d").strftime("%A %d %b")
-            for s in by_date[date]:
-                lines.append(f"  {day_label}: \"{s['name']}\"")
-    else:
-        lines.append("\nNo upcoming sessions are scheduled in the training plan. Do NOT invent or assume "
-                     "future sessions — instead ask the athlete what's coming up so it can be planned around.")
+def _key_date_lines(training_plan):
+    """Upcoming fixtures. Without these the model has no horizon to aim advice at —
+    it cannot know a 2k test is three weeks out, so every day reads as open-ended."""
+    today = datetime.now().date()
+    upcoming = []
+    for k in (training_plan or {}).get("key_dates", []):
+        try:
+            d = datetime.strptime(k["date"], "%Y-%m-%d").date()
+        except (KeyError, ValueError):
+            continue
+        if d >= today:
+            upcoming.append(((d - today).days, k.get("label", "?"), k["date"]))
+    if not upcoming:
+        return []
+    upcoming.sort()
+    days, label, date = upcoming[0]
+    # A fixture weeks away still gets treated as imminent: given a strength retest 30
+    # days out, the model called it "next week" and "in just a few days". Past a
+    # fortnight it gets no aiming instruction, only a note that it is not the point.
+    if days > KEY_DATE_HORIZON_DAYS:
+        return [f"\nNo fixture in the next {KEY_DATE_HORIZON_DAYS} days (the next is {label}, "
+                f"{days} days away, too far off to shape today's advice). Aim the advice at "
+                "the current block described at the top instead."]
+    when = "today" if days == 0 else "tomorrow" if days == 1 else f"in {days} days"
+    # Phrased as ordinary prose, not a shouty label: the model quotes these headings
+    # back verbatim ("For your NEXT KEY DATE of the C2 test..."), so the heading has
+    # to be something that still reads naturally if it leaks into the output.
+    return ["\nComing up — aim today's advice at this. Quote the gap exactly as written; "
+            "do not round it into \"a couple of weeks\" or similar:",
+            f"  {label}, {date} ({when})."]
 
-    if illness and illness.today is not None:
-        today_pct     = round(illness.today * 100)
-        yesterday_pct = round(illness.yesterday * 100) if illness.yesterday is not None else today_pct
-        trend = "rising" if illness.today > illness.yesterday + 0.05 else \
-                "falling" if illness.today < illness.yesterday - 0.05 else "stable"
-        level = "elevated — factor this into how hard today's session should be" if illness.today > 0.3 else \
-                "mildly raised — worth a cautious eye" if illness.today > 0.15 else "low"
-        lines.append(f"\nIllness risk (GP+HMM model): {today_pct}% today (was {yesterday_pct}% yesterday, "
-                     f"trend: {trend}, level: {level}).")
-        if illness.today > 0.15 and illness.bands:
-            last = illness.bands[-1]
-            lines.append(f"Last detected illness episode: {last['start']} – {last['end']}.")
 
-    active_notes = load_notes().get("active", [])
-    if active_notes:
-        lines.append("\nRECENT PERSONAL NOTES from the athlete (weight these heavily as current context; "
-                     "most recent last; relative day labels are from today's perspective):")
-        today_date = datetime.now().date()
-        for n in active_notes:
-            day = n["ts"][:10]
-            note_date = datetime.strptime(day, "%Y-%m-%d").date()
-            delta = (today_date - note_date).days
-            if delta == 0:
-                rel = "today"
-            elif delta == 1:
-                rel = "yesterday"
-            else:
-                rel = f"{delta} days ago"
-            day_name = note_date.strftime("%A")
-            lines.append(f"  [{day} {day_name}, {rel}] {n['text']}")
-
-    lines.extend(_benchmark_lines(wellness))
-    return "\n".join(lines)
+def build_tips_context(wellness, training_plan=None, sport_settings=None):
+    """Reference data the tips may draw on beyond the overview: fixtures, HR zones,
+    goals and lifts. No raw wellness numbers — those reach the model only through
+    the verified overview, which is what stops it re-interpreting them."""
+    lines = []
+    notes = fresh_notes(load_notes().get("active", []))
+    if notes:
+        # His own words are the one source of context the numbers can't give (an
+        # injury, a change of plan), so they go to the model as written.
+        lines.append(f"\nPERSONAL NOTES from the athlete, last {NOTE_CONTEXT_DAYS} days (most recent last):")
+        for n in notes:
+            d = note_age_days(n)
+            lines.append(f"  [{'today' if d == 0 else 'yesterday' if d == 1 else f'{d} days ago'}] {n['text']}")
+    return "\n".join(lines + _key_date_lines(training_plan) + _hr_zone_lines(sport_settings)
+                     + _benchmark_lines(wellness))
 
 
 def _benchmark_lines(wellness):
@@ -1592,165 +2195,755 @@ def _benchmark_lines(wellness):
     return out
 
 
-def get_training_summary(data_text):
-    """Returns ({"overview": ..., "tips": ...}, is_stale)."""
-    input_hash = _data_hash(data_text)
+# The coach brief is split by what a small local model can be trusted with. The
+# OVERVIEW is pure fact — training state, readiness numbers, what's left today — and
+# every attempt to have a 3B model write it from the numbers produced confident
+# inversions (it read 15 sessions in 14 days as "three days without training", and
+# rising Fitness as "dropped"), however the prompt was worded. So the overview is
+# composed here in Python from computed facts and cannot contradict the data. The
+# model only writes the TIPS, from those already-interpreted facts rather than raw
+# numbers, and its output is checked against them on the way out (_verify_tips).
+#
+# Deliberately *not* restated in COACH_ROLE: goals, PBs, bodyweight, current lifts.
+# Those all arrive in the data from benchmarks.json, and the old hardcoded copy
+# silently went stale and contradicted the live numbers.
+COACH_ROLE = (
+    "You are Alex's rowing coach. He trains solo — no squad, no coach in the room — on a "
+    "WaterRower at home plus a nearby gym. No longer rowing full time, he is chasing a faster 2k "
+    "erg through more force production rather than more erg volume.\n"
+    "Current block (late Sep–late Oct 2026): a full rebuild after proper time off this summer — "
+    "strength first (squat, RDL, hip thrust, three gym sessions a week) with plenty of easy "
+    "aerobic work with some threshold erg pieces, and gaining 5+ kg of bodyweight, so eating in a "
+    "surplus matters. He plans his sessions week by week.\n"
+    "LIFTING IS THE PRIORITY. Everything else is structured around it: never advise cutting, "
+    "shortening or lightening a lift to fit aerobic work in. If recovery is short, the aerobic "
+    "volume is what gives. Lift first on double days; aerobic work next to leg days stays easy "
+    "and on the bike or rower rather than running.\n"
+    "Food and wellness logs are partial samples: never criticise or remark on his logging, and "
+    "when a point rests on them say \"based on the limited data we have\".\n"
+)
+
+TIPS_TASK = (
+    "Write the COACHING TIPS paragraph of today's brief.\n\n"
+    "The SITUATION paragraph above is already verified and correct — it is the whole truth "
+    "about his recent training and readiness. Build on it; do not restate it, and never "
+    "describe his training state, Fitness trend, or recovery any differently from how it is "
+    "written there.\n\n"
+    "Give exactly two pieces of advice for the next day or two. If a TODAY'S CALL is given, both "
+    "must carry it out; otherwise aim them at the event named under \"Coming up\". Do not recount "
+    "past sessions — the situation paragraph already does. For each, say what to do AND why it works — the reasoning is "
+    "the point. Draw on whichever fit: sharpening versus resting before a test, pacing the "
+    "WaterRower by heart rate because it is not a Concept2, 2k test pacing and warm-up, squat "
+    "depth when the glutes are the limiter, hip thrust and RDL progression, when to deload, "
+    "fuelling for the session type, and backing off when illness risk or sleep debt is flagged.\n"
+    "Any bpm figure must be one band from the HEART-RATE ZONES list, quoted exactly. Do not "
+    "quote any other number that is not in the data above.\n"
+    "Never write \"sleep more\", \"stay hydrated\", \"listen to your body\", \"rest is "
+    "important\", or anything equally true on any other day.\n\n"
+    "Format: exactly 4 sentences, one paragraph of plain prose, addressing him as \"you\". "
+    "No heading, no greeting, no markdown, no bullet points, no TSS or load numbers."
+)
+
+
+PLAN_PROMPT_SENTENCE = ("Nothing is on the plan from here, so tell me what you have coming up — "
+                        "type your week into the Plan box and I'll build around it.")
+
+
+def _coach_prompt(data_text, task):
+    return (f"{COACH_ROLE}\n===== TODAY'S DATA =====\n{data_text}\n"
+            f"===== END DATA =====\n\n{task}")
+
+
+# Sentence terminator. The trailing lookahead is what makes this decimal-safe: the
+# "." in "+18.5" is followed by a digit, never by whitespace or end-of-string, so
+# numbers like TSB and split times can't be mistaken for the end of a sentence.
+_SENTENCE_END = re.compile(r'[.!?]+(?=\s|$)')
+
+
+# Platitudes the prompt bans but a 3B model still emits: negative instructions are
+# weak at this size, so the ban is enforced here by dropping the offending sentence
+# outright rather than trusting the model to have obeyed.
+_PLATITUDES = re.compile(
+    r'\b(?:stay(?:ing)? |monitor(?:ing)? your )?hydrat|\bdrink (?:more|plenty|enough)\b'
+    r'|\bsleep more\b|\bget (?:more|enough|adequate|plenty of) (?:sleep|rest)\b'
+    r'|\blisten to your body\b|\brest is (?:important|key|crucial|essential)\b'
+    r'|\bstay consistent\b(?!\s+(?:by|with|through))|\beat(?:ing)? (?:well|healthily)\b',
+    re.IGNORECASE)
+
+
+def _split_sentences(text):
+    out, start = [], 0
+    for m in _SENTENCE_END.finditer(text):
+        out.append(text[start:m.end()].strip())
+        start = m.end()
+    if text[start:].strip():
+        out.append(text[start:].strip())
+    return out
+
+
+def _clean_section(text, max_sentences, drop_platitudes=False):
+    """Strip the markdown scaffolding the model adds despite being told not to,
+    and hard-cap the sentence count so a runaway section can't flood the card."""
+    text = re.sub(r'^\s{0,3}#{1,6}\s*.*$', '', text, flags=re.MULTILINE)   # ### HEADERS
+    text = re.sub(r'^\s*(?:[-*•]|\d+[.)])\s+', '', text, flags=re.MULTILINE)  # bullets
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)                            # bold
+    text = re.sub(r'(?<!\w)[*_](.+?)[*_](?!\w)', r'\1', text)                # italics
+    text = re.sub(r'\s*\n\s*', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+
+    sentences = _split_sentences(text)
+    if drop_platitudes:
+        kept = [s for s in sentences if not _PLATITUDES.search(s)]
+        if len(kept) < len(sentences):
+            log.info("coach brief: dropped %d platitude sentence(s)", len(sentences) - len(kept))
+        # If it was platitudes all the way down there is nothing worth salvaging;
+        # an empty tips section is handled by the caller and beats printing filler.
+        sentences = kept
+    return " ".join(sentences[:max_sentences]).strip()
+
+
+_ACTIVITY_NOUNS = {
+    "Run": "run", "VirtualRun": "run", "Ride": "ride", "VirtualRide": "ride",
+    "Rowing": "row", "VirtualRow": "row", "WeightTraining": "weights session",
+    "Walk": "walk", "Hike": "hike", "Swim": "swim", "Workout": "workout",
+}
+
+
+def _activity_day(a):
+    return (a.get("start_date_local") or a.get("start_date") or "")[:10]
+
+
+def _describe_activity(a):
+    """"a 59-min run (10.7 km)" — short enough to sit inside a sentence."""
+    noun = _ACTIVITY_NOUNS.get(a.get("type", ""), (a.get("type") or "session").lower())
+    mins = int((a.get("moving_time") or a.get("elapsed_time") or 0) / 60)
+    dist = a.get("distance") or 0
+    s = f"a {mins}-min {noun}" if mins else f"a {noun}"
+    if dist > 100 and noun not in ("weights session",):
+        s += f" ({dist/1000:.1f} km)"
+    return s
+
+
+def _form_phrase(tsb):
+    """intervals.icu's own Form bands, so the wording matches what the chart shows."""
+    if tsb < -30:
+        return "deep in fatigue — the high-risk band"
+    if tsb < -10:
+        return "carrying training fatigue (the productive-training band)"
+    if tsb <= 5:
+        return "in the neutral grey zone, neither fresh nor heavily loaded"
+    if tsb <= 25:
+        return "fresh"
+    return "very fresh — long enough off that fitness is starting to fade"
+
+
+def build_brief_facts(wellness, activities, training_plan=None, illness=None):
+    """Everything the overview states, computed once. Each field is either a number
+    straight from intervals.icu or a verdict derived by fixed rules — never by a model."""
+    entries = sorted([w for w in wellness if w.get("id")], key=lambda w: w["id"])
+    today_w = next((w for w in reversed(entries) if w.get("ctl") or w.get("hrv")), {})
+    now     = datetime.now()
+    today   = now.date()
+    today_s = now.strftime("%Y-%m-%d")
+
+    f = {"ctl": today_w.get("ctl"), "atl": today_w.get("atl"),
+         "hrv": today_w.get("hrv"), "rhr": today_w.get("restingHR"),
+         "sleep_score": today_w.get("sleepScore"), "ref": _reference_stats(wellness)}
+    f["tsb"] = round(f["ctl"] - f["atl"], 1) if f["ctl"] and f["atl"] else None
+
+    hrv_vals = [w.get("hrv") for w in entries[-7:] if w.get("hrv")]
+    f["hrv_avg"] = statistics.mean(hrv_vals[:-1]) if len(hrv_vals) > 1 else None
+
+    ctl_series = [w["ctl"] for w in entries if w.get("ctl")]
+    if len(ctl_series) > 14:
+        then, cur = ctl_series[-15], ctl_series[-1]
+        f["ctl_then"] = then
+        f["ctl_trend"] = "falling" if cur < then - 1 else "rising" if cur > then + 1 else "flat"
+
+    _, sd = compute_sleep_balance(wellness)
+    f["sleep_debt"] = sd[-1] if sd else None
+
+    if illness is not None and getattr(illness, "today", None) is not None:
+        f["illness_pct"] = round(illness.today * 100)
+
+    past = []
+    for a in activities:
+        d = _activity_day(a)
+        if not d:
+            continue
+        age = (today - datetime.strptime(d, "%Y-%m-%d").date()).days
+        if age >= 0:
+            past.append((age, a))
+    past.sort(key=lambda t: t[0])
+    f["done_today"] = [a for g, a in past if g == 0]
+    before_today    = [(g, a) for g, a in past if g > 0]
+    f["n14"]        = sum(1 for g, _ in past if g <= 14)
+    if before_today:
+        gap = before_today[0][0]
+        last_day = [a for g, a in before_today if g == gap]
+        f["gap"] = gap
+        # The longest session that day stands for it; a 1-min warm-up ride doesn't.
+        f["last_session"] = max(last_day, key=lambda a: a.get("moving_time") or 0)
+    else:
+        f["gap"] = None
+
+    weeks = [0.0, 0.0]
+    for g, a in past:
+        if g < 14:
+            weeks[1 - g // 7] += a.get("icu_training_load") or a.get("training_load") or 0
+    f["load_prev"], f["load_this"] = weeks
+
+    sessions = (training_plan or {}).get("sessions", [])
+    today_sessions     = [s for s in sessions if s.get("date") == today_s]
+    f["planned_today"] = [s.get("name", "session") for s in today_sessions]
+    f["planned_kinds"] = [_session_kind(s) for s in today_sessions]
+    tomorrow_s         = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    f["lower_tomorrow"] = any(_is_lower(s) for s in sessions if s.get("date") == tomorrow_s)
+    f["planned_ahead"] = any(today_s < s.get("date", "") <= (now + timedelta(days=14)).strftime("%Y-%m-%d")
+                             for s in sessions)
+
+    f["next_key"] = None
+    for k in sorted((training_plan or {}).get("key_dates", []), key=lambda k: k.get("date", "")):
+        try:
+            d = datetime.strptime(k["date"], "%Y-%m-%d").date()
+        except (KeyError, ValueError):
+            continue
+        if d >= today:
+            f["next_key"] = {"label": k.get("label", "key date"), "days": (d - today).days,
+                             "date": d}
+            break
+    return f
+
+
+def render_overview(f):
+    """The OVERVIEW paragraph, three sentences, composed from build_brief_facts()."""
+    out = []
+
+    # 1. Training state — the frame every later number is read through.
+    if f["gap"] is None and not f["done_today"]:
+        s1 = "Nothing is logged in intervals.icu for the last six weeks"
+    elif f["n14"] == 0:
+        s1 = f"Your last logged session was {f['gap']} days ago"
+    else:
+        when = ("today" if f["gap"] is None else "yesterday" if f["gap"] == 1
+                else f"{f['gap']} days ago")
+        last = f["done_today"][0] if f["gap"] is None else f["last_session"]
+        s1 = (f"You've logged {f['n14']} session{'s' if f['n14'] != 1 else ''} in the last "
+              f"14 days, most recently {_describe_activity(last)} {when}")
+        if f["gap"] is not None and f["gap"] >= 4:
+            s1 += f" — a {f['gap']}-day gap, so ease back in rather than picking up where you left off"
+        prev, this = f["load_prev"], f["load_this"]
+        if prev > 0 and this >= 1.8 * prev:
+            s1 += ", with this past week's load roughly double the week before"
+        elif prev > 0 and this >= 1.25 * prev:
+            s1 += ", with load up on the week before"
+        elif prev > 0 and this <= 0.6 * prev:
+            s1 += ", with load well down on the week before"
+    if f["ctl"]:
+        trend = f.get("ctl_trend")
+        s1 += f". Fitness is {f['ctl']:.0f}"
+        if trend:
+            s1 += (f" and {trend} ({f['ctl_then']:.0f} two weeks ago)" if trend != "flat"
+                   else " and flat over two weeks")
+        ref = f["ref"].get("ctl")
+        if ref and ref["where"] != "about usual":
+            s1 += f", {ref['where']} for the past year (median {ref['med']:.0f})"
+    out.append(s1 + ".")
+
+    # 2. Readiness — each figure judged only against its own band.
+    if f["tsb"] is not None:
+        s2 = f"Form is {f['tsb']:+.1f}, so you're {_form_phrase(f['tsb'])}"
+        normal, flagged = [], []
+        labels = {"hrv": "HRV", "rhr": "resting HR", "sleep": "sleep score"}
+        values = {"hrv": f["hrv"], "rhr": f["rhr"], "sleep": f["sleep_score"]}
+        for key in ("hrv", "rhr", "sleep"):
+            b, v = f["ref"].get(key), values[key]
+            if not v:
+                continue
+            txt = f"{labels[key]} {v:.0f}"
+            if key == "hrv" and f["hrv_avg"]:
+                txt += f" (7-day avg {f['hrv_avg']:.0f})"
+            if not b or b["verdict"] == "normal":
+                normal.append(txt)
+            else:
+                flagged.append(f"{txt} is {b['verdict']} than your usual {b['lo']:.0f}-{b['hi']:.0f}")
+        if normal:
+            s2 += "; " + _join_list(normal) + (" are" if len(normal) > 1 else " is") + " within your normal range"
+        if flagged:
+            s2 += ", but " + _join_list(flagged)
+        if f.get("sleep_debt") is not None and f["sleep_debt"] < -1:
+            s2 += f", and you're carrying {abs(f['sleep_debt']):.1f}h of sleep debt"
+        if f.get("illness_pct") is not None and f["illness_pct"] > 15:
+            s2 += f", and illness risk is {'elevated' if f['illness_pct'] > 30 else 'mildly raised'} at {f['illness_pct']}%"
+        out.append(s2 + ".")
+
+    # 3. Today and what's next.
+    if f["done_today"]:
+        s3 = "Today you've already done " + _join_list([_describe_activity(a) for a in f["done_today"]])
+    else:
+        s3 = "Nothing is logged yet today"
+    if f["planned_today"]:
+        s3 += "; on the plan: " + _join_list(f"\"{n}\"" for n in f["planned_today"])
+    elif not f["planned_ahead"]:
+        s3 += " and nothing is planned for the next two weeks"
+    k = f["next_key"]
+    if k:
+        when = ("today" if k["days"] == 0 else "tomorrow" if k["days"] == 1
+                else f"in {k['days']} days ({k['date'].strftime('%A')})")
+        # Labels look like "C2 test – target 6:25"; the target reads better bracketed.
+        head, _, tail = k["label"].partition(" – ")
+        s3 += f", with the {head}{f' ({tail})' if tail else ''} {when}"
+    out.append(s3 + ".")
+    return " ".join(out)
+
+
+def _join_list(items):
+    items = list(items)
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+_NUM = re.compile(r"\d+(?:[.:]\d+)?")
+_RANGE = re.compile(r"\b(\d{2,3})\s*(?:-|–|to)\s*(\d{2,3})\b")
+
+# Claims about his training state that the tips must not make unless the facts say
+# so — the exact inversions the model produced when it wrote the overview itself.
+_LAYOFF_CLAIM = re.compile(
+    r"\blay-?off\b|\btime off\b|\bbreak from\b|\bdetrain|\bhaven'?t (?:been )?(?:train|logged|done)"
+    r"|\bno (?:recent )?(?:training|sessions)\b|\b(?:getting|coming) back\b|\breturn(?:ing)? to training\b"
+    r"|\bafter (?:a|your|the) (?:break|gap|pause)\b|\brest period\b", re.I)
+# The overview already recounts what he did; when the tips do it too they garble it
+# (a 59-min run became "your rowing session at the WaterRower"), so recaps are dropped.
+_RECAP_CLAIM = re.compile(
+    r"\byesterday\b|\blast (?:session|run|row|ride)\b|\byou(?:'ve| have) (?:completed|hit|done|logged|had)\b"
+    r"|\byour recent (?:run|row|ride|session|rowing)", re.I)
+# Benchmarks (e.g. the 30R20 row test) are in the data as history, and the model reads
+# them as fixtures ("for the upcoming 30R20 row test"). Test/race talk needs a real one.
+_HR_TALK = re.compile(r"\bbpm\b|\bheart|\bHR\b|\bzone\b|\bband\b", re.I)
+# A sentence leaning on the one before ("This approach…") is dropped with it, or the
+# tips read as a reply to something that isn't there.
+_ANAPHORA = re.compile(r"^(?:this|these|that|those|it|doing so|by doing (?:this|so)|such)\b", re.I)
+_FIXTURE_TALK = re.compile(r"\b(?:test|retest|race|competition|time trial)\b", re.I)
+_SOON_CLAIM = re.compile(
+    r"\b(?:next week|this week|(?:a )?few days|couple of days|approaching|looming|imminent|upcoming (?:test|retest))\b", re.I)
+_FITNESS_DOWN = re.compile(r"fitness\b[^.]{0,25}\b(?:dropp|declin|fall|fell|decreas|slipp)", re.I)
+_FITNESS_UP   = re.compile(r"fitness\b[^.]{0,25}\b(?:improv|rising|rose|increas|climb)", re.I)
+
+
+def _verify_tips(tips, facts, context):
+    """Drop tip sentences that contradict the facts or quote a number the data
+    doesn't contain. Sentence-level, so one bad claim costs one sentence, not the tips."""
+    allowed = set(_NUM.findall(context))
+    # Both ends of a real zone appear in the data individually, so a stitched-together
+    # "181-186 bpm" would pass the number check; ranges must match a band exactly.
+    bands = set(_RANGE.findall(context))
+    k = facts["next_key"]
+    kept, dropped_prev = [], False
+    for sent in _split_sentences(tips):
+        # It re-derives the test's timing and gets it wrong ("the C2 test tomorrow" when
+        # it is two days out); the gap is known exactly, so it is corrected, not dropped.
+        if k and k["days"] != 1:
+            sent = re.sub(r"\btomorrow\b", "today" if k["days"] == 0 else f"in {k['days']} days", sent)
+        why = None
+        if facts["n14"] and (facts["gap"] is None or facts["gap"] <= 3) and _LAYOFF_CLAIM.search(sent):
+            why = "layoff claim while training"
+        elif _HR_TALK.search(sent) and any(r not in bands for r in _RANGE.findall(sent)):
+            why = "range not a real HR band"
+        elif (not k or k["days"] > KEY_DATE_HORIZON_DAYS) and _FIXTURE_TALK.search(sent):
+            why = "talks about a test/race when none is scheduled"
+        elif (not k or k["days"] > 7) and _SOON_CLAIM.search(sent):
+            why = "claims a fixture is imminent"
+        elif _RECAP_CLAIM.search(sent):
+            why = "recaps past training"
+        elif facts.get("ctl_trend") == "rising" and _FITNESS_DOWN.search(sent):
+            why = "says fitness falling"
+        elif facts.get("ctl_trend") == "falling" and _FITNESS_UP.search(sent):
+            why = "says fitness rising"
+        else:
+            # Small bare integers are ordinary advice ("3 x 10 min", "2 days out").
+            bad = [n for n in _NUM.findall(sent)
+                   if n not in allowed and not (n.isdigit() and int(n) <= 12)]
+            if bad:
+                why = f"unsupported numbers {bad}"
+        if not why and dropped_prev and _ANAPHORA.search(sent):
+            why = "leans on a dropped sentence"
+        dropped_prev = bool(why)
+        if why:
+            log.info("coach tips: dropped sentence (%s): %s", why, sent)
+        else:
+            kept.append(sent)
+    return " ".join(kept)
+
+
+def _session_kind(s):
+    """Planner sessions carry their kind; older hand-written ones are inferred."""
+    if s.get("kind"):
+        return s["kind"]
+    name = s.get("name", "")
+    if _MOBILITY_WORDS.search(name):
+        return "mobility"
+    if _STRENGTH_WORDS.search(name):
+        return "strength"
+    if (s.get("z4_mins") or 0) > 0:
+        return "threshold"
+    return "easy" if re.search(r"\beasy\b|\blong\b", name, re.I) else None
+
+
+_KIND_CALLS = {
+    "recovery": ("Today's planned session is a recovery hour: stay in the Recovery band for its sport "
+                 "throughout — deliberately easier than a normal easy session, to relax and absorb the "
+                 "week's load, not to train."),
+    "easy": ("Today's planned session is easy: hold the Aerobic band for its sport the whole way. "
+             "The point is aerobic volume that adds no fatigue, so no pushing the pace."),
+    "steady": ("Today's planned session is steady (UT1-type): controlled and even, up to the top of "
+               "the Tempo band for its sport, not drifting into SubThreshold."),
+    "threshold": ("Today's planned session is threshold intervals: the work reps in the "
+                  "SubThreshold band, even-paced from first rep to last, easy between reps."),
+    "vo2max": "Today's planned session is short hard intervals: full effort on the reps, full recovery between.",
+    "strength": ("Today's planned session is strength: quality reps with full depth and control, "
+                 "progressing load only when every rep is clean."),
+}
+
+
+def _todays_call(f):
+    """What kind of day today should be, decided by fixed rules. Left to the model,
+    the call itself went wrong (it prescribed a SuperThreshold row two days before a
+    2k test), so the model is only asked to explain and flesh out this decision."""
+    k = f["next_key"]
+    if f.get("illness_pct") is not None and f["illness_pct"] > 30:
+        return ("Keep today easy or take it off: illness risk is elevated, and training hard "
+                "into an oncoming illness costs more days than it gains.")
+    if k and k["days"] == 0:
+        return (f"Today is the {k['label']}: a thorough warm-up with a few short bursts at test "
+                "pace, then execute the test with an even-paced plan.")
+    if k and k["days"] <= 3:
+        return (f"Ease off for the {k['label']} in {k['days']} day{'s' if k['days'] != 1 else ''}: "
+                "only short, easy sessions in the Aerobic band, optionally with a few short "
+                "sharp efforts to stay primed. No hard, long, or heavy-lifting sessions "
+                "until after it.")
+    if f["gap"] is not None and f["gap"] >= 4:
+        return ("Restart gently: one easy Aerobic-band session today, building back over the "
+                "week rather than jumping straight into hard work.")
+    # Otherwise the day is whatever he planned — the tips explain how to do it well
+    # (left free, the model put a planned easy ride in Tempo).
+    calls = [_KIND_CALLS[k] for k in dict.fromkeys(f.get("planned_kinds") or []) if k in _KIND_CALLS]
+    kinds = set(f.get("planned_kinds") or [])
+    if "strength" in kinds and kinds - {"strength", "rest"}:
+        calls.append("Lift first, while fresh; the other session comes after, ideally 6+ hours "
+                     "later, and never at the expense of the lift.")
+    if f.get("lower_tomorrow"):
+        calls.append("Tomorrow is a lower-body lift, which takes priority: keep today easy on the "
+                     "bike or rower, no running and nothing hard, so your legs arrive fresh.")
+    # He is deliberately building through the high-risk band to get back to ~50
+    # Fitness, so a deep Form doesn't cancel the planned day; it makes recovery the
+    # thing to get right around it.
+    if f["tsb"] is not None and f["tsb"] < -30:
+        calls.append("Form is in the high-risk band by design this block, so recovery is the "
+                     "priority around the session: keep easy work truly easy, eat in surplus with "
+                     "carbs around training, and protect sleep.")
+    return " ".join(calls) or None
+
+
+def get_training_summary(facts, tips_context):
+    """Returns ({"overview": ..., "tips": ...}, is_stale).
+
+    `facts` is build_brief_facts(); `tips_context` is the reference data (zones,
+    key dates, benchmarks) the tips may draw on beyond the overview itself."""
+    overview   = render_overview(facts)
+    context    = f"SITUATION (verified):\n{overview}\n{tips_context}"
+    call       = _todays_call(facts)
+    if call:
+        context += ("\n\nTODAY'S CALL (already decided — your advice must follow it, explain "
+                    f"why it is right, and add how to do it well; never contradict it):\n  {call}")
+    input_hash = _data_hash(context)
     cache      = _load_cache(CACHE_FILE)
     if cache.get("hash") == input_hash and cache.get("overview"):
         return {"overview": cache["overview"], "tips": cache.get("tips", "")}, False
 
-    prompt = (
-        "You are an experienced rowing coach writing a personalised daily brief for a post-graduation rower "
-        "training solo (no squad) with a WaterRower at home and a nearby gym.\n\n"
-
-        "ATHLETE CONTEXT: Alex has just graduated from Cambridge, bladed at May Bumps 2026, and is targeting "
-        "a 2k erg improvement from 6:29 to 6:10 (376W → 437W, +61W) by June 2027 to make a good university "
-        "crew if starting a PhD. Current squat ~90kg (glute-limited at depth), RDL ~100kg+, bodyweight 83kg "
-        "targeting 90kg. Training plan phases: Phase 1 Jul–Sep (glute fix + base, target 6:25), "
-        "Phase 2 Oct–Jan (strength build + threshold, target 6:18), "
-        "Phase 3 Feb–Apr (VO2max intervals, target 6:12), Phase 4 May–Jun (race-specific, target 6:10). "
-        "Secondary goals: two half marathons (Feb and Apr/May) and a cycling sportive (Sep/Oct). "
-        "No squad structure — self-accountability is important; the brief should reinforce consistency.\n\n"
-
-        "Write TWO separate sections. Separate them with exactly the line: ---TIPS---\n\n"
-
-        "SECTION 1 — OVERVIEW (3–4 sentences, plain factual prose):\n"
-        "  • Readiness read from the specific numbers (TSB, HRV vs 7-day baseline, sleep score, "
-        "    sleep-debt EMA, and illness risk — call out elevated illness risk or a significant sleep deficit if present), "
-        "    and what that combination means for how hard today should be.\n"
-        "  • What's been done today and what's still to do — infer completed sessions from "
-        "    the logged activity metrics (type/duration/distance/Z4+ time); report actual logged "
-        "    distance/duration, not the planned session name distance.\n"
-        "  • If NO upcoming sessions are scheduled, do not assume any — instead ask the athlete directly what "
-        "    sessions are coming up (mention they can type it into the Notes box below and you'll plan around it). "
-        "    If sessions ARE scheduled, briefly orient them to what's ahead.\n\n"
-
-        "SECTION 2 — TIPS (3–5 sentences, genuinely useful and specific):\n"
-        "  Give advice that a knowledgeable coach would give, tailored to today's actual context and phase of "
-        "  the plan. Develop the reasoning — say why, not just what. "
-        "  Must NOT be 'sleep more', 'stay hydrated', or any other generic wellness platitude. "
-        "  Draw on the most relevant angles from: fuelling for the specific session type (gym vs threshold vs VO2max), "
-        "  strength progression cues (squat depth, hip thrust loading, when to deload), "
-        "  pacing the WaterRower by HR rather than pace since it's not a C2, "
-        "  threshold and VO2max execution cues, running economy for HM prep, "
-        "  how to manage fatigue without a squad keeping you accountable, "
-        "  managing training load when illness risk is elevated or sleep debt is high, "
-        "  acting on anything raised in the athlete's recent personal notes, "
-        "  or anything else specific and useful given today's data and plan phase.\n\n"
-
-        "Hard rules: no TSS/load numbers. No bullet points, no headers, no greetings, no markdown. "
-        "Each section plain prose. Overview ≤90 words, Tips ≤140 words.\n\n"
-        + data_text
-    )
-    text = _ollama_p(prompt, source="training_summary")
-    if not text.strip():
-        raise RuntimeError("local model returned empty output")
-    if "---TIPS---" in text:
-        overview, tips = text.split("---TIPS---", 1)
-        overview = overview.strip(); tips = tips.strip()
-    else:
-        # Model didn't emit the separator — degrade loudly, don't blank the tips.
-        log.warning("coach brief missing ---TIPS--- separator; falling back to paragraph split")
-        blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
-        if len(blocks) >= 2:
-            overview = blocks[0]
-            tips     = "\n\n".join(blocks[1:])
-        else:
-            overview = text.strip(); tips = ""
+    # One retry if the checks gut the first attempt: a second sample is usually
+    # clean, and costs ~15s with the model already warm.
+    tips = ""
+    for _attempt in range(2):
+        raw = _ollama_p(_coach_prompt(context, TIPS_TASK),
+                        source="training_summary_tips", model=LOCAL_MODEL)
+        candidate = _verify_tips(_clean_section(raw, max_sentences=6, drop_platitudes=True),
+                                 facts, context)
+        if len(_split_sentences(candidate)) > len(_split_sentences(tips)):
+            tips = candidate
+        if len(_split_sentences(tips)) >= 2:
+            break
+    # With nothing scheduled the brief is guesswork until he says what's coming up,
+    # so the ask is appended here rather than left to the model, which drops it.
+    needs_ask = not facts["planned_today"] and not facts["planned_ahead"]
+    tips = " ".join(_split_sentences(tips)[:3 if needs_ask else 4])
+    if needs_ask:
+        tips = (tips + " " if tips else "") + PLAN_PROMPT_SENTENCE
     if not tips:
         log.warning("coach brief produced empty tips section")
     _save_cache(CACHE_FILE, {"hash": input_hash, "overview": overview, "tips": tips})
     return {"overview": overview, "tips": tips}, False
 
 
-EXTRACT_CACHE_FILE = os.path.expanduser("~/.cache/training-brief/extract-cache.json")
+# ── Week planner — typed or spoken week → sessions ──────────────────────────
 
-def extract_sessions_from_notes(active_notes):
-    """Conservatively pull *clearly-described* upcoming sessions out of the active
-    notes and append them to training-plan.json. Returns the list of added
-    sessions. Does nothing (returns []) unless a note unambiguously describes a
-    future session — never invents or duplicates entries."""
-    if not active_notes:
-        return []
+# TSS per hour by intensity. Load comes from these fixed rates, not from the model,
+# whose load guesses varied run to run; for interval sessions the work minutes are
+# costed at the hard rate and the rest of the session at the easy rate.
+PLAN_KINDS = {            # (TSS/hour for the session, TSS/hour for work intervals)
+    "mobility":  (0, None),    # stretching: recovery work, not training load
+    "recovery":  (30, None),
+    "easy":      (45, None),
+    "steady":    (85, None),   # his UT1-type erg/run: 83-91 TSS/h (avg HR ~170, mostly SubThreshold)
+    "threshold": (45, 95),
+    "vo2max":    (45, 120),
+    "strength":  (30, None),   # intervals.icu scores his lifting ~30 TSS/h (HR-based)
+    "rest":      (0, None),
+}
+PLAN_DEFAULT_MINUTES = {"strength": 60, "rest": 0}
 
-    plan      = load_training_plan()
-    sessions  = plan.get("sessions", [])
-    existing  = {(s.get("date"), s.get("name", "").strip().lower()) for s in sessions}
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    notes_blob = "\n".join(f"[{n['ts'][:10]}] {n['text']}" for n in active_notes)
 
-    # Skip the LLM call if neither the notes nor the upcoming plan have changed
-    # since the last extraction (avoids a ~5s call on every refresh).
-    state_key = notes_blob + "||" + "|".join(sorted(
-        f"{d}:{n}" for d, n in existing if d and d >= today_str))
-    state_hash = _data_hash(state_key)
-    if _load_cache(EXTRACT_CACHE_FILE).get("hash") == state_hash:
-        return []
+# Running scores far above cycling at the same effort for him (hrTSS with a higher
+# run LTHR and more time up the zones), so easy/recovery runs get their own rate.
+PLAN_RUN_FACTOR = 1.45     # easy 45 → ~65 TSS/h, recovery 30 → ~44
 
+
+def plan_session_load(minutes, kind, work_minutes=0, name=""):
+    """(tss, z4_mins) for a planned session."""
+    base, hard = PLAN_KINDS.get(kind, PLAN_KINDS["easy"])
+    if kind in ("easy", "recovery") and _RUN_WORDS.search(name or ""):
+        base *= PLAN_RUN_FACTOR
+    minutes = max(0, int(minutes or 0))
+    work = min(max(0, int(work_minutes or 0)), minutes) if hard else 0
+    tss = (minutes - work) * base / 60 + work * (hard or 0) / 60
+    return round(tss), work
+
+
+# Day words as he actually types/says them, typos included ("tommorow", "mondy").
+_PLAN_DAY = re.compile(
+    r"\b(today|tonight|this (?:morning|afternoon|evening)|tomm?orr?ow|tmrw|"
+    r"mon(?:d?ay)?|mondy|tue(?:s(?:day)?)?|wed(?:s|nesday)?|thu(?:rs?(?:day)?)?|"
+    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b", re.I)
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_STRENGTH_WORDS = re.compile(r"\b(gym|weights?|lift(?:ing)?|strength|squats?|deadlifts?|rdls?|"
+                             r"hip thrusts?|bench|upper|lower|legs|pull|push)\b", re.I)
+_REST_WORDS = re.compile(r"\b(rest|off|day off|nothing)\b", re.I)
+_MOBILITY_WORDS = re.compile(r"\b(stretch(?:ing)?|mobility|yoga|foam roll(?:ing)?)\b", re.I)
+_RECOVERY_WORDS = re.compile(r"\b(recovery|very (?:easy|low|light)|low zone|zone ?1|z1|spin to relax|flush)\b", re.I)
+_STEADY_WORDS = re.compile(r"\b(steady|tempo|ut1|sweet ?spot)\b", re.I)
+_DURATION = re.compile(r"\b(\d+(?:\.\d+)?)\s*(h|hr|hrs|hours?|m|mins?|minutes?)\b", re.I)
+_REPS = re.compile(r"\b(\d{1,2})\s*(?:x|×|\*|by)\s*(\d{1,4}(?:\.\d+)?)\s*(km|k\b)?", re.I)
+
+
+def _resolve_plan_day(word, today):
+    w = word.lower()
+    if w.startswith(("today", "tonight", "this ")):
+        return today
+    if w.startswith(("tom", "tmrw")):
+        return today + timedelta(days=1)
+    # A bare weekday is its next occurrence; today's own weekday means today.
+    return today + timedelta(days=(_WEEKDAYS.index(w[:3]) - today.weekday()) % 7)
+
+
+def _split_plan_text(text, today):
+    """[(date, segment text)] — cut at every day word. Text before the first day
+    word belongs to today. Dates are resolved here, never by the model: given a
+    date table it still put "today" on Monday and "Monday" a week late."""
+    marks = list(_PLAN_DAY.finditer(text))
+    if not marks:
+        return [(today, text.strip())]
+    segs = []
+    if text[:marks[0].start()].strip(" ,.;:-"):
+        segs.append((today, text[:marks[0].start()]))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        day = _resolve_plan_day(m.group(1), today)
+        # A week is described in order, so "... Friday ..., Saturday long run" said on
+        # a Saturday means next Saturday, not today: never step backwards in time.
+        while segs and day < segs[-1][0]:
+            day += timedelta(days=7)
+        segs.append((day, text[m.end():end]))
+    out = []
+    for d, t in segs:
+        t = re.sub(r"^(?:\s|[,.;:-]|\b(?:and|then|is|i will|i'll|morning|evening|afternoon)\b)+", "", t,
+                   flags=re.I).strip(" ,.;:-")
+        t = re.sub(r"(?:[\s,.;]|\band\b)+$", "", t, flags=re.I)
+        if t:
+            out.append((d, t))
+    return out
+
+
+def parse_week_plan(text):
+    """Turn "today 60 min bike, tomorrow gym lower, Mon 3x10 erg" into draft rows
+    {date, name, minutes, kind, work_minutes} for the review grid. Python owns the
+    dates and the interval arithmetic; the model only names each segment's session
+    and says what kind it is."""
+    today = datetime.now().date()
+    segs = _split_plan_text(text, today)
+    listing = "\n".join(f"{i + 1}: {t}" for i, (_, t) in enumerate(segs))
     prompt = (
-        "You maintain a rower's training plan. Read the athlete's free-text notes below and extract ONLY "
-        "concrete upcoming training sessions that are clearly described (a session on a stated or clearly "
-        "implied date). Do NOT invent sessions, infer vague intentions, or include sessions already in the plan.\n\n"
-        f"Today is {today_str}. Resolve relative dates (\"tomorrow\", \"Friday\") to absolute YYYY-MM-DD.\n\n"
-        "Sessions ALREADY in the plan (do not duplicate):\n"
-        + ("\n".join(f"  {s.get('date')}: {s.get('name')}" for s in sessions if s.get("date", "") >= today_str) or "  (none upcoming)")
-        + "\n\nAthlete's notes:\n" + notes_blob + "\n\n"
-        "Output a STRICT JSON array (no prose, no code fences). Each item: "
-        '{"date":"YYYY-MM-DD","name":"<short session name>","tss":<int estimate>,"z4_mins":<int estimate>}. '
-        "TSS scales with DURATION, not just intensity — a short maximal effort is still LOW TSS. "
-        "Guide: easy paddle/recovery ~30-45; steady 60-90min ~60-80; long row 2h+ ~100-130; "
-        "a SHORT all-out race or sprint (a few minutes up to ~15min, e.g. a bumps race) is only ~20-45 "
-        "even though it feels maximal — do NOT inflate short efforts. Include the paddle to/from in the estimate. "
-        "z4_mins = minutes actually spent at Z4+ (a 5-min sprint is ~5, an easy paddle is 0). "
-        "If no clear upcoming session is described, output exactly: []"
+        "Each numbered line describes the training for one day. Name each session as JSON. "
+        "Respond with JSON only.\n\n"
+        'Schema: {"sessions": [{"line": N, "name": "short name"}]}\n'
+        "- name: sport first, then only details the line actually states, e.g. \"Bike – 60 min easy\", "
+        "\"Erg – 3×10 min\", \"Gym – lower\", \"Rest\". Never add reps, weights or durations that "
+        "are not in the line.\n"
+        "- Every line gets at least one session; a line with two sessions gets two entries.\n\n"
+        f"{listing}"
     )
-
-    raw = _ollama_p(prompt, source="extract_sessions").strip()
-    # Extract the first JSON array, tolerating code fences or trailing prose
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if not match:
-        log.info("session extraction: no JSON array in model output")
-        return []
+    t0 = time.monotonic()
     try:
-        parsed = json.loads(match.group(0))
+        resp = requests.post(OLLAMA_CHAT_URL, json={
+            "model": LOCAL_MODEL, "messages": [{"role": "user", "content": prompt}],
+            "format": "json", "stream": False, "options": {"temperature": 0}}, timeout=180)
+        resp.raise_for_status()
+        raw = json.loads(resp.json()["message"]["content"]).get("sessions") or []
     except Exception:
-        log.warning("session extraction: could not parse model JSON: %s", raw[:200])
-        return []
-    if not isinstance(parsed, list):
-        return []
+        _log_ollama_usage("plan_week", int((time.monotonic() - t0) * 1000), False)
+        log.exception("week plan parse failed")
+        raise RuntimeError("Couldn't read that plan — is Ollama running?")
+    _log_ollama_usage("plan_week", int((time.monotonic() - t0) * 1000), True)
 
-    added = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        date = str(item.get("date", "")).strip()
-        name = str(item.get("name", "")).strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or not name:
-            continue
-        if date < today_str:                       # only future/today
-            continue
-        if (date, name.lower()) in existing:        # dedupe
-            continue
+    by_line = defaultdict(list)
+    for r in raw:
         try:
-            tss = int(item.get("tss", 60)); z4 = int(item.get("z4_mins", 0))
+            by_line[int(r.get("line"))].append(r)
         except (TypeError, ValueError):
-            tss, z4 = 60, 0
-        entry = {"date": date, "name": name, "tss": tss, "z4_mins": z4}
-        sessions.append(entry); existing.add((date, name.lower())); added.append(entry)
+            continue
 
-    if added:
-        plan["sessions"] = sorted(sessions, key=lambda s: s.get("date", ""))
-        with open(TRAINING_PLAN_FILE, "w") as f:
-            json.dump(plan, f, indent=2)
-        log.info("session extraction added %d session(s): %s",
-                 len(added), "; ".join(f"{a['date']} {a['name']}" for a in added))
-        # `existing` now includes the added sessions; cache the post-add state so an
-        # unchanged re-run is a cache hit rather than one more (empty) LLM call.
-        final_key = notes_blob + "||" + "|".join(sorted(
-            f"{d}:{n}" for d, n in existing if d and d >= today_str))
-        state_hash = _data_hash(final_key)
-    _save_cache(EXTRACT_CACHE_FILE, {"hash": state_hash})
-    return added
+    rows = []
+    for i, (day, seg) in enumerate(segs, start=1):
+        sessions = by_line.get(i) or [{"name": seg[:60]}]
+        for r in sessions:
+            name = str(r.get("name") or seg).strip()[:60]
+            # With one session on the day his own words are the evidence; with two,
+            # each session's name is. Either way the model's name is checked against
+            # them, so an invented "5x4" on a gym session can't turn it into intervals.
+            evidence = seg if len(sessions) == 1 else name
+            reps = _REPS.search(evidence) if _REPS.search(seg) else None
+            if reps is None and _REPS.search(name):
+                name = _REPS.sub("", name).replace("  ", " ").strip(" –-")
+            if _MOBILITY_WORDS.search(evidence) and not _STRENGTH_WORDS.search(evidence):
+                kind, work = "mobility", 0
+            elif _REST_WORDS.search(evidence) and not _STRENGTH_WORDS.search(evidence):
+                kind, work = "rest", 0
+            elif _STRENGTH_WORDS.search(evidence):
+                kind, work = "strength", 0
+            elif reps and not reps.group(3) and float(reps.group(2)) <= 30:
+                # "3x10" / "3x10m" are minutes; "8x500m" (>30) and "3x1k" are distances.
+                length = float(reps.group(2))
+                kind, work = ("threshold" if length >= 6 else "vo2max"), round(int(reps.group(1)) * length)
+            elif reps:
+                kind, work = "vo2max", 12
+            elif _RECOVERY_WORDS.search(evidence):
+                kind, work = "recovery", 0
+            elif _STEADY_WORDS.search(evidence):
+                kind, work = "steady", 0
+            elif _RUN_WORDS.search(evidence) and not re.search(r"\b(easy|gentle|jog)\b", evidence, re.I):
+                # His runs sit in Tempo/SubThreshold unless he says otherwise.
+                kind, work = "steady", 0
+            else:
+                kind, work = "easy", 0
+            # Stated duration wins — read with the reps removed, so the "10" of "3x10
+            # min" isn't taken as the session length. Otherwise: intervals get 30 min
+            # of warm-up, recoveries and cool-down on top of the work.
+            dur = _DURATION.search(_REPS.sub(" ", evidence))
+            if kind == "rest":
+                minutes = 0
+            elif dur:
+                v = float(dur.group(1))
+                minutes = round(v * 60 if dur.group(2).lower().startswith("h") else v)
+                if work and minutes < work + 10:      # "20 min easy then 5x3": a part, not the total
+                    minutes += work
+            else:
+                minutes = work + 30 if work else 60
+            rows.append({"date": day.isoformat(), "name": name or seg[:60],
+                         "minutes": max(minutes, work), "kind": kind, "work_minutes": work})
+    return rows
+
+
+# Main lifts make a lower day outright; accessories (hip thrust, lunge) only when the
+# session isn't an upper one, so "upper + hip thrust" doesn't protect the day before.
+_LOWER_WORDS = re.compile(r"\b(lower|legs?|squats?|deadlifts?|rdls?|full body)\b", re.I)
+_LOWER_ACCESSORY = re.compile(r"\b(hip thrusts?|lunges?|split squats?)\b", re.I)
+_RUN_WORDS = re.compile(r"\brun(?:ning)?\b|\bjog", re.I)
+MIN_LIFTS_PER_WEEK = 4
+
+
+def _is_lower(s):
+    name = s.get("name", "")
+    if _session_kind(s) != "strength":
+        return False
+    return bool(_LOWER_WORDS.search(name)) or (
+        bool(_LOWER_ACCESSORY.search(name)) and not re.search(r"\bupper\b", name, re.I))
+
+
+def _is_hard(s):
+    # "steady" counts: his UT1 sessions sit mostly in SubThreshold, and that residual
+    # fatigue lands on the next day's squat just as intervals do.
+    return _session_kind(s) in ("steady", "threshold", "vo2max")
+
+
+def plan_lifting_conflicts(rows):
+    """Warnings for a draft week, judged together with what's already planned around
+    it. Lifting is the priority, so the checks protect lower-body sessions from the
+    work most likely to blunt them — hard intervals and running the day before (the
+    eccentric load and residual fatigue land on the squat), and hard work before the
+    lift on the same day — and flag a week that has lost a gym session."""
+    drafted = {r["date"] for r in rows}
+    around = [x for x in load_training_plan().get("sessions", []) if x.get("date") not in drafted]
+    week = sorted(around + [r for r in rows if r.get("kind") != "rest"], key=lambda x: x.get("date", ""))
+    by_day = defaultdict(list)
+    for x in week:
+        by_day[x["date"]].append(x)
+
+    def day_name(d):
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%a")
+
+    warnings = []
+    for d in sorted(drafted):
+        today = by_day.get(d, [])
+        nxt = (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        if any(_is_lower(x) for x in by_day.get(nxt, [])):
+            for x in today:
+                if _is_hard(x):
+                    warnings.append(f"{day_name(d)}: {x['name']} is the day before a lower-body lift — "
+                                    "move it after the lift, or to the day after.")
+                elif _RUN_WORDS.search(x.get("name", "")):
+                    warnings.append(f"{day_name(d)}: running the day before a lower-body lift — "
+                                    "swap for bike or row.")
+        if any(_is_lower(x) for x in today) and any(_is_hard(x) for x in today):
+            warnings.append(f"{day_name(d)}: hard or UT1 work on a lower-body day — lift first and "
+                            "keep them 6+ hours apart, or move it.")
+    # Only judge the gym count when the draft actually plans most of a week.
+    if len(drafted) >= 5:
+        first = datetime.strptime(min(drafted), "%Y-%m-%d")
+        span = {(first + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
+        lifts = sum(1 for d in span for x in by_day.get(d, []) if _session_kind(x) == "strength")
+        if lifts < MIN_LIFTS_PER_WEEK:
+            warnings.append(f"Only {lifts} gym session{'s' if lifts != 1 else ''} in this week — "
+                            f"lifting is the priority, plan at least {MIN_LIFTS_PER_WEEK}.")
+    return warnings
+
+
+def save_week_plan(rows):
+    """Write reviewed rows into training-plan.json. Every date that appears in the
+    draft is replaced wholesale — re-planning a day overwrites it rather than
+    stacking a second copy — and rest days clear their date without adding a session."""
+    plan = load_training_plan()
+    dates = {r["date"] for r in rows}
+    sessions = [x for x in plan.get("sessions", []) if x.get("date") not in dates]
+    for r in rows:
+        if r.get("kind") == "rest" or not str(r.get("name", "")).strip():
+            continue
+        tss, z4 = plan_session_load(r.get("minutes"), r.get("kind"), r.get("work_minutes"),
+                                    r.get("name", ""))
+        sessions.append({"date": r["date"], "name": str(r["name"]).strip(),
+                         "tss": tss, "z4_mins": z4, "kind": r.get("kind", "easy")})
+    plan["sessions"] = sorted(sessions, key=lambda x: x.get("date", ""))
+    with open(TRAINING_PLAN_FILE, "w") as f:
+        json.dump(plan, f, indent=2, ensure_ascii=False)
+    log.info("week plan saved: %d row(s) over %s", len(rows), ", ".join(sorted(dates)))
 
 
 NUTR_COACH_CACHE = os.path.expanduser("~/.cache/training-brief/nutrition-coach-cache.json")
@@ -1806,6 +2999,7 @@ def get_nutrition_coach(activities, training_plan, coach_summary=None):
         "You are a sports nutritionist advising a solo rower (post-graduation, no squad) targeting a 2k erg "
         "from 6:29 to 6:10 over the next year, with a secondary goal of gaining 7kg of lean mass (83→90kg). "
         "Write a concise nutrition-focused daily note (3 sentences, plain prose, no greetings, no headers, no markdown).\n\n"
+        + LOGGING_NOTE +
         "Focus on: what they should eat NOW or next given the sessions done and still ahead, "
         "and one specific food or meal recommendation.\n\n"
         "CRITICAL — time of day awareness: do NOT judge today's intake as insufficient or low "
@@ -1822,7 +3016,7 @@ def get_nutrition_coach(activities, training_plan, coach_summary=None):
         "Last 7 days of eating:\n" + "\n".join(weekly) + "\n\n"
         "Be specific: name actual foods and quantities. No generic advice."
     )
-    brief = _ollama_p(prompt, source="nutrition_coach")
+    brief = _ollama_p(prompt, source="nutrition_coach", model=LOCAL_MODEL_FAST)
     _save_cache(NUTR_COACH_CACHE, {"hash": input_hash, "brief": brief})
     return brief, False
 
@@ -1831,31 +3025,34 @@ def get_nutrition_coach(activities, training_plan, coach_summary=None):
 
 def _color_tsb(v):
     if v is None:  return "#888"
-    if v > 10:     return "#4ade80"
-    if v < -20:    return "#f87171"
-    return "#fbbf24"
+    if v > 10:     return "#6fcf97"
+    if v < -20:    return "#e8837a"
+    return "#e3b95f"
 
 def _color_hrv(delta):
-    if delta is None: return "#e2e8f0"
-    if delta < -5:    return "#f87171"
-    return "#4ade80"
+    if delta is None: return "#e8e9ea"
+    if delta < -5:    return "#e8837a"
+    return "#6fcf97"
 
 def _color_sleep(score):
     if score is None: return "#888"
-    if score >= 80:   return "#4ade80"
-    if score >= 60:   return "#fbbf24"
-    return "#f87171"
+    if score >= 80:   return "#6fcf97"
+    if score >= 60:   return "#e3b95f"
+    return "#e8837a"
 
 def _fmt_sleep(secs):
     if not secs: return "—"
     h, m = divmod(int(secs) // 60, 60)
     return f"{h}h {m:02d}m"
 
-def _stat(label, value, color="#e2e8f0", sub=None, tip=None):
+def _stat(label, value, color="#e8e9ea", sub=None, tip=None, link=None):
     sub_html = f'<div class="sub">{sub}</div>' if sub else ""
     tip_attr = f' data-tip="{tip}"' if tip else ""
     cursor   = ' style="cursor:help"' if tip else ""
-    return (f'<div class="stat"{tip_attr}{cursor}>'
+    if link:
+        tab, _, anchor = link.partition(":")
+        cursor = f' onclick="goTo(\'{tab}\',\'{anchor}\')"'
+    return (f'<div class="stat{" stat-link" if link else ""}"{tip_attr}{cursor}>'
             f'<div class="label">{label}</div>'
             f'<div class="value" style="color:{color}">{value}</div>'
             f'{sub_html}</div>')
@@ -1885,9 +3082,9 @@ def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7
             '<hr class="div">'
             '<div style="background:#1c1008;border:1px solid #78350f;border-radius:6px;'
             'padding:7px 9px;margin-bottom:4px">'
-            '<div style="font-size:10px;color:#fbbf24;font-weight:600;margin-bottom:3px">'
+            '<div style="font-size:10px;color:#e3b95f;font-weight:600;margin-bottom:3px">'
             '⚡ MOBILITY RECOMMENDED</div>'
-            f'<div style="font-size:11px;color:#d97706;line-height:1.4">'
+            f'<div style="font-size:11px;color:#e3b95f;line-height:1.4">'
             f'{int(z4_today)}min Z4+ today — 10min mobility or stretching before bed will '
             f'reduce tomorrow\'s soreness.</div>'
             '</div>'
@@ -1897,12 +3094,12 @@ def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7
     streak, stretched_today = get_stretch_status()
     if streak > 0 or stretched_today:
         flame = "🔥" * min(streak, 3)
-        streak_color = "#4ade80" if stretched_today else "#fbbf24"
+        streak_color = "#6fcf97" if stretched_today else "#e3b95f"
         streak_label = f"{streak}d streak {flame}" if streak > 0 else "Start your streak today"
         done_badge = (
-            '<span style="font-size:9px;color:#4ade80;margin-left:6px">✓ done today</span>'
+            '<span style="font-size:9px;color:#6fcf97;margin-left:6px">✓ done today</span>'
             if stretched_today else
-            '<span style="font-size:9px;color:#475569;margin-left:6px">not yet today</span>'
+            '<span style="font-size:9px;color:#56585a;margin-left:6px">not yet today</span>'
         )
         rows.append(
             '<hr class="div">'
@@ -1910,18 +3107,18 @@ def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7
             f'<div class="label">Stretch</div>'
             f'<div style="font-size:11px;color:{streak_color};font-weight:600">{streak_label}</div>'
             f'</div>'
-            f'<div style="font-size:10px;color:#475569;margin-top:2px">'
-            f'Run <code style="color:#94a3b8">stretch log</code> to record a session{done_badge}</div>'
+            f'<div style="font-size:10px;color:#56585a;margin-top:2px">'
+            f'Run <code style="color:#a3a6a9">stretch log</code> to record a session{done_badge}</div>'
         )
     else:
         rows.append(
             '<hr class="div">'
             '<div style="display:flex;align-items:center;justify-content:space-between">'
             '<div class="label">Stretch</div>'
-            '<div style="font-size:11px;color:#475569">No streak yet</div>'
+            '<div style="font-size:11px;color:#56585a">No streak yet</div>'
             '</div>'
-            '<div style="font-size:10px;color:#475569;margin-top:2px">'
-            'Run <code style="color:#94a3b8">stretch log</code> to start one</div>'
+            '<div style="font-size:10px;color:#56585a;margin-top:2px">'
+            'Run <code style="color:#a3a6a9">stretch log</code> to start one</div>'
         )
 
     # ── Upcoming sessions ─────────────────────────────────────────────────────
@@ -1934,11 +3131,11 @@ def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7
         for date in sorted(by_date):
             if date == today_str:
                 day_label = "Today"
-                label_color = "#94a3b8"
+                label_color = "#a3a6a9"
             else:
                 d = datetime.strptime(date, "%Y-%m-%d")
                 day_label = d.strftime("%a %-d %b")
-                label_color = "#475569"
+                label_color = "#56585a"
             rows.append(
                 f'<div style="font-size:10px;color:{label_color};'
                 f'text-transform:uppercase;letter-spacing:.05em;'
@@ -1947,21 +3144,36 @@ def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7
             for s in by_date[date]:
                 name = s.get("name", "Session")
                 z4 = s.get("z4_mins", 0)
-                dot_color = "#f87171" if z4 >= 10 else ("#fbbf24" if z4 >= 3 else "#475569")
+                dot_color = "#e8837a" if z4 >= 10 else ("#e3b95f" if z4 >= 3 else "#56585a")
                 rows.append(
                     f'<div style="display:flex;align-items:flex-start;gap:6px;'
                     f'margin-bottom:4px;line-height:1.3">'
                     f'<span style="color:{dot_color};margin-top:2px;flex-shrink:0">●</span>'
-                    f'<span style="font-size:12px;color:#94a3b8">{name}</span>'
+                    f'<span style="font-size:12px;color:#a3a6a9">{name}</span>'
                     f'</div>'
                 )
 
         if beyond:
             rows.append(
-                f'<div style="font-size:10px;color:#475569;margin-top:7px;font-style:italic">'
+                f'<div style="font-size:10px;color:#56585a;margin-top:7px;font-style:italic">'
                 f'+{beyond} further session{"s" if beyond != 1 else ""} in the plan</div>'
             )
+    else:
+        rows.append('<hr class="div"><div class="label" style="margin-bottom:6px">Next 7 days</div>'
+                    '<div style="font-size:11px;color:#56585a;font-style:italic">Nothing planned yet.</div>')
 
+    rows.append(
+        '<div class="plan-input">'
+        '<textarea id="plan-box" rows="2" placeholder="Plan the week… e.g. today 60 min bike, '
+        'tomorrow gym lower, Mon 3×10 erg (Ctrl+Enter)"></textarea>'
+        '<div class="plan-btns">'
+        '<button id="plan-mic-btn" class="mic-btn" onclick="toggleVoice(\'plan\')" '
+        'title="Speak your week">&#127908;</button>'
+        '<button onclick="submitPlan()">Plan</button>'
+        '</div></div>'
+        '<div class="food-status" id="plan-status" style="display:none"></div>'
+        '<div id="plan-draft"></div>'
+    )
     return "".join(rows)
 
 
@@ -1969,9 +3181,9 @@ def _build_sessions_html(training_plan, today_str, activities=None, days_ahead=7
 
 def _color_illness(p):
     if p is None: return "#888"
-    if p < 0.20:  return "#4ade80"
-    if p < 0.50:  return "#fbbf24"
-    return "#f87171"
+    if p < 0.20:  return "#6fcf97"
+    if p < 0.50:  return "#e3b95f"
+    return "#e8837a"
 
 
 def _illness_stat(illness):
@@ -1995,8 +3207,7 @@ def _illness_stat(illness):
 
     sub_html = f'<div class="sub" id="illness-sub">{sub}</div>'
     tip_attr = f' data-tip="{tip}"' if tip else ""
-    cursor   = ' style="cursor:help"' if tip else ""
-    return (f'<div class="stat"{tip_attr}{cursor}>'
+    return (f'<div class="stat stat-link"{tip_attr} onclick="selectTab(\'illness\')" title="Open illness detail">'
             f'<div class="label">Illness Risk</div>'
             f'<div class="value" id="illness-val" style="color:{color}">{val}</div>'
             f'{sub_html}'
@@ -2006,8 +3217,31 @@ def _illness_stat(illness):
             f'</div>')
 
 
+def _focus_stat():
+    """KPI tile for the Focus tab: today's check-ins and the latest mood/energy."""
+    if not _focus:
+        return ""
+    try:
+        p = _focus.focus_payload()
+    except Exception:
+        return ""
+    done = len(p["today_slots"])
+    L = p.get("latest")
+    sub = (f"mood {L['mood'] or '-'} · energy {L['energy'] or '-'}"
+           if L else "no check-ins yet")
+    return _stat("Focus", f"{done}/3 today", "#88dcfd" if done else "#a3a6a9", sub, link="focus")
+
+
 def build_html(wellness, activities, training_plan, summary=None, calorie_target=None,
                food_data=None, illness=None, surplus_target=0):
+    try:
+        _cfg_anchor = (load_config().get("oya_anchor") or "")
+        oya_html = _oya.render_panel(activities, wellness,
+                                     anchor=date.fromisoformat(_cfg_anchor) if _cfg_anchor else None) \
+            if _oya else '<div style="padding:22px 26px;color:#75777a">one_year_ago module not available.</div>'
+    except Exception:
+        log.warning("Vs Last Year panel failed to render", exc_info=True)
+        oya_html = '<div style="padding:22px 26px;color:#e0766b">Could not build the year comparison; see the log.</div>'
     entries     = sorted([w for w in wellness if w.get("id")], key=lambda w: w["id"])
     today_entry = next((w for w in reversed(entries) if w.get("ctl") or w.get("hrv")), {})
     recent      = entries[-7:]
@@ -2028,8 +3262,8 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     if sleep_14d:
         avg_daily_debt = sum(8.0 - s / 3600 for s in sleep_14d) / len(sleep_14d)
         sign           = "deficit" if avg_daily_debt > 0 else "surplus"
-        debt_str       = f"{abs(avg_daily_debt):.1f}h/night {sign}"
-        debt_color     = "#f87171" if avg_daily_debt > 1 else ("#fbbf24" if avg_daily_debt > 0 else "#4ade80")
+        debt_str       = f"{abs(avg_daily_debt):.1f}h {sign}"
+        debt_color     = "#e8837a" if avg_daily_debt > 1 else ("#e3b95f" if avg_daily_debt > 0 else "#6fcf97")
     else:
         debt_str, debt_color = "—", "#888"
 
@@ -2048,7 +3282,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     kcal_sub     = f"{kcal_base:,} base"
     kcal_sub    += f" + {session_kcal:,} burned" if session_kcal else " · no sessions yet"
     kcal_disp = f"{kcal_total:,} kcal"
-    kcal_stat = _stat("Calorie Target", kcal_disp, "#94a3b8", kcal_sub)
+    kcal_stat = _stat("Calorie Target", kcal_disp, "#a3a6a9", kcal_sub, link="nutrition:nutr-cal")
 
     cal_target_for_chart = calorie_target if calorie_target else 2700
     cal_hist_dates, cal_hist_consumed, cal_hist_target = get_calorie_history(
@@ -2064,7 +3298,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
                                  surplus_goal=surplus_target, today_str=today_str_h,
                                  day_frac=day_frac) if surplus_target else None
     if bulk_trend:
-        bt_color = {"on track": "#4ade80", "slow but positive": "#fbbf24", "in deficit": "#f87171"}[bulk_trend["state"]]
+        bt_color = {"on track": "#6fcf97", "slow but positive": "#e3b95f", "in deficit": "#e8837a"}[bulk_trend["state"]]
         proj_sub = ""
         if bulk_trend["today_projected"] is not None:
             proj_sub = f" · today proj. {bulk_trend['today_projected']:+,} kcal"
@@ -2078,6 +3312,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
             tip=(f"{bulk_trend['window']}-day average over prior days · "
                  f"{bulk_trend['logged_days']}/{bulk_trend['window']} days logged"
                  f"{proj_sub}"),
+            link="nutrition:nutr-bulk",
         )
     else:
         bt_stat = ""
@@ -2139,7 +3374,7 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
             break
     clearance_val, clearance_sub, clearance_color, clearance_tip = sleep_debt_clearance(
         current_sleep_debt, next_exam_days=_next_exam_days)
-    clearance_stat = _stat("Sleep Clearance", clearance_val, clearance_color, clearance_sub, tip=clearance_tip)
+    clearance_stat = _stat("Sleep Clearance", clearance_val, clearance_color, clearance_sub, tip=clearance_tip, link="sleep")
 
     # The "Logged today" card content — entries + quick-add only. The calorie bar
     # and macro rows the old widget drew are now their own dashboard cards.
@@ -2151,20 +3386,21 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         _stat("Form (TSB)", f"{tsb:+.1f}" if tsb is not None else "—",
               _color_tsb(tsb),
               f"Fitness {ctl:.0f} · Fatigue {atl:.0f}" if ctl and atl else None,
-              tip=tsb_tip),
+              tip=tsb_tip, link="trends:w-tsb"),
         _stat("HRV", f"{int(hrv)}" if hrv else "—",
               _color_hrv(hrv_delta),
               f"7-day avg {hrv_baseline:.0f}" if hrv_baseline else None,
-              tip=hrv_tip),
-        _stat("Resting HR", f"{int(rhr)} bpm" if rhr else "—", tip=rhr_tip),
+              tip=hrv_tip, link="trends:w-hrv"),
+        _stat("Resting HR", f"{int(rhr)} bpm" if rhr else "—", tip=rhr_tip, link="trends:w-hrv"),
         _illness_stat(illness),
         _stat("Sleep", _fmt_sleep(sleep_secs), _color_sleep(sleep_score),
               f"Score {int(sleep_score)}" if sleep_score else None,
-              tip=sleep_tip),
-        _stat("Sleep Avg (14d)", debt_str, debt_color, "avg vs 8h/night target", tip=debt_tip),
+              tip=sleep_tip, link="sleep"),
+        _stat("Sleep Avg (14d)", debt_str, debt_color, "per night vs 8h target", tip=debt_tip, link="sleep"),
         clearance_stat,
         kcal_stat,
         bt_stat,
+        _focus_stat(),
     ])
 
 
@@ -2219,6 +3455,9 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
         for key, meta in benchmark_cfg["metrics"].items() if key != "bodyweight")
 
     chart_data = json.dumps({
+        "focus": (_focus.focus_payload() if _focus else None),
+        "sleep": (_sleep.sleep_payload(wellness) if _sleep else None),
+        "life": (_life.life_payload((training_plan or {}).get("sessions", [])) if _life else None),
         "dates": chart_dates, "ctl": ctl_vals, "atl": atl_vals, "tsb": tsb_vals,
         "hrv": hrv_vals_c, "rhr": rhr_vals_c,
         "hilDates": hil_dates, "hil": hil_vals,
@@ -2266,26 +3505,27 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#0f172a;color:#e2e8f0;font-family:-apple-system,'Segoe UI',sans-serif;
+body{{background:#1b1c1e;color:#e8e9ea;font-family:-apple-system,'Segoe UI',sans-serif;
      height:100vh;display:flex;flex-direction:column;overflow:hidden}}
-.header{{padding:11px 18px;border-bottom:1px solid #1e293b;display:flex;align-items:center;
+.header{{padding:11px 18px;border-bottom:1px solid #2a2c2f;display:flex;align-items:center;
          gap:10px;flex-shrink:0}}
 .header h1{{font-size:14px;font-weight:600}}
-.header .date{{font-size:12px;color:#64748b}}
-select{{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:5px;
+.header .date{{font-size:12px;color:#75777a}}
+select{{background:#2a2c2f;color:#a3a6a9;border:1px solid #424446;border-radius:5px;
         padding:3px 8px;font-size:12px;cursor:pointer;outline:none}}
-select:hover{{border-color:#475569}}
-#periodSelect{{margin-left:auto}}
+select:hover{{border-color:#56585a}}
+#appSwitch{{margin-left:auto}}
+#periodSelect{{margin-left:8px}}
 #periodSelect[hidden]{{display:none}}
 
 /* ── tabs ─────────────────────────────────────────────────────────────────── */
 .tabs{{display:flex;gap:2px;margin-left:14px}}
-.tab{{background:none;border:1px solid transparent;border-radius:5px;color:#64748b;
+.tab{{background:none;border:1px solid transparent;border-radius:5px;color:#75777a;
       font-family:inherit;font-size:11.5px;padding:4px 11px;cursor:pointer;
       transition:color .15s,background .15s,border-color .15s}}
-.tab:hover{{color:#94a3b8;background:#1e293b}}
-.tab:focus-visible{{outline:2px solid #a78bfa;outline-offset:1px}}
-.tab[aria-selected="true"]{{color:#a78bfa;border-color:#a78bfa;background:#1e1b4b}}
+.tab:hover{{color:#a3a6a9;background:#2a2c2f}}
+.tab:focus-visible{{outline:2px solid #88dcfd;outline-offset:1px}}
+.tab[aria-selected="true"]{{color:#88dcfd;border-color:#88dcfd;background:#1a3e4c}}
 
 .tab-body{{flex:1;min-height:0;overflow-y:auto}}
 .panel{{display:none}}
@@ -2293,24 +3533,28 @@ select:hover{{border-color:#475569}}
 
 /* ── KPI strip (was a 185px vertical rail) ────────────────────────────────── */
 .stats{{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;align-items:start;
-        padding:10px 6px;border-bottom:1px solid #1e293b;flex-shrink:0}}
-.stat{{padding:0 14px;border-left:1px solid #1e293b;min-width:0}}
+        padding:10px 6px;border-bottom:1px solid #2a2c2f;flex-shrink:0}}
+.stat{{padding:0 14px;border-left:1px solid #2a2c2f;min-width:0}}
 .stat:first-child{{border-left:none}}
-.label{{font-size:9.5px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;
+.stat-link{{cursor:pointer}}
+.stat-link:hover .label{{color:#88dcfd}}
+.back-link{{color:#a3a6a9;text-decoration:none;font-size:12px;margin-right:12px}}
+.back-link:hover{{color:#88dcfd}}
+.label{{font-size:9.5px;color:#75777a;text-transform:uppercase;letter-spacing:.06em;
         margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .value{{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;
         white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 /* Tiles are ~1/10th of the window now, not a 185px column. Clamp the sub to two
    lines so one verbose stat cannot set the height of the whole strip. */
-.sub{{font-size:10.5px;color:#64748b;margin-top:2px;line-height:1.35;
+.sub{{font-size:10.5px;color:#75777a;margin-top:2px;line-height:1.35;
       display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
-hr.div{{border:none;border-top:1px solid #1e293b;margin:8px 0 10px}}
+hr.div{{border:none;border-top:1px solid #2a2c2f;margin:8px 0 10px}}
 .charts{{padding:12px 14px;display:grid;
          grid-template-columns:1fr 1fr;grid-template-rows:repeat(3,180px);
          gap:14px 12px;min-width:0}}
 .chart-cell{{display:flex;flex-direction:column;min-height:0}}
 .chart-cell.wide{{grid-column:1 / -1}}
-.chart-label{{font-size:10px;color:#64748b;text-transform:uppercase;
+.chart-label{{font-size:10px;color:#75777a;text-transform:uppercase;
               letter-spacing:.06em;margin-bottom:3px;flex-shrink:0;display:flex;align-items:center;gap:8px}}
 .chart-wrap{{flex:1;min-height:0;position:relative}}
 canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
@@ -2334,24 +3578,24 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 
 /* Compact nutrition dials shared with the Nutrition tab's data */
 .today-dials{{display:flex;flex-direction:column;gap:12px;
-             background:#131c2f;border:1px solid #1e293b;border-radius:10px;padding:14px 16px}}
+             background:#1f2123;border:1px solid #2a2c2f;border-radius:10px;padding:14px 16px}}
 .dials-top{{display:flex;align-items:center;gap:14px}}
 .dial-ring{{position:relative;width:104px;height:104px;flex-shrink:0}}
 .dial-ring canvas{{position:absolute;inset:0;width:100%;height:100%}}
 .dial-ring-mid{{position:absolute;inset:0;display:flex;flex-direction:column;
                 align-items:center;justify-content:center;text-align:center}}
 .dial-ring-mid .big{{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}}
-.dial-ring-mid .small{{font-size:9px;color:#64748b;margin-top:2px}}
+.dial-ring-mid .small{{font-size:9px;color:#75777a;margin-top:2px}}
 .dial-macros{{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px}}
 .dm-row{{display:grid;grid-template-columns:38px 1fr auto;align-items:center;gap:7px;font-size:10px}}
-.dm-name{{color:#94a3b8}}
-.dm-track{{height:6px;background:#0f172a;border-radius:3px;overflow:hidden}}
+.dm-name{{color:#a3a6a9}}
+.dm-track{{height:6px;background:#1b1c1e;border-radius:3px;overflow:hidden}}
 .dm-fill{{height:100%;border-radius:3px}}
-.dm-val{{color:#64748b;font-variant-numeric:tabular-nums;white-space:nowrap}}
-.dial-foot{{display:flex;justify-content:space-between;font-size:10px;color:#64748b;
-            border-top:1px solid #1e293b;padding-top:9px;font-variant-numeric:tabular-nums}}
-.dial-foot b{{color:#e2e8f0}}
-.dial-link{{margin-top:2px;font-size:10px;color:#a78bfa;cursor:pointer;background:none;border:none;
+.dm-val{{color:#75777a;font-variant-numeric:tabular-nums;white-space:nowrap}}
+.dial-foot{{display:flex;justify-content:space-between;font-size:10px;color:#75777a;
+            border-top:1px solid #2a2c2f;padding-top:9px;font-variant-numeric:tabular-nums}}
+.dial-foot b{{color:#e8e9ea}}
+.dial-link{{margin-top:2px;font-size:10px;color:#88dcfd;cursor:pointer;background:none;border:none;
             padding:0;text-align:left}}
 .dial-link:hover{{text-decoration:underline}}
 
@@ -2366,10 +3610,11 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 /* ── Nutrition dashboard ──────────────────────────────────────────────────── */
 .nutr-dash{{padding:16px 20px;display:grid;gap:14px;
             grid-template-columns:repeat(12,1fr);align-items:start}}
-.nutr-card{{background:#131c2f;border:1px solid #1e293b;border-radius:10px;padding:14px 16px;
+.nutr-card{{background:#1f2123;border:1px solid #2a2c2f;border-radius:10px;padding:14px 16px;
             min-width:0}}
 .cal-ring-card{{grid-column:span 3}}
-.nutr-card:nth-child(2){{grid-column:span 4}}   /* composition pie */
+.nutr-card:nth-child(3){{grid-column:span 4}}   /* composition pie (after pace + ring cards) */
+.pace-card{{grid-column:span 12!important}}
 .macro-break-card{{grid-column:span 5}}
 .bulk-card{{grid-column:span 5}}
 .weight-card{{grid-column:span 7}}
@@ -2377,55 +3622,55 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 .foodlog-card{{grid-column:span 5}}
 .weeklog-card{{grid-column:span 7}}
 @media (max-width:1100px){{
-  .cal-ring-card, .nutr-card:nth-child(2), .macro-break-card, .bulk-card,
+  .cal-ring-card, .nutr-card:nth-child(3), .macro-break-card, .bulk-card,
   .weight-card, .gap-slot, .foodlog-card, .weeklog-card {{ grid-column:span 12 }}
 }}
-.nutr-card-h{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;
+.nutr-card-h{{font-size:10px;color:#75777a;text-transform:uppercase;letter-spacing:.06em;
               margin-bottom:10px}}
-.nutr-card-sub{{color:#475569;text-transform:none;letter-spacing:0;margin-left:6px}}
+.nutr-card-sub{{color:#56585a;text-transform:none;letter-spacing:0;margin-left:6px}}
 
 .cal-ring-wrap{{position:relative;width:150px;height:150px;margin:2px auto 8px}}
 .cal-ring-wrap canvas{{position:absolute;inset:0;width:100%;height:100%}}
 .cal-ring-mid{{position:absolute;inset:0;display:flex;flex-direction:column;
                align-items:center;justify-content:center;text-align:center;pointer-events:none}}
 .cal-ring-mid .big{{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}}
-.cal-ring-mid .small{{font-size:10px;color:#64748b;margin-top:3px}}
+.cal-ring-mid .small{{font-size:10px;color:#75777a;margin-top:3px}}
 .cal-ring-legend{{display:flex;flex-direction:column;gap:4px;font-size:11px}}
-.cal-ring-legend .row{{display:flex;justify-content:space-between;color:#94a3b8;
+.cal-ring-legend .row{{display:flex;justify-content:space-between;color:#a3a6a9;
                        font-variant-numeric:tabular-nums}}
-.cal-ring-legend .row b{{color:#e2e8f0;font-weight:600}}
+.cal-ring-legend .row b{{color:#e8e9ea;font-weight:600}}
 
 .compo-row{{display:flex;align-items:center;gap:14px}}
 .compo-pie-wrap{{position:relative;width:120px;height:120px;flex-shrink:0}}
 .compo-pie-wrap canvas{{position:absolute;inset:0;width:100%;height:100%}}
 .compo-legend{{display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}}
-.compo-legend .row{{display:flex;align-items:center;gap:8px;font-size:12px;color:#cbd5e1}}
+.compo-legend .row{{display:flex;align-items:center;gap:8px;font-size:12px;color:#d4d6d8}}
 .compo-legend .sw{{width:10px;height:10px;border-radius:3px;flex-shrink:0}}
-.compo-legend .pct{{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600;color:#e2e8f0}}
-.compo-legend .gg{{font-size:10px;color:#64748b;font-variant-numeric:tabular-nums}}
+.compo-legend .pct{{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600;color:#e8e9ea}}
+.compo-legend .gg{{font-size:10px;color:#75777a;font-variant-numeric:tabular-nums}}
 
 .macro-break{{display:flex;flex-direction:column;gap:11px}}
 .mb-row{{display:grid;grid-template-columns:64px 1fr 96px;align-items:center;gap:10px}}
-.mb-name{{font-size:11px;color:#94a3b8}}
-.mb-track{{position:relative;height:8px;background:#0f172a;border-radius:4px;overflow:hidden}}
+.mb-name{{font-size:11px;color:#a3a6a9}}
+.mb-track{{position:relative;height:8px;background:#1b1c1e;border-radius:4px;overflow:hidden}}
 .mb-fill{{height:100%;border-radius:4px;transition:width .5s ease}}
-.mb-target-mark{{position:absolute;top:-2px;bottom:-2px;width:2px;background:#64748b}}
-.mb-val{{font-size:10.5px;color:#64748b;text-align:right;font-variant-numeric:tabular-nums;
+.mb-target-mark{{position:absolute;top:-2px;bottom:-2px;width:2px;background:#75777a}}
+.mb-val{{font-size:10.5px;color:#75777a;text-align:right;font-variant-numeric:tabular-nums;
          white-space:nowrap}}
-.mb-val b{{color:#e2e8f0;font-weight:600}}
+.mb-val b{{color:#e8e9ea;font-weight:600}}
 .mb-dot{{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:5px}}
 
 .goal-adjuster{{margin-bottom:12px}}
 .goal-readout{{display:flex;align-items:baseline;gap:6px;margin-bottom:6px}}
 .goal-kg{{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}}
-.goal-kg-unit{{font-size:11px;color:#64748b}}
-.goal-kcal{{margin-left:auto;font-size:12px;color:#94a3b8;font-variant-numeric:tabular-nums}}
-#goal-slider{{width:100%;accent-color:#a78bfa;cursor:pointer}}
-.goal-scale{{display:flex;justify-content:space-between;font-size:9px;color:#475569;
+.goal-kg-unit{{font-size:11px;color:#75777a}}
+.goal-kcal{{margin-left:auto;font-size:12px;color:#a3a6a9;font-variant-numeric:tabular-nums}}
+#goal-slider{{width:100%;accent-color:#88dcfd;cursor:pointer}}
+.goal-scale{{display:flex;justify-content:space-between;font-size:9px;color:#56585a;
              text-transform:uppercase;letter-spacing:.05em;margin-top:2px}}
 .bulk-stats{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
-.bulk-stat{{background:#0f172a;border:1px solid #1e293b;border-radius:7px;padding:8px 10px}}
-.bulk-stat .k{{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.05em}}
+.bulk-stat{{background:#1b1c1e;border:1px solid #2a2c2f;border-radius:7px;padding:8px 10px}}
+.bulk-stat .k{{font-size:9px;color:#75777a;text-transform:uppercase;letter-spacing:.05em}}
 .bulk-stat .v{{font-size:15px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}}
 
 .weight-wrap{{position:relative;height:150px}}
@@ -2437,127 +3682,146 @@ canvas{{position:absolute;top:0;left:0;width:100%;height:100%}}
 
 /* Logged-today card: entries + quick-add only */
 .food-entry-list{{display:flex;flex-direction:column;max-height:230px;overflow-y:auto}}
-.food-entry-row{{display:flex;gap:8px;font-size:11.5px;padding:5px 0;border-bottom:1px solid #16213a}}
-.food-entry-time{{color:#475569;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
-.food-entry-desc{{color:#cbd5e1;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.food-entry-kcal{{color:#64748b;flex-shrink:0;font-variant-numeric:tabular-nums}}
-.food-entry-btn{{background:none;border:none;color:#334155;font-size:11px;cursor:pointer;padding:0 2px;
+.food-entry-row{{display:flex;gap:8px;font-size:11.5px;padding:5px 0;border-bottom:1px solid #25282b}}
+.food-entry-time{{color:#56585a;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.food-entry-desc{{color:#d4d6d8;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.food-entry-kcal{{color:#75777a;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.food-entry-btn{{background:none;border:none;color:#424446;font-size:11px;cursor:pointer;padding:0 2px;
   flex-shrink:0;line-height:1}}
-.food-entry-btn:hover{{color:#a78bfa}}
+.food-entry-btn:hover{{color:#88dcfd}}
 .food-entry-edit-form{{display:flex;gap:4px;width:100%;align-items:center}}
-.food-entry-edit-form input{{background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;
+.food-entry-edit-form input{{background:#1b1c1e;border:1px solid #424446;border-radius:4px;color:#e8e9ea;
   font-size:11px;padding:3px 5px;font-family:inherit;outline:none;min-width:0}}
-.food-entry-edit-form input:focus{{border-color:#a78bfa}}
+.food-entry-edit-form input:focus{{border-color:#88dcfd}}
 .food-entry-edit-form .fe-time{{width:42px;flex-shrink:0}}
 .food-entry-edit-form .fe-desc{{flex:1;min-width:0}}
 .food-entry-edit-form .fe-num{{width:44px;flex-shrink:0}}
-.food-entry-edit-form button{{background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:4px;
+.food-entry-edit-form button{{background:#2a2c2f;border:1px solid #424446;color:#a3a6a9;border-radius:4px;
   font-size:11px;padding:3px 7px;cursor:pointer;flex-shrink:0}}
-.food-entry-edit-form button:hover{{background:#334155;color:#e2e8f0}}
-.food-log-empty{{font-size:11.5px;color:#475569;font-style:italic;padding:2px 0 6px}}
-.week-day{{border-bottom:1px solid #16213a}}
+.food-entry-edit-form button:hover{{background:#424446;color:#e8e9ea}}
+.food-log-empty{{font-size:11.5px;color:#56585a;font-style:italic;padding:2px 0 6px}}
+.week-day{{border-bottom:1px solid #25282b}}
 .week-day:last-child{{border-bottom:none}}
 .week-day summary{{display:flex;align-items:center;justify-content:space-between;gap:8px;
                     padding:7px 0;cursor:pointer;list-style:none;font-size:12px}}
 .week-day summary::-webkit-details-marker{{display:none}}
-.week-day summary::before{{content:'\\25b8';color:#475569;margin-right:6px;font-size:10px}}
+.week-day summary::before{{content:'\\25b8';color:#56585a;margin-right:6px;font-size:10px}}
 .week-day[open] summary::before{{content:'\\25be'}}
-.week-day-label{{color:#cbd5e1;flex:1}}
-.week-day-label.is-today{{color:#a78bfa}}
-.week-day-total{{color:#64748b;font-variant-numeric:tabular-nums;flex-shrink:0}}
+.week-day-label{{color:#d4d6d8;flex:1}}
+.week-day-label.is-today{{color:#88dcfd}}
+.week-day-total{{color:#75777a;font-variant-numeric:tabular-nums;flex-shrink:0}}
 .week-day-entries{{padding:0 0 8px 16px}}
-.week-entry-row{{display:flex;gap:8px;font-size:11px;padding:3px 0;color:#94a3b8}}
-.week-entry-row .food-entry-time{{color:#475569;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.week-entry-row{{display:flex;gap:8px;font-size:11px;padding:3px 0;color:#a3a6a9}}
+.week-entry-row .food-entry-time{{color:#56585a;width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}}
 .week-entry-row .food-entry-desc{{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.week-entry-row .food-entry-kcal{{color:#64748b;flex-shrink:0;font-variant-numeric:tabular-nums}}
+.week-entry-row .food-entry-kcal{{color:#75777a;flex-shrink:0;font-variant-numeric:tabular-nums}}
 .food-input-row{{display:flex;gap:6px;margin-top:10px}}
-.food-input-row input{{flex:1;min-width:0;background:#0f172a;border:1px solid #334155;border-radius:5px;
-  color:#e2e8f0;font-size:12px;padding:6px 9px;font-family:inherit;outline:none}}
-.food-input-row input:focus{{border-color:#a78bfa}}
-.food-input-row button{{background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:5px;
+.food-input-row input{{flex:1;min-width:0;background:#1b1c1e;border:1px solid #424446;border-radius:5px;
+  color:#e8e9ea;font-size:12px;padding:6px 9px;font-family:inherit;outline:none}}
+.food-input-row input:focus{{border-color:#88dcfd}}
+.food-input-row button{{background:#2a2c2f;border:1px solid #424446;color:#a3a6a9;border-radius:5px;
   padding:6px 13px;font-size:11.5px;cursor:pointer;font-family:inherit}}
-.food-input-row button:hover{{background:#334155;color:#e2e8f0}}
+.food-input-row button:hover{{background:#424446;color:#e8e9ea}}
+.mic-btn.recording{{background:#7f1d1d;border-color:#e8837a;color:#fecaca;animation:micpulse 1.2s ease-in-out infinite}}
+.mic-btn.busy{{opacity:.5;cursor:wait}}
+@keyframes micpulse{{0%,100%{{box-shadow:0 0 0 0 rgba(248,113,113,.5)}}50%{{box-shadow:0 0 0 4px rgba(248,113,113,0)}}}}
 .food-status{{font-size:10.5px;margin-top:6px}}
-.food-status.pending{{color:#94a3b8}} .food-status.error{{color:#f87171}}
+.plan-input{{display:flex;gap:6px;align-items:flex-end;margin-top:12px}}
+#plan-box{{flex:1;min-width:0;background:#1d1f22;color:#e8e9ea;border:1px solid #2a2c2f;border-radius:5px;
+          padding:5px 7px;font-size:12px;font-family:inherit;resize:vertical}}
+.plan-btns{{display:flex;gap:5px}}
+.plan-btns button{{background:#2a2c2f;color:#e8e9ea;border:1px solid #424446;border-radius:5px;padding:5px 9px;
+          font-size:11px;cursor:pointer}}
+.plan-btns button:hover{{background:#424446}}
+.plan-grid{{width:100%;border-collapse:collapse;margin-top:8px;font-size:11px}}
+.plan-grid th{{color:#75777a;font-weight:500;text-align:left;font-size:9px;text-transform:uppercase;padding:0 3px 3px}}
+.plan-grid td{{padding:2px 3px}}
+.plan-grid input,.plan-grid select{{width:100%;box-sizing:border-box;background:#1b1c1e;color:#e8e9ea;
+          border:1px solid #424446;border-radius:4px;padding:3px 4px;font-size:11px;font-family:inherit}}
+.plan-grid .pg-date{{width:112px}} .plan-grid .pg-min,.plan-grid .pg-work{{width:48px}}
+.plan-grid .pg-del{{background:none;border:none;color:#75777a;cursor:pointer}}
+.plan-grid .pg-del:hover{{color:#e8837a}}
+.plan-warn{{font-size:11px;color:#e3b95f;margin-top:5px;line-height:1.35}}
+.food-status.pending{{color:#a3a6a9}} .food-status.error{{color:#e8837a}}
 
 /* ── Catch-up-to-pace suggestion ──────────────────────────────────────────── */
 .gap-card{{background:#1c1008;border:1px solid #78350f;border-radius:9px;
            padding:12px 14px;margin-bottom:14px}}
 .gap-head{{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:6px}}
-.gap-head .brief-label{{color:#fbbf24}}
-.gap-amount{{font-size:15px;font-weight:700;color:#fbbf24;font-variant-numeric:tabular-nums}}
-.gap-text{{font-size:13.5px;line-height:1.65;color:#fcd34d}}
+.gap-head .brief-label{{color:#e3b95f}}
+.gap-amount{{font-size:15px;font-weight:700;color:#e3b95f;font-variant-numeric:tabular-nums}}
+.gap-text{{font-size:13.5px;line-height:1.65;color:#e3b95f}}
 
 /* ── Cards: give panel content edges so it does not float in dead space ───── */
-.card{{background:#131c2f;border:1px solid #1e293b;border-radius:9px;padding:14px 16px}}
+.card{{background:#1f2123;border:1px solid #2a2c2f;border-radius:9px;padding:14px 16px}}
 
 /* ── Illness (experimental) ───────────────────────────────────────────────── */
 .ill-panel{{padding:16px 22px;display:flex;flex-direction:column;gap:14px}}
 .ill-head{{display:flex;align-items:center;justify-content:space-between}}
-.badge-exp{{margin-left:9px;font-size:8.5px;letter-spacing:.08em;color:#fbbf24;
+.badge-exp{{margin-left:9px;font-size:8.5px;letter-spacing:.08em;color:#e3b95f;
             background:#2a2110;border:1px solid #4a3a12;border-radius:4px;padding:2px 6px;
             text-transform:uppercase;vertical-align:1px}}
-.ill-today{{font-size:12px;color:#64748b;font-variant-numeric:tabular-nums}}
+.ill-today{{font-size:12px;color:#75777a;font-variant-numeric:tabular-nums}}
 .ill-today b{{font-size:20px;font-weight:600;margin-right:7px}}
 
 .ill-charts{{display:grid;grid-template-columns:1fr 1fr;gap:14px 16px}}
 .ill-charts .chart-wrap{{height:190px}}
-.swatch-x{{color:#475569;letter-spacing:0;text-transform:none;font-size:9.5px}}
+.swatch-x{{color:#56585a;letter-spacing:0;text-transform:none;font-size:9.5px}}
 
 .ill-lower{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:30px;
             align-items:start}}
 .ill-stats{{display:grid;grid-template-columns:repeat(auto-fill,minmax(146px,1fr));gap:8px}}
-.ill-stat{{background:#131c2f;border:1px solid #1e293b;border-radius:7px;padding:8px 10px}}
-.ill-stat .k{{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.06em}}
-.ill-stat .v{{font-size:15px;font-weight:600;color:#e2e8f0;margin-top:2px;
+.ill-stat{{background:#1f2123;border:1px solid #2a2c2f;border-radius:7px;padding:8px 10px}}
+.ill-stat .k{{font-size:9px;color:#75777a;text-transform:uppercase;letter-spacing:.06em}}
+.ill-stat .v{{font-size:15px;font-weight:600;color:#e8e9ea;margin-top:2px;
               font-variant-numeric:tabular-nums}}
-.ill-stat .u{{font-size:10px;color:#475569;font-weight:400;margin-left:2px}}
+.ill-stat .u{{font-size:10px;color:#56585a;font-weight:400;margin-left:2px}}
 
 .ill-episodes{{display:flex;flex-direction:column;gap:5px;max-height:150px;overflow-y:auto}}
-.ill-ep{{display:flex;align-items:baseline;gap:10px;font-size:11.5px;color:#94a3b8;
-         padding:5px 9px;background:#131c2f;border:1px solid #1e293b;border-radius:6px;
+.ill-ep{{display:flex;align-items:baseline;gap:10px;font-size:11.5px;color:#a3a6a9;
+         padding:5px 9px;background:#1f2123;border:1px solid #2a2c2f;border-radius:6px;
          font-variant-numeric:tabular-nums}}
-.ill-ep .dur{{margin-left:auto;color:#475569;font-size:10.5px}}
-.ill-ep .pk{{color:#f87171}}
+.ill-ep .dur{{margin-left:auto;color:#56585a;font-size:10.5px}}
+.ill-ep .pk{{color:#e8837a}}
 
 .ill-about{{max-width:74ch}}
-.ill-about p{{font-size:12.5px;line-height:1.65;color:#94a3b8;margin-bottom:9px}}
-.ill-about em{{color:#cbd5e1;font-style:normal;font-weight:500}}
+.ill-about p{{font-size:12.5px;line-height:1.65;color:#a3a6a9;margin-bottom:9px}}
+.ill-about em{{color:#d4d6d8;font-style:normal;font-weight:500}}
 .ill-warn{{border-left:2px solid #78350f;padding-left:10px;color:#a8a29e !important}}
 
 /* ── Notes: was one carousel panel of four ────────────────────────────────── */
 .notes-panel-full{{padding:18px 22px;display:flex;flex-direction:column;gap:8px;max-width:90ch}}
-.notes-hint{{font-size:9px;color:#475569;text-transform:none;letter-spacing:0}}
-.notes-list{{min-height:0;overflow-y:auto;font-size:12px;color:#cbd5e1;line-height:1.5;
+.notes-hint{{font-size:9px;color:#56585a;text-transform:none;letter-spacing:0}}
+.notes-list{{min-height:0;overflow-y:auto;font-size:12px;color:#d4d6d8;line-height:1.5;
              max-height:calc(100vh - 300px)}}
-.notes-empty{{color:#475569;font-style:italic;font-size:12px}}
-.note-row{{padding:2px 0;border-bottom:1px solid #16213a}}
-.note-added{{color:#4ade80;font-size:11px;padding:3px 0}}
-.note-day{{color:#64748b;font-size:10px;margin-right:7px}}
+.notes-empty{{color:#56585a;font-style:italic;font-size:12px}}
+.note-row{{padding:2px 0;border-bottom:1px solid #25282b}}
+.note-added{{color:#6fcf97;font-size:11px;padding:3px 0}}
+.note-day{{color:#75777a;font-size:10px;margin-right:7px}}
 .notes-input{{display:flex;gap:6px;align-items:flex-end}}
-#note-box{{flex:1;background:#0f1b30;color:#e2e8f0;border:1px solid #1e293b;border-radius:5px;
+#note-box{{flex:1;background:#1d1f22;color:#e8e9ea;border:1px solid #2a2c2f;border-radius:5px;
           padding:5px 7px;font-size:12px;font-family:inherit;resize:none}}
-.notes-input button{{background:#1e293b;color:#e2e8f0;border:none;border-radius:5px;padding:5px 10px;
+.notes-input button{{background:#2a2c2f;color:#e8e9ea;border:none;border-radius:5px;padding:5px 10px;
           font-size:11px;cursor:pointer}}
-.notes-input button:hover{{background:#334155}}
-.notes-input button.notes-clear{{background:transparent;color:#64748b}}
-.notes-input button.notes-clear:hover{{color:#f87171}}
-.brief-label{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}}
-.brief-text{{font-size:15px;color:#94a3b8;line-height:1.65}}
-.tips-text{{color:#cbd5e1;font-size:15px;line-height:1.65}}
-.brief-loading{{color:#475569;font-style:italic}}
-.stat-tooltip{{position:fixed;background:#1e293b;border:1px solid #334155;border-radius:7px;
-               padding:8px 11px;font-size:12px;color:#94a3b8;line-height:1.55;pointer-events:none;
+.notes-input button:hover{{background:#424446}}
+.notes-input button.notes-clear{{background:transparent;color:#75777a}}
+.notes-input button.notes-clear:hover{{color:#e8837a}}
+.brief-label{{font-size:10px;color:#75777a;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}}
+.brief-text{{font-size:15px;color:#a3a6a9;line-height:1.65}}
+.tips-text{{color:#d4d6d8;font-size:15px;line-height:1.65}}
+.brief-loading{{color:#56585a;font-style:italic}}
+.stat-tooltip{{position:fixed;background:#2a2c2f;border:1px solid #424446;border-radius:7px;
+               padding:8px 11px;font-size:12px;color:#a3a6a9;line-height:1.55;pointer-events:none;
                display:none;z-index:999;max-width:280px;
                box-shadow:0 4px 16px rgba(0,0,0,.5);white-space:pre-line}}
-.footer{{padding:7px 18px;border-top:1px solid #1e293b;display:flex;justify-content:flex-end;flex-shrink:0}}
-button{{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:5px;
+.footer{{padding:7px 18px;border-top:1px solid #2a2c2f;display:flex;justify-content:flex-end;flex-shrink:0}}
+button{{background:#2a2c2f;color:#a3a6a9;border:1px solid #424446;border-radius:5px;
         padding:4px 14px;font-size:12px;cursor:pointer}}
-button:hover{{background:#334155;color:#e2e8f0}}
+button:hover{{background:#424446;color:#e8e9ea}}
 #stale-warn {{ display:none; position:fixed; bottom:10px; right:10px; font-size:16px; cursor:default;
   z-index:9999; }}
-#stale-warn .stale-tip {{ display:none; position:absolute; bottom:24px; right:0; background:#1e293b;
-  border:1px solid #f59e0b; border-radius:6px; padding:6px 9px; font-size:11px; color:#fcd34d;
+#stale-warn .stale-tip {{ display:none; position:absolute; bottom:24px; right:0; background:#2a2c2f;
+  border:1px solid #e3b95f; border-radius:6px; padding:6px 9px; font-size:11px; color:#e3b95f;
   white-space:nowrap; pointer-events:none; }}
 #stale-warn:hover .stale-tip {{ display:block; }}
 /* ── Performance tracker ─────────────────────────────────────────────────── */
@@ -2565,100 +3829,200 @@ button:hover{{background:#334155;color:#e2e8f0}}
   padding:18px 22px; gap:10px; }}
 .tracker-top {{ display:flex; gap:12px; align-items:flex-start; }}
 .tracker-radar-col {{ flex-shrink:0; display:flex; flex-direction:column; align-items:center; gap:4px; }}
-.tracker-header {{ font-size:10px; color:#64748b; font-weight:600; letter-spacing:.05em;
+.tracker-header {{ font-size:10px; color:#75777a; font-weight:600; letter-spacing:.05em;
   text-transform:uppercase; }}
 .tracker-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(175px,1fr));
   gap:7px; flex:1; }}
-.metric-card {{ background:#1e293b; border:1px solid #1e3a5f; border-radius:7px;
+.metric-card {{ background:#2a2c2f; border:1px solid #3a3e43; border-radius:7px;
   padding:9px 11px; }}
-.mc-label {{ font-size:10px; color:#64748b; margin-bottom:2px; }}
+.mc-label {{ font-size:10px; color:#75777a; margin-bottom:2px; }}
 .mc-val {{ font-size:20px; font-weight:700; line-height:1; }}
-.mc-date {{ font-size:9px; color:#334155; margin-top:3px; }}
-.mc-bar-wrap {{ height:3px; background:#0f172a; border-radius:2px; margin-top:5px; }}
+.mc-date {{ font-size:9px; color:#424446; margin-top:3px; }}
+.mc-bar-wrap {{ height:3px; background:#1b1c1e; border-radius:2px; margin-top:5px; }}
 .mc-bar-fill {{ height:100%; border-radius:2px; transition:width .6s ease; }}
 .mc-spark {{ width:100%; height:24px; margin-top:4px; display:block; }}
-.mc-notes {{ font-size:9px; color:#475569; margin-top:2px; font-style:italic;
+.mc-notes {{ font-size:9px; color:#56585a; margin-top:2px; font-style:italic;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-.mc-journey {{ font-size:9px; color:#475569; display:flex; justify-content:space-between;
+.mc-journey {{ font-size:9px; color:#56585a; display:flex; justify-content:space-between;
   margin-top:3px; }}
 /* The blanket `canvas{{position:absolute;top:0;left:0}}` rule is meant for the
    chart canvases, which sit inside a position:relative .chart-wrap. The radar has
    no positioned ancestor, so it would anchor to the viewport and cover the header. */
 #c-radar {{ display:block; position:static; }}
 .log-form {{ display:flex; flex-wrap:wrap; gap:5px; align-items:center;
-  padding:8px 10px; background:#1e293b; border-radius:7px; border:1px solid #334155; }}
+  padding:8px 10px; background:#2a2c2f; border-radius:7px; border:1px solid #424446; }}
 .log-form select, .log-form input {{
   -webkit-appearance:none; appearance:none;
-  background:#0f172a; border:1px solid #334155; border-radius:4px;
-  color:#94a3b8; font-size:11px; padding:3px 7px; outline:none; }}
+  background:#1b1c1e; border:1px solid #424446; border-radius:4px;
+  color:#a3a6a9; font-size:11px; padding:3px 7px; outline:none; }}
 .log-form select {{ width:170px; cursor:pointer; }}
-.log-form select option {{ background:#0f172a; color:#94a3b8; }}
+.log-form select option {{ background:#1b1c1e; color:#a3a6a9; }}
 .log-form input[type=number] {{ width:72px; }}
 .log-form input[type=text]   {{ flex:1; min-width:80px; }}
-.log-form select:focus, .log-form input:focus {{ border-color:#475569; color:#e2e8f0; }}
-.log-form .log-btn {{ background:#312e81; border-color:#4338ca; color:#c7d2fe;
+.log-form select:focus, .log-form input:focus {{ border-color:#56585a; color:#e8e9ea; }}
+.log-form .log-btn {{ background:#2c6a83; border-color:#34a2ce; color:#c7d2fe;
   font-size:11px; padding:3px 12px; }}
-.log-form .log-btn:hover {{ background:#3730a3; }}
-.log-added {{ font-size:10px; color:#4ade80; padding:2px 0; }}
+.log-form .log-btn:hover {{ background:#2d84a6; }}
+.log-added {{ font-size:10px; color:#6fcf97; padding:2px 0; }}
 
 /* ── Modular tracker: goals / key metrics / stored ─────────────────────────── */
 .tracker-cols {{ flex:1; min-width:0; }}
 .tier-head {{ display:flex; align-items:baseline; gap:10px; margin-bottom:7px; }}
-.tier-hint {{ font-size:9.5px; color:#475569; }}
-.radar-hint {{ font-size:9px; color:#475569; margin-top:2px; }}
+.tier-hint {{ font-size:9.5px; color:#56585a; }}
+.radar-hint {{ font-size:9px; color:#56585a; margin-top:2px; }}
 .add-metric-btn {{ margin-left:auto; font-size:10.5px; padding:2px 9px;
-  background:#1e293b; border:1px solid #334155; color:#94a3b8; border-radius:5px; cursor:pointer; }}
-.add-metric-btn:hover {{ background:#334155; color:#e2e8f0; }}
+  background:#2a2c2f; border:1px solid #424446; color:#a3a6a9; border-radius:5px; cursor:pointer; }}
+.add-metric-btn:hover {{ background:#424446; color:#e8e9ea; }}
 
 .goals-section {{ display:flex; flex-direction:column; gap:12px; margin-bottom:6px; }}
-.goal-empty {{ font-size:11.5px; color:#475569; background:#131c2f; border:1px dashed #1e3a5f;
+.goal-empty {{ font-size:11.5px; color:#56585a; background:#1f2123; border:1px dashed #3a3e43;
   border-radius:8px; padding:12px 14px; }}
-.goal-card {{ background:#131c2f; border:1px solid #1e3a5f; border-radius:9px; padding:12px 14px; }}
+.goal-card {{ background:#1f2123; border:1px solid #3a3e43; border-radius:9px; padding:12px 14px; }}
 .goal-head {{ display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:8px; }}
-.goal-label {{ font-size:13px; font-weight:600; color:#e2e8f0; }}
-.goal-sub {{ font-size:10px; color:#64748b; margin-top:2px; font-variant-numeric:tabular-nums; }}
+.goal-label {{ font-size:13px; font-weight:600; color:#e8e9ea; }}
+.goal-sub {{ font-size:10px; color:#75777a; margin-top:2px; font-variant-numeric:tabular-nums; }}
 .goal-now {{ text-align:right; font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }}
-.goal-pct {{ display:block; font-size:10px; color:#64748b; font-weight:400; }}
+.goal-pct {{ display:block; font-size:10px; color:#75777a; font-weight:400; }}
 .goal-wrap {{ position:relative; height:150px; }}
 .tier-pill {{ margin-left:8px; font-size:8px; letter-spacing:.08em; text-transform:uppercase;
-  color:#67e8f9; background:#0b2b33; border:1px solid #155e6b; border-radius:4px; padding:2px 5px;
+  color:#d3d5d7; background:#2b2d30; border:1px solid #424446; border-radius:4px; padding:2px 5px;
   vertical-align:2px; font-weight:600; }}
 
 .mc-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:6px; }}
 .mc-actions {{ display:flex; align-items:center; gap:3px; flex-shrink:0; }}
-.mc-none {{ font-size:10.5px; color:#475569; font-style:italic; margin:6px 0; }}
+.mc-none {{ font-size:10.5px; color:#56585a; font-style:italic; margin:6px 0; }}
 .mc-pb {{ display:flex; align-items:baseline; gap:6px; margin-top:5px; font-size:10px; }}
-.pb-tag {{ color:#22d3ee; text-transform:uppercase; letter-spacing:.05em; font-size:8.5px;
-  border:1px solid #155e6b; background:#0b2b33; border-radius:3px; padding:1px 4px; }}
-.pb-val {{ color:#67e8f9; font-weight:600; font-variant-numeric:tabular-nums; }}
-.pb-date {{ color:#475569; margin-left:auto; font-variant-numeric:tabular-nums; }}
+.pb-tag {{ color:#b79cf0; text-transform:uppercase; letter-spacing:.05em; font-size:8.5px;
+  border:1px solid #424446; background:#2b2d30; border-radius:3px; padding:1px 4px; }}
+.pb-val {{ color:#d3d5d7; font-weight:600; font-variant-numeric:tabular-nums; }}
+.pb-date {{ color:#56585a; margin-left:auto; font-variant-numeric:tabular-nums; }}
 .metric-card.stored {{ opacity:.62; }}
 .metric-card.stored:hover {{ opacity:1; }}
 .metric-card.empty {{ border-style:dashed; }}
 
 .tier-btns {{ display:flex; gap:1px; }}
 .tier-btn, .edit-btn {{ background:none; border:1px solid transparent; border-radius:4px;
-  color:#475569; font-size:11px; line-height:1; padding:2px 4px; cursor:pointer; }}
-.tier-btn:hover, .edit-btn:hover {{ color:#94a3b8; background:#0f172a; }}
-.tier-btn.active {{ color:#a78bfa; border-color:#a78bfa; background:#1e1b4b; }}
+  color:#56585a; font-size:11px; line-height:1; padding:2px 4px; cursor:pointer; }}
+.tier-btn:hover, .edit-btn:hover {{ color:#a3a6a9; background:#1b1c1e; }}
+.tier-btn.active {{ color:#88dcfd; border-color:#88dcfd; background:#1a3e4c; }}
 
-.metric-form {{ margin-top:9px; padding:10px; background:#0f172a; border:1px solid #334155;
+.metric-form {{ margin-top:9px; padding:10px; background:#1b1c1e; border:1px solid #424446;
   border-radius:7px; display:flex; flex-wrap:wrap; gap:7px; }}
-.metric-form label {{ display:flex; flex-direction:column; gap:2px; font-size:9px; color:#64748b;
+.metric-form label {{ display:flex; flex-direction:column; gap:2px; font-size:9px; color:#75777a;
   text-transform:uppercase; letter-spacing:.05em; }}
 .metric-form label.chk {{ flex-direction:row; align-items:center; gap:5px; text-transform:none;
-  letter-spacing:0; font-size:10.5px; color:#94a3b8; }}
+  letter-spacing:0; font-size:10.5px; color:#a3a6a9; }}
 .metric-form input[type=text], .metric-form input[type=number], .metric-form select {{
-  -webkit-appearance:none; appearance:none; background:#1e293b; border:1px solid #334155;
-  border-radius:4px; color:#e2e8f0; font-size:11px; padding:4px 6px; width:104px; outline:none; }}
-.metric-form input:focus, .metric-form select:focus {{ border-color:#a78bfa; }}
+  -webkit-appearance:none; appearance:none; background:#2a2c2f; border:1px solid #424446;
+  border-radius:4px; color:#e8e9ea; font-size:11px; padding:4px 6px; width:104px; outline:none; }}
+.metric-form input:focus, .metric-form select:focus {{ border-color:#88dcfd; }}
 .metric-form-actions {{ display:flex; gap:6px; align-items:flex-end; width:100%; }}
 .metric-form-actions button {{ font-size:11px; padding:3px 11px; }}
 .metric-form-actions .danger {{ margin-left:auto; background:transparent; border-color:#7f1d1d;
-  color:#f87171; }}
+  color:#e8837a; }}
 .metric-form-actions .danger:hover {{ background:#7f1d1d; color:#fecaca; }}
-.metric-err {{ margin-top:8px; font-size:11px; color:#f87171; background:#2a1010;
+.metric-err {{ margin-top:8px; font-size:11px; color:#e8837a; background:#2a1010;
   border:1px solid #7f1d1d; border-radius:6px; padding:7px 10px; }}
+
+/* ══ Theme layer: flat surfaces, one accent, status-only colour ═══════════════ */
+:root{{color-scheme:dark}}
+::-webkit-scrollbar{{width:8px;height:8px}}
+::-webkit-scrollbar-thumb{{background:#323436;border-radius:4px}}
+::-webkit-scrollbar-track{{background:transparent}}
+
+.header{{border-bottom:none;padding:18px 26px 4px;gap:14px}}
+.header h1{{font-size:15px;font-weight:600;letter-spacing:-.01em}}
+.header .date{{font-size:12px;color:#75777a}}
+.tabs{{gap:22px;margin-left:26px}}
+.tab{{border:none;border-radius:0;background:none;padding:6px 0;font-size:13px;color:#75777a;
+      border-bottom:2px solid transparent}}
+.tab:hover{{background:none;color:#d4d6d8}}
+.tab[aria-selected="true"]{{background:none;color:#e8e9ea;border-bottom-color:#88dcfd}}
+
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:14px 18px;border-bottom:none;padding:14px 26px 18px;align-items:start}}
+.stat{{border-left:none;padding:0;min-width:0}}
+.label{{font-size:10px;letter-spacing:.08em;margin-bottom:4px}}
+.value{{font-size:17px;font-weight:600;overflow:hidden;text-overflow:ellipsis}}
+.sub{{font-size:11px;-webkit-line-clamp:2}}
+#illness-sub + div{{display:none}}
+.metric-card.empty,.goal-empty{{border:1px dashed rgba(159,165,173,.28)!important;background:transparent!important}}
+.pace-top{{display:flex;justify-content:space-between;font-size:13px;margin:2px 0 8px;color:#a3a6a9}}
+.pace-top b{{color:#e8e9ea;font-size:15px}}
+.pace-bar{{position:relative;height:34px;border-radius:9px;background:rgba(159,165,173,.1);overflow:visible}}
+.pace-seg{{position:absolute;top:0;bottom:0;border-radius:6px;display:flex;cursor:default;overflow:hidden;transition:filter .12s}}
+.pace-seg i{{display:block;height:100%}}
+.pace-seg span{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10.5px;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.65);pointer-events:none}}
+.pace-legend{{display:flex;gap:14px;align-items:center;font-size:11px;color:#a3a6a9;margin-top:6px}}
+.pace-legend i{{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px}}
+.pace-seg:hover{{filter:brightness(1.25)}}
+.pace-rest{{position:absolute;top:0;bottom:0;cursor:default}}
+.pace-marker{{position:absolute;top:-5px;bottom:-5px;width:10px;margin-left:-5px;cursor:default;
+  background:linear-gradient(90deg,transparent 4px,#e8e9ea 4px,#e8e9ea 6px,transparent 6px)}}
+.pace-target{{position:absolute;top:0;bottom:0;width:0;border-right:2px dashed rgba(159,165,173,.5)}}
+.pace-axis{{position:relative;height:18px;margin-top:6px;font-size:10.5px;color:#75777a}}
+.pace-axis span{{position:absolute;transform:translateX(-50%);white-space:nowrap}}
+.pace-axis span:first-child{{left:0;transform:none}}
+.pace-axis span.r{{right:0;left:auto;transform:none}}
+.pace-tip{{position:fixed;display:none;z-index:999;max-width:320px;background:#2a2c2f;border-radius:8px;padding:9px 12px;
+  font-size:12px;line-height:1.55;color:#d4d6d8;pointer-events:none;box-shadow:0 6px 24px rgba(0,0,0,.45)}}
+.pace-tip b{{color:#e8e9ea}}
+.week-day-actions{{margin-top:6px}}
+.week-day-actions button{{font-size:11px;padding:3px 10px}}
+.flash{{animation:flashbg 1.6s ease-out}}
+@keyframes flashbg{{0%{{background:rgba(139,219,250,.18)}}100%{{background:transparent}}}}
+.stat-link:hover .value{{color:#e8e9ea}}
+
+.nutr-card,.today-dials,.card,.goal-card,.metric-card,.ill-stat,.bulk-stat,.stat-tooltip{{
+  background:rgba(159,165,173,.055);border:none;border-radius:12px}}
+.bulk-stat,.ill-stat{{background:rgba(159,165,173,.05);border-radius:9px}}
+.gap-card{{background:rgba(227,185,95,.07);border:none;border-radius:12px}}
+.nutr-card,.today-dials,.card{{padding:16px 18px}}
+.stat-tooltip{{background:#2a2c2f;box-shadow:0 6px 24px rgba(0,0,0,.4)}}
+.brief-label,.chart-label,.nutr-card-h{{font-size:10.5px;font-weight:500;letter-spacing:.08em;color:#75777a}}
+.today-dash,.nutr-dash{{gap:18px}}
+
+input,select,textarea{{color-scheme:dark;background:rgba(159,165,173,.08);border:1px solid transparent;
+  border-radius:8px;color:#e8e9ea;padding:6px 10px;font-family:inherit;font-size:13px;outline:none}}
+input:focus,select:focus,textarea:focus{{border-color:#88dcfd}}
+input::placeholder,textarea::placeholder{{color:#75777a}}
+button{{background:rgba(159,165,173,.1);border:none;border-radius:8px;color:#d4d6d8;
+  padding:6px 14px;font-family:inherit;font-size:12.5px;cursor:pointer}}
+button:hover{{background:rgba(159,165,173,.18)}}
+.food-input-row input,.food-input-row button,.plan-btns button,#plan-box,#note-box,
+.food-entry-edit-form input,.food-entry-edit-form button,.metric-form,.metric-form input{{
+  border:1px solid transparent;background:rgba(159,165,173,.08);border-radius:8px}}
+.btn{{background:rgba(139,219,250,.16);color:#ccf1ff;border:none;border-radius:8px;padding:6px 14px;
+  font-size:12.5px;cursor:pointer}}
+.btn:hover{{background:rgba(139,219,250,.26)}}
+#life-lists,#focus-root{{font-size:13.5px;line-height:1.5}}
+.perf-toolbar{{display:flex;align-items:center;gap:8px;padding:2px 0 14px}}
+.pm-overlay{{position:fixed;inset:0;background:rgba(10,11,12,.62);display:flex;align-items:center;justify-content:center;z-index:60}}
+.pm-dialog{{width:min(480px,92vw);max-height:90vh;overflow-y:auto;background:#212325;border-radius:16px;padding:22px 24px;
+  box-shadow:0 20px 60px rgba(0,0,0,.5)}}
+.pm-title{{font-size:16px;font-weight:600;margin-bottom:14px}}
+.pm-field{{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;flex:1;min-width:0}}
+.pm-field>label,.pm-field label:first-child{{font-size:11px;color:#a3a6a9;letter-spacing:.03em}}
+.pm-field input[type=text],.pm-field input[type=number],.pm-field input[type=date],.pm-field select{{width:100%;padding:8px 10px;font-size:13px}}
+.pm-row{{display:flex;gap:10px;align-items:flex-start}}
+.pm-opt{{color:#75777a;font-weight:400;text-transform:none}}
+.pm-hint{{font-size:11.5px;color:#75777a;min-height:16px}}
+.pm-hint b{{color:#d4d6d8;font-weight:600}}
+.pm-err{{color:#e8837a;font-size:12px;min-height:16px}}
+.pm-actions{{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}}
+.pm-more{{margin:2px 0 10px;font-size:12px;color:#a3a6a9}}
+.pm-more summary{{cursor:pointer;margin-bottom:10px}}
+.pm-dialog label.chk,.metric-form label.chk{{display:flex;flex-direction:row;align-items:center;gap:6px;font-size:12px;color:#a3a6a9;margin:4px 0}}
+.sl-chip{{display:inline-block;padding:5px 11px;margin:0 6px 6px 0;border-radius:8px;background:rgba(159,165,173,.08);
+  color:#a3a6a9;cursor:pointer;font-size:12.5px;user-select:none}}
+.sl-chip:hover{{background:rgba(159,165,173,.16)}}
+.sl-chip.on{{background:rgba(139,219,250,.22);color:#e8e9ea}}
+.sl-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:14px}}
+.sl-tiles{{display:grid;grid-template-columns:repeat(auto-fit,minmax(138px,1fr));gap:12px}}
+.sl-tile .v{{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}}
+.sl-tile .d{{font-size:11.5px;color:#75777a;margin-top:2px}}
+#sleep-root{{font-size:13.5px}}
+#life-lists{{margin-top:16px}}
+#life-form{{gap:8px!important}}
 </style></head>
 <body>
 <div class="header">
@@ -2669,8 +4033,11 @@ button:hover{{background:#334155;color:#e2e8f0}}
     <button class="tab" role="tab" aria-selected="false" data-panel="trends">Trends</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="nutrition">Nutrition</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="perf">Performance</button>
-    <button class="tab" role="tab" aria-selected="false" data-panel="illness">Illness</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="oya">Vs Last Year</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="focus">Focus</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="life">Life</button>
   </div>
+  <select id="appSwitch" onchange="openApp(this.value)" title="Open another app"><option value="">Apps</option><option value="journal">Paper Journal</option><option value="calendar">Calendar</option><option value="todo">Todo</option><option value="maths">Maths Panel</option><option value="revise">Revision Brief</option></select>
   <select id="periodSelect" onchange="setPeriod(this.value)">
     <option value="14">14 days</option>
     <option value="30">30 days</option>
@@ -2700,7 +4067,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
       </div>
 
       <div class="today-sleep">
-        <div class="brief-label">Sleep Debt <span class="nutr-card-sub">EMA τ=5d vs 8h/night · <span style="color:#4ade80">─</span> 9.5h <span style="color:#fbbf24">─</span> 8.5h <span style="color:#f87171">─</span> trend</span></div>
+        <div class="brief-label">Sleep Debt <span class="nutr-card-sub">EMA τ=5d vs 8h/night · <span style="color:#6fcf97">─</span> 9.5h <span style="color:#e3b95f">─</span> 8.5h <span style="color:#e8837a">─</span> trend</span></div>
         <div class="chart-wrap" id="w-slp"><canvas id="c-slp"></canvas></div>
       </div>
 
@@ -2754,7 +4121,13 @@ button:hover{{background:#334155;color:#e2e8f0}}
   <section class="panel" data-panel="nutrition">
     <div class="nutr-dash">
 
-      <div class="nutr-card cal-ring-card">
+      <div class="nutr-card pace-card" id="nutr-pace">
+        <div class="nutr-card-h">Today&rsquo;s pace <span class="nutr-card-sub">each block is a meal &middot; hover for details</span></div>
+        <div id="pace-bar-host"></div>
+        <div class="pace-tip" id="pace-tip"></div>
+      </div>
+
+      <div class="nutr-card cal-ring-card" id="nutr-cal">
         <div class="nutr-card-h">Energy today</div>
         <div class="cal-ring-wrap"><canvas id="c-cal-ring"></canvas>
           <div class="cal-ring-mid" id="cal-ring-mid"></div>
@@ -2775,7 +4148,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
         <div class="macro-break" id="macro-break"></div>
       </div>
 
-      <div class="nutr-card bulk-card">
+      <div class="nutr-card bulk-card" id="nutr-bulk">
         <div class="nutr-card-h">Body composition goal</div>
         <div class="goal-adjuster">
           <div class="goal-readout">
@@ -2827,6 +4200,11 @@ button:hover{{background:#334155;color:#e2e8f0}}
 
   <section class="panel" data-panel="perf">
     <div class="tracker-view" id="tracker-view">
+      <div class="perf-toolbar">
+        <button class="btn" onclick="openLogModal()">+ Log result</button>
+        <button onclick="openAddMetric()">+ New metric</button>
+        <span id="log-confirm" class="log-added"></span>
+      </div>
       <div class="goals-section" id="goals-section"></div>
 
       <div class="tracker-top">
@@ -2845,31 +4223,56 @@ button:hover{{background:#334155;color:#e2e8f0}}
           <div class="tier-head" style="margin-top:14px">
             <span class="tracker-header">Stored</span>
             <span class="tier-hint">☆ tracked, off the profile</span>
-            <button class="add-metric-btn" onclick="openAddMetric()">+ Add metric</button>
+            
           </div>
           <div class="tracker-grid" id="bank-cards" style="align-content:start"></div>
         </div>
       </div>
 
-      <div class="metric-form" id="add-metric-form" style="display:none"></div>
       <div class="metric-err" id="metric-err" style="display:none"></div>
-      <div class="log-form" id="log-form">
-          <select id="log-metric">
-            <option value="">— metric —</option>
-            {metric_options_html}
-          </select>
-          <input id="log-value" type="number" step="0.5" placeholder="Value">
-          <input id="log-reps"  type="number" step="1"   placeholder="×reps">
-          <input id="log-notes" type="text" placeholder="Notes (optional)">
-          <button class="log-btn" onclick="submitMetric()">Add</button>
-          <span id="log-confirm" class="log-added"></span>
-      </div>
     </div>
+  </section>
+
+  <div class="pm-overlay" id="pm-overlay" style="display:none" onclick="if(event.target===this)pmClose()">
+    <div class="pm-dialog" id="pm-dialog"></div>
+  </div>
+
+  <section class="panel" data-panel="oya">
+    {oya_html}
+  </section>
+
+  <section class="panel" data-panel="sleep">
+    <div style="padding:22px 26px;max-width:1180px">
+      <a href="#" class="back-link" onclick="selectTab('today');return false">&larr; Back</a>
+      <div id="sleep-root" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="life">
+    <div style="padding:22px 26px;max-width:1040px">
+      <div class="brief-label">Add</div>
+      <div id="life-form" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 4px">
+        <select id="lf-type"><option value="todo">Todo</option><option value="event">Event</option></select>
+        <input type="text" id="lf-title" placeholder="What?" style="flex:1;min-width:200px">
+        <select id="lf-area"></select>
+        <input type="date" id="lf-date" title="Due date (todo, optional) or date (event)">
+        <input type="time" id="lf-start" title="Start (events)">
+        <input type="time" id="lf-end" title="End (events)">
+        <select id="lf-repeat"><option value="">no repeat</option><option value="daily">daily</option><option value="weekly">weekly</option></select>
+        <button class="btn" id="lf-add">Add</button>
+      </div>
+      <div id="life-lists"></div>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="focus">
+    <div id="focus-root" style="padding:22px 26px;max-width:900px"></div>
   </section>
 
   <section class="panel" data-panel="illness">
     <div class="ill-panel">
       <div class="ill-head">
+        <a href="#" class="back-link" onclick="selectTab('today');return false">&larr; Back</a>
         <div class="brief-label" style="margin:0">Illness Risk<span class="badge-exp">Experimental</span></div>
         <div class="ill-today" id="ill-today"></div>
       </div>
@@ -2877,15 +4280,15 @@ button:hover{{background:#334155;color:#e2e8f0}}
       <div class="ill-charts">
         <div class="chart-cell">
           <div class="chart-label">P(sick) posterior · full history
-            <span class="swatch-x" style="color:#f87171">─ risk</span>
-            <span class="swatch-x" style="color:#475569">┈ p = {sick_thresh_str} episode threshold</span>
+            <span class="swatch-x" style="color:#e8837a">─ risk</span>
+            <span class="swatch-x" style="color:#56585a">┈ p = {sick_thresh_str} episode threshold</span>
           </div>
           <div class="chart-wrap" id="w-ill-risk"><canvas id="c-ill-risk"></canvas></div>
         </div>
         <div class="chart-cell">
           <div class="chart-label">Resting HR — the only signal the model reads
-            <span class="swatch-x" style="color:#fb923c">─ RHR</span>
-            <span class="swatch-x" style="color:#f87171">▮ detected episode</span>
+            <span class="swatch-x" style="color:#e3b95f">─ RHR</span>
+            <span class="swatch-x" style="color:#e8837a">▮ detected episode</span>
           </div>
           <div class="chart-wrap" id="w-ill-rhr"><canvas id="c-ill-rhr"></canvas></div>
         </div>
@@ -2932,7 +4335,7 @@ button:hover{{background:#334155;color:#e2e8f0}}
   <button id="refresh-btn" onclick="triggerRefresh()" style="margin-right:8px">Refresh</button>
   <button onclick="document.title='__close__'">Dismiss</button>
 </div>
-<div id="tooltip" style="position:fixed;background:#1e293b;border:1px solid #334155;
+<div id="tooltip" style="position:fixed;background:#2a2c2f;border:1px solid #424446;
      border-radius:7px;padding:8px 12px;font-size:11px;pointer-events:none;
      display:none;z-index:999;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,.4)"></div>
 <div class="stat-tooltip" id="stat-tip"></div>
@@ -2982,17 +4385,17 @@ function chartAxes(ctx, W, H, lo, hi, ticks, PAD, dates) {{
   const yOf=v=>PAD.top+(1-(v-lo)/span)*cH;
   for (let t=0;t<=ticks;t++) {{
     const v=lo+span*t/ticks, y=yOf(v);
-    ctx.strokeStyle='#1e293b'; ctx.lineWidth=1;
+    ctx.strokeStyle='#2a2c2f'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(PAD.left,y); ctx.lineTo(PAD.left+cW,y); ctx.stroke();
-    ctx.fillStyle='#475569'; ctx.font='9px system-ui'; ctx.textAlign='right';
+    ctx.fillStyle='#56585a'; ctx.font='9px system-ui'; ctx.textAlign='right';
     ctx.fillText(Math.round(v),PAD.left-3,y+3);
   }}
   if (lo<0&&hi>0) {{
-    const y0=yOf(0); ctx.strokeStyle='#475569'; ctx.lineWidth=1;
+    const y0=yOf(0); ctx.strokeStyle='#56585a'; ctx.lineWidth=1;
     ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(PAD.left,y0); ctx.lineTo(PAD.left+cW,y0); ctx.stroke(); ctx.setLineDash([]);
   }}
   const n=dates.length, lbls=[0,Math.floor(n*.25),Math.floor(n*.5),Math.floor(n*.75),n-1];
-  ctx.fillStyle='#475569'; ctx.font='9px system-ui'; ctx.textAlign='center';
+  ctx.fillStyle='#56585a'; ctx.font='9px system-ui'; ctx.textAlign='center';
   for (const i of lbls) {{
     if(i>=dates.length) continue;
     const d=new Date(dates[i]+'T00:00:00');
@@ -3008,7 +4411,7 @@ function sliceByDays(dates,...arrays) {{
 }}
 
 function drawTodayLine(ctx,x,PAD,H) {{
-  ctx.strokeStyle='#334155'; ctx.lineWidth=1; ctx.setLineDash([2,3]);
+  ctx.strokeStyle='#424446'; ctx.lineWidth=1; ctx.setLineDash([2,3]);
   ctx.beginPath(); ctx.moveTo(x,PAD.top); ctx.lineTo(x,H-PAD.bottom); ctx.stroke(); ctx.setLineDash([]);
 }}
 
@@ -3052,16 +4455,16 @@ function drawCtl() {{
   drawTodayLine(ctx,xOf(nHist-1),PAD,H);
   drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projCtl,sigCtl,'rgba(34,211,238,.18)');
   drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projAtl,sigAtl,'rgba(248,113,113,.18)');
-  plotSeries(ctx,i=>xOf(i),yOf,ctl,'#22d3ee',1.8);
-  plotSeries(ctx,i=>xOf(i),yOf,atl,'#f87171',1.8);
-  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projCtl,'#22d3ee',1.2,true);
-  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projAtl,'#f87171',1.2,true);
+  plotSeries(ctx,i=>xOf(i),yOf,ctl,'#b79cf0',1.8);
+  plotSeries(ctx,i=>xOf(i),yOf,atl,'#e8837a',1.8);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projCtl,'#b79cf0',1.2,true);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projAtl,'#e8837a',1.2,true);
   const ctlTip=[...ctl,...DATA.projCtl.slice(1)], atlTip=[...atl,...DATA.projAtl.slice(1)];
   const ctlSigTip=[...ctl.map(()=>null),...sigCtl.slice(1)];
   const atlSigTip=[...atl.map(()=>null),...sigAtl.slice(1)];
   CHART_META['c-ctl']={{dates:fullDates,PAD,yOf,series:[
-    {{label:'CTL',data:ctlTip,sigmaData:ctlSigTip,color:'#22d3ee',fmt:v=>Math.round(v)+''}},
-    {{label:'ATL',data:atlTip,sigmaData:atlSigTip,color:'#f87171',fmt:v=>Math.round(v)+''}},
+    {{label:'CTL',data:ctlTip,sigmaData:ctlSigTip,color:'#b79cf0',fmt:v=>Math.round(v)+''}},
+    {{label:'ATL',data:atlTip,sigmaData:atlSigTip,color:'#e8837a',fmt:v=>Math.round(v)+''}},
   ]}};
 }}
 
@@ -3099,11 +4502,11 @@ function drawTsb() {{
     ctx.bezierCurveTo(p1.x+(p2.x-p0.x)/6,p1.y+(p2.y-p0.y)/6,p2.x-(p3.x-p1.x)/6,p2.y-(p3.y-p1.y)/6,p2.x,p2.y);
     ctx.stroke();
   }}
-  drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projTsb,sigTsb,'rgba(148,163,184,.22)');
-  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projTsb,'#94a3b8',1.2,true);
+  drawProjBand(ctx,i=>xOf(nHist-1+i),yOf,DATA.projTsb,sigTsb,'rgba(159,165,173,.22)');
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.projTsb,'#a3a6a9',1.2,true);
   for(const s of DATA.planSessions) {{
     const di=fullDates.indexOf(s.date); if(di<0) continue;
-    ctx.fillStyle='#fbbf24'; ctx.beginPath(); ctx.arc(xOf(di),PAD.top+6,3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#e3b95f'; ctx.beginPath(); ctx.arc(xOf(di),PAD.top+6,3,0,Math.PI*2); ctx.fill();
   }}
   const tsbTip=[...tsb,...DATA.projTsb.slice(1)];
   const tsbSigTip=[...tsb.map(()=>null),...sigTsb.slice(1)];
@@ -3137,11 +4540,11 @@ function drawHrv() {{
     }});
   }}
   chartAxes(ctx,W,H,lo,hi,4,PAD,dates);
-  plotSeries(ctx,xOf,yOf,hrv,'#f472b6',1.8);
-  plotSeries(ctx,xOf,yOf,rhr,'#fb923c',1.6);
+  plotSeries(ctx,xOf,yOf,hrv,'#88dcfd',1.8);
+  plotSeries(ctx,xOf,yOf,rhr,'#e3b95f',1.6);
   CHART_META['c-hrv']={{dates,PAD,yOf,series:[
-    {{label:'HRV',data:hrv,color:'#f472b6',fmt:v=>Math.round(v)+''}},
-    {{label:'RHR',data:rhr,color:'#fb923c',fmt:v=>Math.round(v)+' bpm'}},
+    {{label:'HRV',data:hrv,color:'#88dcfd',fmt:v=>Math.round(v)+''}},
+    {{label:'RHR',data:rhr,color:'#e3b95f',fmt:v=>Math.round(v)+' bpm'}},
   ]}};
 }}
 
@@ -3164,14 +4567,14 @@ function drawHil() {{
   chartAxes(ctx,W,H,lo,hi,4,PAD,fullDates);
   const nHist=dates.length;
   drawTodayLine(ctx,xOf(nHist-1),PAD,H);
-  plotSeries(ctx,i=>xOf(i),yOf,hil,'#a78bfa',1.8);
+  plotSeries(ctx,i=>xOf(i),yOf,hil,'#88dcfd',1.8);
   if(projExtra.length) {{
     const anchor=[hil[hil.length-1],...projExtraHil];
-    plotSeries(ctx,i=>xOf(nHist-1+i),yOf,anchor,'#a78bfa',1.2,true);
+    plotSeries(ctx,i=>xOf(nHist-1+i),yOf,anchor,'#88dcfd',1.2,true);
   }}
   const hilTip=[...hil,...projExtraHil];
   CHART_META['c-hil']={{dates:fullDates,PAD,yOf,series:[
-    {{label:'Z4+ load',data:hilTip,color:'#a78bfa',fmt:v=>v.toFixed(1)+' min'}},
+    {{label:'Z4+ load',data:hilTip,color:'#88dcfd',fmt:v=>v.toFixed(1)+' min'}},
   ]}};
 }}
 
@@ -3210,23 +4613,23 @@ function drawSleep() {{
 
   // Historical line
   const pts=bal.map((v,i)=>v!=null?{{x:xOf(i),y:yOf(v)}}:null).filter(Boolean);
-  ctx.strokeStyle='#67e8f9'; ctx.lineWidth=1.5; ctx.lineJoin='round';
+  ctx.strokeStyle='#d3d5d7'; ctx.lineWidth=1.5; ctx.lineJoin='round';
   ctx.beginPath(); drawSmooth(ctx,pts); ctx.stroke();
 
   // Projection lines (dashed), anchored at today (nHist-1)
-  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjBest, '#4ade80',1.2,true);
-  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjMed,  '#fbbf24',1.2,true);
-  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjTrend,'#f87171',1.2,true);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjBest, '#6fcf97',1.2,true);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjMed,  '#e3b95f',1.2,true);
+  plotSeries(ctx,i=>xOf(nHist-1+i),yOf,DATA.slpProjTrend,'#e8837a',1.2,true);
 
   // Tooltip data: history + best-case projection for hover
   const balTip=[...bal,...DATA.slpProjBest.slice(1)];
   const medTip=[...bal.map(()=>null),...DATA.slpProjMed.slice(1)];
   const trendTip=[...bal.map(()=>null),...DATA.slpProjTrend.slice(1)];
   CHART_META['c-slp']={{dates:fullDates,PAD,yOf,series:[
-    {{label:'Sleep debt',  data:balTip,   color:'#67e8f9',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
-    {{label:'Best (9.5h)', data:[...bal.map(()=>null),...DATA.slpProjBest.slice(1)],  color:'#4ade80',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
-    {{label:'Med (8.5h)',  data:medTip,   color:'#fbbf24',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
-    {{label:'Trend (' + DATA.slpAvg + 'h)',data:trendTip,color:'#f87171',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Sleep debt',  data:balTip,   color:'#d3d5d7',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Best (9.5h)', data:[...bal.map(()=>null),...DATA.slpProjBest.slice(1)],  color:'#6fcf97',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Med (8.5h)',  data:medTip,   color:'#e3b95f',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
+    {{label:'Trend (' + DATA.slpAvg + 'h)',data:trendTip,color:'#e8837a',fmt:v=>(v>=0?'+':'')+v.toFixed(1)+'h'}},
   ]}};
 }}
 
@@ -3250,25 +4653,25 @@ function addHoverToChart(cid, wid) {{
     ov.width=W*dpr; ov.height=H*dpr;
     const ctx=ov.getContext('2d'); ctx.scale(dpr,dpr);
     const xPos=PAD.left+(idx/Math.max(n-1,1))*cW;
-    ctx.strokeStyle='rgba(148,163,184,.4)'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+    ctx.strokeStyle='rgba(159,165,173,.4)'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
     ctx.beginPath(); ctx.moveTo(xPos,PAD.top); ctx.lineTo(xPos,H-PAD.bottom); ctx.stroke(); ctx.setLineDash([]);
     for(const s of series) {{
       const v=s.data[idx]; if(v==null) continue;
       const yPos=yOf(v), col=s.colorFn?s.colorFn(v):s.color;
       ctx.fillStyle=col; ctx.beginPath(); ctx.arc(xPos,yPos,4,0,Math.PI*2); ctx.fill();
-      ctx.strokeStyle='#0f172a'; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.strokeStyle='#1b1c1e'; ctx.lineWidth=1.5; ctx.stroke();
     }}
     const d=new Date(dates[idx]+'T00:00:00');
     const dStr=d.toLocaleDateString('en-GB',{{weekday:'short',day:'numeric',month:'short'}});
     const isProj=dates[idx]>new Date().toISOString().slice(0,10);
-    let html=`<div style="color:#64748b;margin-bottom:5px;font-size:10px">${{dStr}}${{isProj?' <span style="color:#fbbf24">(proj)</span>':''}}</div>`;
+    let html=`<div style="color:#75777a;margin-bottom:5px;font-size:10px">${{dStr}}${{isProj?' <span style="color:#e3b95f">(proj)</span>':''}}</div>`;
     for(const s of series) {{
       const v=s.data[idx]; if(v==null) continue;
       const col=s.colorFn?s.colorFn(v):s.color;
       const sigV=s.sigmaData?s.sigmaData[idx]:null;
       html+=`<div style="display:flex;justify-content:space-between;gap:14px;margin-bottom:1px">
         <span style="color:${{col}}">${{s.label}}</span>
-        <span style="color:#e2e8f0;font-weight:600">${{s.fmt?s.fmt(v):v.toFixed(1)}}${{sigV!=null?' <span style="color:#64748b;font-size:10px;font-weight:400">\xb1'+sigV.toFixed(1)+'</span>':''}}</span></div>`;
+        <span style="color:#e8e9ea;font-weight:600">${{s.fmt?s.fmt(v):v.toFixed(1)}}${{sigV!=null?' <span style="color:#75777a;font-size:10px;font-weight:400">\xb1'+sigV.toFixed(1)+'</span>':''}}</span></div>`;
     }}
     // Calorie chart, today's bar: how far in the red vs today's full-day target,
     // plus a precomputed (cached, haiku) meal suggestion sized to close the gap.
@@ -3276,10 +4679,10 @@ function addHoverToChart(cid, wid) {{
       const consumedS=series.find(s=>s.label==='Consumed'), targetS=series.find(s=>s.label==='Target');
       const c=consumedS&&consumedS.data[idx], t=targetS&&targetS.data[idx];
       if(c!=null && t!=null && t-c>50) {{
-        html+=`<div style="margin-top:6px;padding-top:6px;border-top:1px solid #334155;color:#f87171">
+        html+=`<div style="margin-top:6px;padding-top:6px;border-top:1px solid #424446;color:#e8837a">
           ${{Math.round(t-c)}} kcal behind today's target</div>`;
         if(DATA.calGapSuggestion) {{
-          html+=`<div style="margin-top:4px;font-size:10px;color:#94a3b8;max-width:220px;white-space:normal">${{DATA.calGapSuggestion}}</div>`;
+          html+=`<div style="margin-top:4px;font-size:10px;color:#a3a6a9;max-width:220px;white-space:normal">${{DATA.calGapSuggestion}}</div>`;
         }}
       }}
     }}
@@ -3336,7 +4739,7 @@ function drawCalHistory() {{
     ctx.fillRect(x-barW/2,yTop,barW,Math.max(yBot-yTop,1));
   }}
   // Target line (full-day target — reference only, today's bar is judged against pace above)
-  ctx.strokeStyle='rgba(148,163,184,.4)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+  ctx.strokeStyle='rgba(159,165,173,.4)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
   ctx.beginPath();
   target.forEach((v,i)=>i===0?ctx.moveTo(xOf(i),yOf(v)):ctx.lineTo(xOf(i),yOf(v)));
   ctx.stroke(); ctx.setLineDash([]);
@@ -3344,11 +4747,11 @@ function drawCalHistory() {{
   for(let i=0;i<n;i++) {{
     if(paceTarget[i]===target[i]) continue;
     const x=xOf(i), y=yOf(paceTarget[i]);
-    ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=2;
+    ctx.strokeStyle='#e8e9ea'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.moveTo(x-barW/2-2,y); ctx.lineTo(x+barW/2+2,y); ctx.stroke();
   }}
   // Consumed line
-  ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1.5; ctx.lineJoin='round';
+  ctx.strokeStyle='#e8e9ea'; ctx.lineWidth=1.5; ctx.lineJoin='round';
   ctx.beginPath(); let s2=false;
   for(let i=0;i<n;i++) {{ if(consumed[i]==null) continue; s2?ctx.lineTo(xOf(i),yOf(consumed[i])):ctx.moveTo(xOf(i),yOf(consumed[i])); s2=true; }}
   ctx.stroke();
@@ -3361,10 +4764,10 @@ function drawCalHistory() {{
   const weightByDate=dates.map(d=>wtMap[d]??null);
 
   CHART_META['c-cal']={{dates,PAD,yOf,todayIdx:DATA.calTodayIdx,series:[
-    {{label:'Consumed',data:consumed,color:'#e2e8f0',fmt:v=>Math.round(v)+' kcal'}},
-    {{label:'Target',data:target,color:'#64748b',fmt:v=>Math.round(v)+' kcal'}},
-    ...(paceTarget.some((v,i)=>v!==target[i]) ? [{{label:'Pace target (today)',data:paceTarget.map((v,i)=>v!==target[i]?v:null),color:'#94a3b8',fmt:v=>Math.round(v)+' kcal'}}] : []),
-    {{label:'Weight',data:weightByDate,color:'#a78bfa',fmt:v=>v!=null?v.toFixed(1)+' kg':'—'}},
+    {{label:'Consumed',data:consumed,color:'#e8e9ea',fmt:v=>Math.round(v)+' kcal'}},
+    {{label:'Target',data:target,color:'#75777a',fmt:v=>Math.round(v)+' kcal'}},
+    ...(paceTarget.some((v,i)=>v!==target[i]) ? [{{label:'Pace target (today)',data:paceTarget.map((v,i)=>v!==target[i]?v:null),color:'#a3a6a9',fmt:v=>Math.round(v)+' kcal'}}] : []),
+    {{label:'Weight',data:weightByDate,color:'#88dcfd',fmt:v=>v!=null?v.toFixed(1)+' kg':'—'}},
   ]}};
 
   drawCalCumStrip(dates, cumBal, PAD);
@@ -3391,7 +4794,7 @@ function drawCalCumStrip(dates, cumBal, mainPAD) {{
   const midY=H/2, halfH=H/2-1;
   const barW=Math.max(2,(cW/n)*0.6);
 
-  ctx.strokeStyle='rgba(148,163,184,.25)'; ctx.lineWidth=1;
+  ctx.strokeStyle='rgba(159,165,173,.25)'; ctx.lineWidth=1;
   ctx.beginPath(); ctx.moveTo(mainPAD.left,midY); ctx.lineTo(W-mainPAD.right,midY); ctx.stroke();
 
   for(let i=0;i<n;i++) {{
@@ -3456,7 +4859,7 @@ function drawWeight() {{
   const _g=setupCanvas('c-wt', 'w-wt'); if(!_g) return; const {{ctx,W,H}}=_g;
   const PAD={{top:4,right:10,bottom:22,left:36}};
   if(!DATA.weightDates||!DATA.weightDates.length) {{
-    ctx.fillStyle='#334155'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+    ctx.fillStyle='#424446'; ctx.font='11px sans-serif'; ctx.textAlign='center';
     ctx.fillText('No weight data logged',W/2,H/2); return;
   }}
   // Aligned to the full calendar-day axis (DATA.dates) so the fit is
@@ -3484,24 +4887,24 @@ function drawWeight() {{
   const xOf=i=>PAD.left+(i/Math.max(sDates.length-1,1))*cW;
   chartAxes(ctx,W,H,lo,hi,3,PAD,sDates);
   // 95% CI band
-  ctx.fillStyle='rgba(167,139,250,.15)';
+  ctx.fillStyle='rgba(139,219,250,.15)';
   ctx.beginPath();
   bandHi.forEach((v,i)=>i===0?ctx.moveTo(xOf(i),yOf(v)):ctx.lineTo(xOf(i),yOf(v)));
   for (let i=bandLo.length-1;i>=0;i--) ctx.lineTo(xOf(i),yOf(bandLo[i]));
   ctx.closePath(); ctx.fill();
   // GP mean — smooth is safe here since xQuery is an evenly-spaced daily grid.
   const meanPts = mean.map((m,i)=>({{x:xOf(i),y:yOf(m)}}));
-  ctx.strokeStyle='#a78bfa'; ctx.lineWidth=1.5; ctx.lineJoin='round';
+  ctx.strokeStyle='#88dcfd'; ctx.lineWidth=1.5; ctx.lineJoin='round';
   ctx.beginPath(); drawSmooth(ctx,meanPts); ctx.stroke();
   // Scatter of actual measurements
   sValsFull.forEach((v,i)=>{{
     if(v==null) return;
-    ctx.fillStyle='#c4b5fd'; ctx.strokeStyle='#0f172a'; ctx.lineWidth=1;
+    ctx.fillStyle='#b3e9ff'; ctx.strokeStyle='#1b1c1e'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.arc(xOf(i),yOf(v),2.5,0,Math.PI*2); ctx.fill(); ctx.stroke();
   }});
   CHART_META['c-wt']={{dates:sDates,PAD,yOf,series:[
-    {{label:'Weight (fit)',data:mean,color:'#a78bfa',fmt:v=>v.toFixed(1)+' kg'}},
-    {{label:'Logged',data:sValsFull,color:'#c4b5fd',fmt:v=>v.toFixed(1)+' kg'}},
+    {{label:'Weight (fit)',data:mean,color:'#88dcfd',fmt:v=>v.toFixed(1)+' kg'}},
+    {{label:'Logged',data:sValsFull,color:'#b3e9ff',fmt:v=>v.toFixed(1)+' kg'}},
   ]}};
 }}
 
@@ -3539,19 +4942,19 @@ function drawIllnessSpark() {{
   for (var i = 0; i < n; i++) ctx.lineTo(xOf(i), yOf(vals[i]));
   ctx.lineTo(xOf(n - 1), H - PAD.b); ctx.closePath(); ctx.fill();
   // Line
-  ctx.strokeStyle = '#f87171'; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#e8837a'; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
   ctx.beginPath();
   for (var i = 0; i < n; i++) {{ i === 0 ? ctx.moveTo(xOf(i), yOf(vals[i])) : ctx.lineTo(xOf(i), yOf(vals[i])); }}
   ctx.stroke();
   // Day dots
   for (var i = 0; i < n; i++) {{
     var v = vals[i];
-    ctx.fillStyle = v < 0.20 ? '#4ade80' : v < 0.50 ? '#fbbf24' : '#f87171';
+    ctx.fillStyle = v < 0.20 ? '#6fcf97' : v < 0.50 ? '#e3b95f' : '#e8837a';
     ctx.beginPath(); ctx.arc(xOf(i), yOf(v), 2, 0, Math.PI * 2); ctx.fill();
   }}
   // Day-of-week labels (Mon…Sun)
   var days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  ctx.fillStyle = '#334155'; ctx.font = '7px system-ui'; ctx.textAlign = 'center';
+  ctx.fillStyle = '#424446'; ctx.font = '7px system-ui'; ctx.textAlign = 'center';
   for (var i = 0; i < n; i++) {{
     var d = new Date(dates[i] + 'T00:00:00');
     ctx.fillText(days[d.getDay()], xOf(i), H - 0.5);
@@ -3597,6 +5000,14 @@ function setWeeklyLog(html) {{
   var el = document.getElementById('weekly-log-body');
   if (el) el.innerHTML = html;
 }}
+(function() {{
+  var box = document.getElementById('food-box'), tmr = null;
+  if (box) box.addEventListener('input', function() {{
+    clearTimeout(tmr);
+    tmr = setTimeout(function() {{ document.title = '__fooddraft__' + Date.now() + '|' + encodeURIComponent(box.value); }}, 500);
+  }});
+}})();
+function toggleExcludeDay(day) {{ document.title = '__excludeday__' + Date.now() + '|' + day; }}
 function submitFood() {{
   var box = document.getElementById('food-box');
   if (!box) return;
@@ -3605,6 +5016,8 @@ function submitFood() {{
   // Box stays enabled so entries can be queued up back-to-back — the Python
   // side serializes them through a single worker so food-log.json never races.
   box.value = '';
+  var dateEl = document.getElementById('food-date');
+  if (dateEl && dateEl.value) v = dateEl.value + '::' + v;   // backlog day (sticky until cleared)
   document.title = '__logfood__' + Date.now() + '|' + encodeURIComponent(v);
 }}
 var _foodEditBackup = {{}};
@@ -3622,8 +5035,8 @@ function editFood(id) {{
     '<input class="fe-num fe-prot" type="number" value="' + data.protein_g + '" title="protein g">' +
     '<input class="fe-num fe-carb" type="number" value="' + data.carbs_g + '" title="carbs g">' +
     '<input class="fe-num fe-fat" type="number" value="' + data.fat_g + '" title="fat g">' +
-    '<button onclick="saveFoodEdit(\'' + id + '\')">Save</button>' +
-    '<button onclick="cancelFoodEdit(\'' + id + '\')">Cancel</button>' +
+    '<button onclick="saveFoodEdit(\\'' + id + '\\')">Save</button>' +
+    '<button onclick="cancelFoodEdit(\\'' + id + '\\')">Cancel</button>' +
     '</div>';
 }}
 function cancelFoodEdit(id) {{
@@ -3671,6 +5084,101 @@ function setFoodQueued(n) {{
     status.style.display = 'none';
   }}
 }}
+var _voiceState = {{food: 'idle', plan: 'idle'}};   // idle | recording | transcribing
+var _voiceBox = {{food: 'food-box', plan: 'plan-box'}};
+var _voiceStatus = {{food: 'food-status', plan: 'plan-status'}};
+function toggleVoice(target) {{
+  if (_voiceState[target] === 'transcribing') return;
+  var starting = _voiceState[target] === 'idle';
+  // One title write only: a second one in the same tick (e.g. warmFoodModel) can
+  // replace it before the title-change signal fires. Python warms Qwen on start.
+  document.title = '__voice__' + Date.now() + '|' + target + '|' + (starting ? 'start' : 'stop');
+}}
+function setVoiceState(target, state, msg) {{
+  _voiceState[target] = state;
+  var btn = document.getElementById(target + '-mic-btn');
+  var status = document.getElementById(_voiceStatus[target]);
+  if (btn) {{
+    btn.className = 'mic-btn' + (state === 'recording' ? ' recording' : state === 'transcribing' ? ' busy' : '');
+    btn.innerHTML = state === 'recording' ? '&#9632;' : '&#127908;';
+  }}
+  if (status) {{
+    if (msg) {{ status.style.display = 'block'; status.textContent = msg; status.className = 'food-status pending'; }}
+    else if (state === 'idle') {{ status.style.display = 'none'; }}
+  }}
+}}
+function voiceError(target, msg) {{
+  if (target === 'food') setFoodError(msg); else setPlanStatus(msg, true);
+}}
+function setVoiceTranscript(target, text) {{
+  setVoiceState(target, 'idle', target === 'food' ? 'Check the transcript, then Enter to log'
+                                                  : 'Check the transcript, then Plan');
+  var box = document.getElementById(_voiceBox[target]);
+  if (!box || !text) return;
+  // Appended, not replaced, so a second clip can add to a half-typed entry.
+  box.value = box.value.trim() ? box.value.trim() + ', ' + text : text;
+  box.focus();
+  box.setSelectionRange(box.value.length, box.value.length);
+}}
+function setPlanStatus(msg, isError) {{
+  var el = document.getElementById('plan-status');
+  if (!el) return;
+  el.style.display = msg ? 'block' : 'none';
+  el.textContent = msg || '';
+  el.className = 'food-status ' + (isError ? 'error' : 'pending');
+}}
+function submitPlan() {{
+  var box = document.getElementById('plan-box');
+  if (!box || !box.value.trim()) return;
+  setPlanStatus('Reading your plan…');
+  document.title = '__planweek__' + Date.now() + '|' + encodeURIComponent(box.value.trim());
+}}
+var _planKinds = ['mobility', 'recovery', 'easy', 'steady', 'threshold', 'vo2max', 'strength', 'rest'];
+function showPlanDraft(rows, warnings) {{
+  setPlanStatus('Check and edit, then Save — saving replaces whatever was planned on these days.');
+  var el = document.getElementById('plan-draft');
+  if (!el) return;
+  var warnHtml = (warnings || []).map(function(w) {{
+    return '<div class="plan-warn">&#9888; ' + String(w).replace(/</g, '&lt;') + '</div>'; }}).join('');
+  function esc(v) {{ return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }}
+  var html = '<table class="plan-grid"><tr><th>Day</th><th>Session</th><th>min</th><th>type</th><th>work</th><th></th></tr>';
+  rows.forEach(function(r, i) {{
+    var d = new Date(r.date + 'T12:00:00');
+    var day = d.toLocaleDateString('en-GB', {{weekday: 'short', day: 'numeric'}});
+    html += '<tr data-i="' + i + '">' +
+      '<td><input class="pg-date" type="date" value="' + esc(r.date) + '" title="' + esc(day) + '"></td>' +
+      '<td><input class="pg-name" value="' + esc(r.name) + '"></td>' +
+      '<td><input class="pg-min" type="number" value="' + esc(r.minutes) + '"></td>' +
+      '<td><select class="pg-kind">' + _planKinds.map(function(k) {{
+        return '<option' + (k === r.kind ? ' selected' : '') + '>' + k + '</option>'; }}).join('') + '</select></td>' +
+      '<td><input class="pg-work" type="number" value="' + esc(r.work_minutes) + '" title="minutes of hard intervals"></td>' +
+      '<td><button class="pg-del" onclick="this.closest(\\'tr\\').remove()" title="Remove">&#10005;</button></td></tr>';
+  }});
+  html += '</table>' + warnHtml + '<div class="plan-btns" style="margin-top:6px">' +
+    '<button onclick="savePlanDraft()">Save</button>' +
+    '<button onclick="cancelPlanDraft()">Cancel</button></div>';
+  el.innerHTML = html;
+}}
+function savePlanDraft() {{
+  var rows = [];
+  document.querySelectorAll('#plan-draft tr[data-i]').forEach(function(tr) {{
+    rows.push({{
+      date: tr.querySelector('.pg-date').value,
+      name: tr.querySelector('.pg-name').value,
+      minutes: parseInt(tr.querySelector('.pg-min').value) || 0,
+      kind: tr.querySelector('.pg-kind').value,
+      work_minutes: parseInt(tr.querySelector('.pg-work').value) || 0,
+    }});
+  }});
+  if (!rows.length) {{ cancelPlanDraft(); return; }}
+  setPlanStatus('Saving…');
+  document.title = '__saveplan__' + Date.now() + '|' + encodeURIComponent(JSON.stringify(rows));
+}}
+function cancelPlanDraft() {{
+  var el = document.getElementById('plan-draft');
+  if (el) el.innerHTML = '';
+  setPlanStatus('');
+}}
 function setFoodError(msg) {{
   var status = document.getElementById('food-status');
   if (status) {{ status.style.display = 'block'; status.textContent = msg; status.className = 'food-status error'; }}
@@ -3704,7 +5212,7 @@ function setIllnessData(todayP, yesterdayP, bands, spark7d) {{
   if (!val) return;
   var pct = Math.round(todayP * 100);
   val.textContent = pct + '%';
-  val.style.color = todayP < 0.20 ? '#4ade80' : todayP < 0.50 ? '#fbbf24' : '#f87171';
+  val.style.color = todayP < 0.20 ? '#6fcf97' : todayP < 0.50 ? '#e3b95f' : '#e8837a';
   if (sub) {{
     var delta = Math.round((todayP - yesterdayP) * 100);
     sub.textContent = (delta >= 0 ? '+' : '') + delta + 'pp vs yesterday';
@@ -3741,7 +5249,7 @@ function drawIllnessRisk() {{
   chartAxes(ctx, W, H, 0, 1, 4, PAD, dates);
 
   var thr = (DATA.illnessMeta && DATA.illnessMeta.sick_thresh) || 0.4;
-  ctx.strokeStyle = '#475569'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+  ctx.strokeStyle = '#56585a'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
   ctx.beginPath(); ctx.moveTo(PAD.left, yOf(thr)); ctx.lineTo(W - PAD.right, yOf(thr));
   ctx.stroke(); ctx.setLineDash([]);
 
@@ -3750,8 +5258,8 @@ function drawIllnessRisk() {{
   vals.forEach(function(v, i) {{ ctx.lineTo(xOf(i), yOf(v)); }});
   ctx.lineTo(xOf(vals.length - 1), yOf(0)); ctx.closePath(); ctx.fill();
 
-  plotSeries(ctx, xOf, yOf, vals, '#f87171', 1.4);
-  ctx.fillStyle = '#f87171';
+  plotSeries(ctx, xOf, yOf, vals, '#e8837a', 1.4);
+  ctx.fillStyle = '#e8837a';
   ctx.beginPath(); ctx.arc(xOf(vals.length - 1), yOf(vals[vals.length - 1]), 2.6, 0, 7); ctx.fill();
 }}
 
@@ -3773,11 +5281,296 @@ function drawIllnessRhr() {{
 
   var meta = DATA.illnessMeta;
   if (meta && meta.baseline_rhr >= lo && meta.baseline_rhr <= hi) {{
-    ctx.strokeStyle = '#334155'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+    ctx.strokeStyle = '#424446'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
     ctx.beginPath(); ctx.moveTo(PAD.left, yOf(meta.baseline_rhr));
     ctx.lineTo(W - PAD.right, yOf(meta.baseline_rhr)); ctx.stroke(); ctx.setLineDash([]);
   }}
-  plotSeries(ctx, xOf, yOf, rhr, '#fb923c', 1.3);
+  plotSeries(ctx, xOf, yOf, rhr, '#e3b95f', 1.3);
+}}
+
+// ── Sleep view ────────────────────────────────────────────────────────────────
+var SS = {{date: null, rating: null, latency: '', wakings: '', factors: [], note: ''}};
+function sleepEsc(s) {{ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }}
+function sleepFmt(h) {{ var m = Math.round(h * 60); return Math.floor(m / 60) + 'h ' + ('0' + (m % 60)).slice(-2) + 'm'; }}
+function sleepDelta(v, unit, goodWhenHigh) {{
+  if (v === null || v === undefined) return '';
+  var good = goodWhenHigh ? v >= 0 : v <= 0;
+  return '<span style="color:' + (Math.abs(v) < 0.05 ? '#75777a' : good ? '#6fcf97' : '#e3b95f') + '">' + (v > 0 ? '+' : '') + v + unit + '</span>';
+}}
+function sleepBars(nights, target) {{
+  var W = 640, H = 150, bw = W / nights.length, max = Math.max(10, Math.ceil(Math.max.apply(null, nights.map(function(n) {{ return n.hours; }}))));
+  var s = '<svg viewBox="0 0 ' + W + ' ' + (H + 34) + '" style="width:100%;height:auto">';
+  var ty = H - target / max * H;
+  s += '<line x1="0" x2="' + W + '" y1="' + ty + '" y2="' + ty + '" stroke="#56585a" stroke-dasharray="4 4"/>'
+     + '<text x="2" y="' + (ty - 4) + '" fill="#75777a" font-size="10">' + target + 'h target</text>';
+  nights.forEach(function(n, i) {{
+    var h = n.hours / max * H, c = n.hours >= target ? '#6fcf97' : n.hours >= target - 1 ? '#e3b95f' : '#e8837a';
+    s += '<rect x="' + (i * bw + 2) + '" y="' + (H - h) + '" width="' + (bw - 4) + '" height="' + h + '" rx="3" fill="' + c + '" opacity="0.8"><title>' + n.date + ': ' + sleepFmt(n.hours) + (n.rating ? ', rested ' + n.rating + '/5' : '') + '</title></rect>';
+    s += '<text x="' + (i * bw + bw / 2) + '" y="' + (H + 16) + '" text-anchor="middle" fill="' + (n.rating ? '#d4d6d8' : '#424446') + '" font-size="11">' + (n.rating || '·') + '</text>';
+  }});
+  s += '<text x="0" y="' + (H + 31) + '" fill="#75777a" font-size="10">' + nights[0].date.slice(5) + '</text>'
+     + '<text x="' + W + '" y="' + (H + 31) + '" text-anchor="end" fill="#75777a" font-size="10">' + nights[nights.length - 1].date.slice(5) + '</text>'
+     + '<text x="0" y="' + (H + 16) + '" fill="#75777a" font-size="9" dx="-0">&nbsp;</text></svg>';
+  return s;
+}}
+function slMean(a) {{ var x = a.filter(function(v) {{ return v != null; }}); return x.length ? x.reduce(function(s, v) {{ return s + v; }}, 0) / x.length : null; }}
+function slRoll(vals, w) {{ return vals.map(function(_, i) {{ return slMean(vals.slice(Math.max(0, i - w + 1), i + 1)); }}); }}
+function slLine(vals, dates, o) {{
+  var W = 360, H = o.h || 120, L = 34, R = 8, T = 8, B = 18, n = vals.length;
+  var nums = vals.filter(function(v) {{ return v != null; }}).concat(o.ref != null ? [o.ref] : []);
+  if (n < 2 || !nums.length) return '<div class="pm-hint">Not enough data yet.</div>';
+  var lo = Math.min.apply(null, nums), hi = Math.max.apply(null, nums), pad = (hi - lo) * 0.1 || 1; lo -= pad; hi += pad;
+  var x = function(i) {{ return L + i / (n - 1) * (W - L - R); }}, y = function(v) {{ return T + (1 - (v - lo) / (hi - lo)) * (H - T - B); }};
+  var fmt = o.fmt || function(v) {{ return v.toFixed(0); }};
+  var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">';
+  for (var g = 0; g <= 2; g++) {{ var gv = lo + (hi - lo) * g / 2, gy = y(gv);
+    s += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + gy + '" y2="' + gy + '" stroke="#2a2c2f"/><text x="' + (L - 5) + '" y="' + (gy + 3) + '" text-anchor="end" fill="#75777a" font-size="9">' + fmt(gv) + '</text>'; }}
+  if (o.ref != null) s += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(o.ref) + '" y2="' + y(o.ref) + '" stroke="#56585a" stroke-dasharray="4 4"/>';
+  var path = function(a) {{ var d = '', pen = false; a.forEach(function(v, i) {{ if (v == null) {{ pen = false; return; }} d += (pen ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1); pen = true; }}); return d; }};
+  s += '<path d="' + path(vals) + '" fill="none" stroke="' + o.color + '" stroke-width="1.2" opacity="' + (o.avg ? 0.4 : 1) + '"/>';
+  if (o.avg) s += '<path d="' + path(slRoll(vals, o.avg)) + '" fill="none" stroke="' + o.color + '" stroke-width="2.2"/>';
+  s += '<text x="' + L + '" y="' + (H - 3) + '" fill="#75777a" font-size="9">' + dates[0].slice(5) + '</text><text x="' + (W - R) + '" y="' + (H - 3) + '" text-anchor="end" fill="#75777a" font-size="9">' + dates[n - 1].slice(5) + '</text></svg>';
+  return s;
+}}
+function slColumns(labels, vals, o) {{
+  var W = 360, H = o.h || 120, L = 8, R = 8, T = 14, B = 18, n = vals.length, max = Math.max.apply(null, vals.concat([o.ref || 0, 1])) * 1.1;
+  var bw = (W - L - R) / n, s = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">';
+  if (o.ref != null) {{ var ry = T + (1 - o.ref / max) * (H - T - B); s += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + ry + '" y2="' + ry + '" stroke="#56585a" stroke-dasharray="4 4"/>'; }}
+  vals.forEach(function(v, i) {{
+    var h = v / max * (H - T - B), c = o.colorFn ? o.colorFn(v) : '#88dcfd';
+    s += '<rect x="' + (L + i * bw + 3) + '" y="' + (H - B - h) + '" width="' + (bw - 6) + '" height="' + h + '" rx="3" fill="' + c + '" opacity="0.85"/>'
+      + '<text x="' + (L + i * bw + bw / 2) + '" y="' + (H - B - h - 3) + '" text-anchor="middle" fill="#d4d6d8" font-size="9">' + (o.valFmt ? o.valFmt(v, i) : v) + '</text>'
+      + '<text x="' + (L + i * bw + bw / 2) + '" y="' + (H - 4) + '" text-anchor="middle" fill="#75777a" font-size="9">' + labels[i] + '</text>';
+  }});
+  return s + '</svg>';
+}}
+function slScatter(pts, o) {{
+  var W = 360, H = 160, L = 34, R = 10, T = 8, B = 24;
+  if (pts.length < 8) return '<div class="pm-hint">Needs at least 8 nights with data (have ' + pts.length + ').</div>';
+  var xs = pts.map(function(p) {{ return p.x; }}), ys = pts.map(function(p) {{ return p.y; }});
+  var xlo = Math.min.apply(null, xs) - 0.2, xhi = Math.max.apply(null, xs) + 0.2, ylo = Math.min.apply(null, ys) * 0.95, yhi = Math.max.apply(null, ys) * 1.05;
+  var x = function(v) {{ return L + (v - xlo) / (xhi - xlo) * (W - L - R); }}, y = function(v) {{ return T + (1 - (v - ylo) / (yhi - ylo)) * (H - T - B); }};
+  var mx = slMean(xs), my = slMean(ys), sxx = 0, syy = 0, sxy = 0;
+  pts.forEach(function(p) {{ sxx += (p.x - mx) * (p.x - mx); syy += (p.y - my) * (p.y - my); sxy += (p.x - mx) * (p.y - my); }});
+  var slope = sxy / sxx, icpt = my - slope * mx, r = sxy / Math.sqrt(sxx * syy);
+  var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">';
+  for (var g = 0; g <= 2; g++) {{ var gv = ylo + (yhi - ylo) * g / 2; s += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(gv) + '" y2="' + y(gv) + '" stroke="#2a2c2f"/><text x="' + (L - 5) + '" y="' + (y(gv) + 3) + '" text-anchor="end" fill="#75777a" font-size="9">' + gv.toFixed(0) + '</text>'; }}
+  for (var k = Math.ceil(xlo); k <= xhi; k++) s += '<text x="' + x(k) + '" y="' + (H - 8) + '" text-anchor="middle" fill="#75777a" font-size="9">' + k + 'h</text>';
+  pts.forEach(function(p) {{ s += '<circle cx="' + x(p.x) + '" cy="' + y(p.y) + '" r="3.2" fill="#88dcfd" opacity="0.7"><title>' + p.t + '</title></circle>'; }});
+  s += '<line x1="' + x(xlo) + '" y1="' + y(slope * xlo + icpt) + '" x2="' + x(xhi) + '" y2="' + y(slope * xhi + icpt) + '" stroke="#e3b95f" stroke-width="1.6"/></svg>';
+  var word = Math.abs(r) < 0.2 ? 'little relationship' : (r > 0 ? 'longer sleep goes with higher values' : 'longer sleep goes with lower values');
+  return s + '<div class="pm-hint">r = ' + r.toFixed(2) + ' over ' + pts.length + ' nights &middot; ' + word + '. Correlation, not cause.</div>';
+}}
+function sleepCharts(N, target) {{
+  var dates = N.map(function(n) {{ return n.date; }}), hrs = N.map(function(n) {{ return n.hours; }});
+  var card = function(title, sub, body) {{ return '<div class="card"><div class="brief-label">' + title + (sub ? ' <span style="text-transform:none;color:#75777a">' + sub + '</span>' : '') + '</div>' + body + '</div>'; }};
+  var debt = hrs.map(function(_, i) {{ if (i < 6) return null; var s = 0; for (var j = i - 6; j <= i; j++) s += target - hrs[j]; return s; }});
+  var wd = [[], [], [], [], [], [], []];
+  N.forEach(function(n) {{ wd[(new Date(n.date + 'T12:00:00').getDay() + 6) % 7].push(n.hours); }});
+  var wdAvg = wd.map(function(a) {{ return slMean(a) || 0; }});
+  var bins = [[0, 5, '<5'], [5, 6, '5-6'], [6, 7, '6-7'], [7, 8, '7-8'], [8, 9, '8-9'], [9, 10, '9-10'], [10, 99, '10+']];
+  var counts = bins.map(function(b) {{ return hrs.filter(function(h) {{ return h >= b[0] && h < b[1]; }}).length; }});
+  var okc = function(h) {{ return h >= target ? '#6fcf97' : h >= target - 1 ? '#e3b95f' : '#e8837a'; }};
+  var hrvPts = N.filter(function(n) {{ return n.hrv; }}).map(function(n) {{ return {{x: n.hours, y: n.hrv, t: n.date + ': ' + sleepFmt(n.hours) + ', HRV ' + Math.round(n.hrv)}}; }});
+  var f1 = function(v) {{ return v.toFixed(1); }};
+  return '<div class="sl-grid">'
+    + card('Duration trend', '(' + N.length + ' nights, bold = 7-night average)', slLine(hrs, dates, {{color: '#88dcfd', avg: 7, ref: target, fmt: f1}}))
+    + card('Rolling 7-night debt', '(hours owed vs ' + target + 'h; above 0 = behind)', slLine(debt, dates, {{color: '#e3b95f', ref: 0, fmt: f1}}))
+    + card('Sleep score', '(bold = 7-night average)', slLine(N.map(function(n) {{ return n.score; }}), dates, {{color: '#b79cf0', avg: 7}}))
+    + card('HRV', '(bold = 7-night average)', slLine(N.map(function(n) {{ return n.hrv; }}), dates, {{color: '#6fcf97', avg: 7}}))
+    + card('Resting HR', '(bold = 7-night average)', slLine(N.map(function(n) {{ return n.rhr; }}), dates, {{color: '#e8837a', avg: 7}}))
+    + card('Average by weekday', '(hours; weekend catch-up shows here)', slColumns(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], wdAvg, {{ref: target, colorFn: okc, valFmt: function(v) {{ return v ? v.toFixed(1) : ''; }}}}))
+    + card('How long you usually sleep', '(nights per duration band)', slColumns(bins.map(function(b) {{ return b[2]; }}), counts, {{valFmt: function(v) {{ return v || ''; }}}}))
+    + card('Duration vs that morning&rsquo;s HRV', '', slScatter(hrvPts, {{}}))
+    + '</div>';
+}}
+function sleepChips(list, selected, kind) {{
+  return list.map(function(o) {{
+    var on = Array.isArray(selected) ? selected.indexOf(o) >= 0 : selected === o;
+    return '<span class="sl-chip' + (on ? ' on' : '') + '" data-k="' + kind + '" data-v="' + sleepEsc(o) + '">' + sleepEsc(o) + '</span>';
+  }}).join('');
+}}
+function renderSleep() {{
+  var root = document.getElementById('sleep-root'), D = DATA.sleep;
+  if (!root) return;
+  if (!D || !D.last) {{ root.textContent = 'No sleep data yet.'; return; }}
+  var L = D.last, S = D.stats, O = D.options;
+  if (SS.date !== L.date) {{
+    SS = {{date: L.date, rating: L.rating || null, latency: L.latency || '', wakings: L.wakings || '', factors: (L.factors || []).slice(), note: L.note || ''}};
+  }}
+  var tile = function(lab, v, d) {{ return '<div class="card sl-tile"><div class="brief-label">' + lab + '</div><div class="v">' + v + '</div><div class="d">' + d + '</div></div>'; }};
+  var h = '<div class="brief-label">Last night &middot; ' + L.date + '</div><div class="sl-tiles" style="margin-top:8px">'
+    + tile('Duration', sleepFmt(L.hours), sleepDelta(Math.round((L.hours - D.target_h) * 10) / 10, 'h', true) + ' vs ' + D.target_h + 'h target')
+    + tile('Sleep score', L.score ? Math.round(L.score) : '&mdash;', S.avg_score14 ? '14-night avg ' + S.avg_score14 : '')
+    + tile('HRV', L.hrv ? Math.round(L.hrv) : '&mdash;', S.hrv_delta !== null ? sleepDelta(S.hrv_delta, '', true) + ' vs prior 7 nights' : '')
+    + tile('Resting HR', L.rhr ? L.rhr + ' bpm' : '&mdash;', S.rhr_delta !== null ? sleepDelta(S.rhr_delta, '', false) + ' vs prior 7 nights' : '')
+    + tile('7-night sleep debt', Math.abs(S.debt7).toFixed(1) + 'h', S.debt7 > 0 ? 'owed vs ' + D.target_h + 'h/night' : 'ahead of target')
+    + tile('Consistency', S.sd_h14 !== null ? '&plusmn;' + S.sd_h14.toFixed(1) + 'h' : '&mdash;', 'spread of duration, 14 nights')
+    + '</div>';
+  h += '<div class="card" style="margin-top:14px"><div class="brief-label">Last 30 nights <span style="text-transform:none;color:#75777a">(bar = duration, digit = how rested you rated it)</span></div>' + sleepBars(D.nights.slice(-30), D.target_h) + '</div>' + sleepCharts(D.nights, D.target_h);
+  h += '<div class="card" style="margin-top:14px"><div class="brief-label">How did you sleep? &middot; night ending ' + L.date + '</div>'
+    + '<div style="margin:10px 0 4px;color:#a3a6a9">How rested do you feel?</div>'
+    + [1,2,3,4,5].map(function(r) {{ var lab = ['wrecked','poor','okay','good','great'][r-1];
+        return '<span class="sl-chip' + (SS.rating === r ? ' on' : '') + '" data-k="rating" data-v="' + r + '">' + r + ' &middot; ' + lab + '</span>'; }}).join('')
+    + '<div style="margin:8px 0 4px;color:#a3a6a9">Time to fall asleep</div>' + sleepChips(O.latency, SS.latency, 'latency')
+    + '<div style="margin:8px 0 4px;color:#a3a6a9">Times woken in the night</div>' + sleepChips(O.wakings, SS.wakings, 'wakings')
+    + '<div style="margin:8px 0 4px;color:#a3a6a9">What helped?</div>' + sleepChips(O.helps, SS.factors, 'factor')
+    + '<div style="margin:8px 0 4px;color:#a3a6a9">What might have hurt?</div>' + sleepChips(O.hurts, SS.factors, 'factor')
+    + '<input type="text" id="sl-note" placeholder="Anything else (optional)" value="' + sleepEsc(SS.note) + '" style="width:100%;margin-top:8px">'
+    + '<div style="margin-top:12px"><button class="btn" id="sl-save">' + (L.rating ? 'Update rating' : 'Save rating') + '</button>'
+    + (L.rating ? ' <span style="color:#6fcf97;font-size:12px">saved</span>' : '') + '</div></div>';
+  h += '<div class="card" style="margin-top:14px"><div class="brief-label">What your ratings say</div>';
+  if (D.insights.length) {{
+    D.insights.forEach(function(x) {{ h += '<div style="padding:5px 0">' + sleepEsc(x.text) + ' <span style="color:#75777a;font-size:11.5px">(' + x.n + ')</span></div>'; }});
+    h += '<div style="color:#75777a;font-size:11.5px;margin-top:6px">Small samples: patterns, not proof.</div>';
+  }} else {{
+    h += '<div style="color:#a3a6a9;padding:4px 0">' + S.rated_total + ' night' + (S.rated_total === 1 ? '' : 's') + ' rated. Comparisons (duration, and each factor) appear once there are at least 3 nights on each side.</div>';
+  }}
+  h += '</div><div style="color:#75777a;font-size:11.5px;margin-top:14px">The feed has duration, score, HRV and resting HR only &mdash; no sleep stages or bed/wake times, so those aren&rsquo;t shown.</div>';
+  root.innerHTML = h;
+}}
+(function() {{
+  var root = document.getElementById('sleep-root');
+  if (!root) return;
+  root.addEventListener('click', function(e) {{
+    var c = e.target.closest('[data-k]');
+    if (c) {{
+      var k = c.dataset.k, v = c.dataset.v;
+      if (k === 'rating') SS.rating = parseInt(v, 10);
+      else if (k === 'factor') {{ var i = SS.factors.indexOf(v); if (i >= 0) SS.factors.splice(i, 1); else SS.factors.push(v); }}
+      else SS[k] = (SS[k] === v ? '' : v);
+      renderSleep();
+      return;
+    }}
+    if (e.target.id === 'sl-save') {{
+      if (!SS.rating) {{ e.target.textContent = 'Pick a rating first'; return; }}
+      var n = document.getElementById('sl-note'); SS.note = n ? n.value : '';
+      document.title = '__sleeprate__' + Date.now() + '|' + encodeURIComponent(JSON.stringify({{date: SS.date, rating: SS.rating, latency: SS.latency, wakings: SS.wakings, factors: SS.factors, note: SS.note}}));
+    }}
+  }});
+  root.addEventListener('input', function(e) {{ if (e.target.id === 'sl-note') SS.note = e.target.value; }});
+}})();
+
+// ── Life tab ──────────────────────────────────────────────────────────────────
+function lifeEsc(s) {{ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }}
+function lifeSend(cmd, obj) {{ document.title = '__' + cmd + '__' + Date.now() + '|' + encodeURIComponent(JSON.stringify(obj)); }}
+var LIFE_COL = {{research:'#88dcfd', admin:'#b79cf0', home:'#34d399', social:'#88dcfd', health:'#6fcf97',
+                 rest:'#a3a6a9', other:'#75777a', training:'#e3b95f'}};
+function lifeChip(area) {{
+  return '<span style="color:' + (LIFE_COL[area] || '#75777a') + ';font-size:11px;text-transform:uppercase">' + lifeEsc(area) + '</span>';
+}}
+function lifeInit() {{
+  var L = DATA.life, sel = document.getElementById('lf-area');
+  if (!L || !sel || sel.options.length) return;
+  L.areas.forEach(function(a) {{ var o = document.createElement('option'); o.value = a; o.textContent = a; sel.appendChild(o); }});
+  document.getElementById('lf-add').onclick = function() {{
+    var type = document.getElementById('lf-type').value, title = document.getElementById('lf-title').value.trim();
+    if (!title) return;
+    var d = document.getElementById('lf-date').value;
+    if (type === 'event' && !d) d = DATA.life.today;
+    var obj = {{type: type, title: title, area: sel.value, start: document.getElementById('lf-start').value,
+                end: document.getElementById('lf-end').value, repeat: document.getElementById('lf-repeat').value}};
+    obj[type === 'event' ? 'date' : 'due'] = d;
+    lifeSend('lifeadd', obj);
+    document.getElementById('lf-title').value = '';
+  }};
+  document.getElementById('lf-title').addEventListener('keydown', function(e) {{
+    if (e.key === 'Enter') document.getElementById('lf-add').click();
+  }});
+  document.getElementById('life-lists').addEventListener('click', function(e) {{
+    var b = e.target.closest('[data-act]');
+    if (b) lifeSend('lifeact', {{act: b.dataset.act, id: b.dataset.id}});
+  }});
+}}
+function renderLife() {{
+  var L = DATA.life, root = document.getElementById('life-lists');
+  if (!root) return;
+  if (!L) {{ root.textContent = 'life.py not available.'; return; }}
+  lifeInit();
+  var days = {{}}, order = [];
+  L.events.forEach(function(e) {{ if (!days[e.date]) {{ days[e.date] = []; order.push(e.date); }} days[e.date].push(e); }});
+  var h = '<div style="display:flex;gap:18px;flex-wrap:wrap"><div class="card" style="flex:1;min-width:300px">'
+    + '<div class="brief-label">Next 7 days</div>';
+  if (!order.length) h += '<div style="color:#75777a;padding:6px 0">Nothing scheduled.</div>';
+  order.forEach(function(d) {{
+    var dt = new Date(d + 'T12:00:00');
+    h += '<div style="margin-top:10px;color:' + (d === L.today ? '#88dcfd' : '#a3a6a9') + ';font-size:12px">'
+      + dt.toLocaleDateString('en-GB', {{weekday:'short', day:'numeric', month:'short'}}) + (d === L.today ? ' (today)' : '') + '</div>';
+    days[d].forEach(function(e) {{
+      h += '<div style="padding:3px 0 3px 8px;border-left:2px solid ' + (LIFE_COL[e.area] || '#424446') + '">'
+        + (e.start ? '<span style="color:#75777a">' + e.start + (e.end ? '&ndash;' + e.end : '') + '</span> ' : '')
+        + lifeEsc(e.title) + ' ' + lifeChip(e.area) + (e.repeat ? ' <span style="color:#75777a;font-size:11px">&#8635; ' + e.repeat + '</span>' : '')
+        + (e.id ? ' <a href="#" data-act="del" data-id="' + e.id + '" style="color:#75777a;text-decoration:none">&times;</a>' : '') + '</div>';
+    }});
+  }});
+  h += '</div><div class="card" style="flex:1;min-width:300px"><div class="brief-label">Todo (' + L.todos.length + ' open)</div>';
+  if (!L.todos.length) h += '<div style="color:#75777a;padding:6px 0">Nothing open.</div>';
+  L.todos.forEach(function(t) {{
+    var overdue = t.due && t.due < L.today;
+    h += '<div style="padding:4px 0;border-bottom:1px solid #2a2c2f">'
+      + '<a href="#" data-act="toggle" data-id="' + t.id + '" style="text-decoration:none;color:#a3a6a9">&#9744;</a> '
+      + lifeEsc(t.title) + ' ' + lifeChip(t.area)
+      + (t.due ? ' <span style="font-size:11px;color:' + (overdue ? '#e3b95f' : '#75777a') + '">' + (overdue ? 'overdue ' : 'due ') + t.due + '</span>' : '')
+      + ' <a href="#" data-act="del" data-id="' + t.id + '" style="color:#75777a;text-decoration:none">&times;</a></div>';
+  }});
+  h += '</div></div>';
+  var keys = Object.keys(L.balance), max = Math.max.apply(null, keys.map(function(k) {{ return L.balance[k]; }}).concat([1]));
+  h += '<div class="card" style="margin-top:18px"><div class="brief-label">This week by area <span style="text-transform:none;color:#75777a">(todos done + events + training sessions)</span></div>';
+  keys.forEach(function(k) {{
+    var v = L.balance[k];
+    h += '<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px"><span style="width:70px;color:#a3a6a9">' + k + '</span>'
+      + '<div style="height:10px;border-radius:5px;background:' + (LIFE_COL[k] || '#75777a') + ';width:' + Math.round(v / max * 220) + 'px;min-width:' + (v ? 4 : 0) + 'px"></div>'
+      + '<span style="color:#75777a">' + v + '</span></div>';
+  }});
+  root.innerHTML = h + '</div>';
+}}
+
+// ── Focus tab ─────────────────────────────────────────────────────────────────
+function focusNow() {{ document.title = '__focusnow__' + Date.now(); }}
+function renderFocus() {{
+  var root = document.getElementById('focus-root');
+  var F = DATA.focus;
+  if (!root) return;
+  if (!F) {{ root.textContent = 'focus.py not available.'; return; }}
+  var bar = F.bar, col = bar >= 60 ? '#6fcf97' : bar >= 40 ? '#e3b95f' : '#e3b95f';
+  var label = bar >= 60 ? 'Restorative-leaning' : bar >= 40 ? 'Balanced' : 'Cheap-stimulation-leaning';
+  var L = F.latest, mood = L ? L.mood : null, en = L ? L.energy : null;
+  var low = (mood && mood <= 2) || (en && en <= 2);
+  var mismatch = (bar >= 60 && low) ? 'Plenty of restorative activity, but mood/energy is low \u2014 worth noticing why.'
+    : (bar < 40 && mood && en && mood >= 4 && en >= 4) ? 'Cheap-stimulation-heavy, yet you feel good \u2014 fine, just note it.' : '';
+  var slotNames = ['morning', 'midday', 'evening'];
+  var h = '<div class="brief-label">Activity balance <span style="text-transform:none;color:#75777a">(what you did, not how you feel)</span></div>'
+    + '<div style="position:relative;height:18px;background:#2a2c2f;border-radius:9px;margin:8px 0 4px">'
+    + '<div style="position:absolute;left:50%;top:-3px;bottom:-3px;width:2px;background:#56585a"></div>'
+    + '<div style="position:absolute;top:0;bottom:0;border-radius:9px;background:' + col + ';'
+    + 'left:' + Math.min(50, bar) + '%;width:' + Math.abs(bar - 50) + '%"></div></div>'
+    + '<div style="color:#a3a6a9;font-size:12px">' + label + ' &middot; a decaying tally of the tags you tick, not a dopamine reading</div>'
+    + '<div class="brief-label" style="margin-top:16px">How you feel (latest check-in)</div>'
+    + '<div style="font-size:15px">' + (L ? 'Mood <b>' + (mood || '-') + '</b>/5 &nbsp; Energy <b>' + (en || '-') + '</b>/5 <span style="color:#75777a;font-size:12px">&middot; ' + L.date + ' ' + L.slot + '</span>' : '<span style="color:#75777a">no check-in yet</span>') + '</div>'
+    + (mismatch ? '<div style="margin-top:6px;color:#e3b95f;font-size:13px">' + mismatch + '</div>' : '');
+  h += '<div class="brief-label" style="margin-top:20px">Today</div><div style="display:flex;gap:8px;align-items:center">';
+  slotNames.forEach(function(s) {{
+    var done = F.today_slots.indexOf(s) >= 0;
+    h += '<span style="padding:5px 12px;border-radius:6px;border:1px solid ' + (done ? '#6fcf97' : '#424446')
+      + ';color:' + (done ? '#bbf7d0' : '#75777a') + '">' + s + ' ' + F.slots[s] + (done ? ' ✓' : '') + '</span>';
+  }});
+  h += '<button class="btn" onclick="focusNow()">Check in now</button></div>';
+  var entries = F.entries.slice().reverse().slice(0, 21);
+  h += '<div class="brief-label" style="margin-top:20px">Recent check-ins</div>';
+  if (!entries.length) h += '<div style="color:#75777a">No check-ins yet.</div>';
+  entries.forEach(function(e) {{
+    var rest = F.tags.restorative, cheap = F.tags.cheap;
+    var tags = (e.tags || []).map(function(t) {{
+      var c = cheap.indexOf(t) >= 0 ? '#e3b95f' : rest.indexOf(t) >= 0 ? '#6fcf97' : '#a3a6a9';
+      return '<span style="color:' + c + '">' + t + '</span>';
+    }}).join(', ');
+    var gap = (e.want && e.like) ? ' &middot; wanted ' + e.want + ' / liked ' + e.like : '';
+    h += '<div style="padding:8px 0;border-bottom:1px solid #2a2c2f"><span style="color:#75777a">'
+      + e.date + ' ' + e.slot + '</span> &nbsp; mood ' + (e.mood || '-') + ' &middot; energy ' + (e.energy || '-')
+      + gap + (e.stuck ? ' &middot; <span style="color:#e3b95f">STORER</span>' : '')
+      + (tags ? '<br>' + tags : '') + (e.note ? '<br><i style="color:#d4d6d8">' + e.note.replace(/</g, '&lt;') + '</i>' : '') + '</div>';
+  }});
+  root.innerHTML = h;
 }}
 
 function renderIllnessTab() {{
@@ -3789,9 +5582,9 @@ function renderIllnessTab() {{
   var head = document.getElementById('ill-today');
   if (head) {{
     if (today == null) {{
-      head.innerHTML = '<b style="color:#64748b">—</b> awaiting data for today';
+      head.innerHTML = '<b style="color:#75777a">—</b> awaiting data for today';
     }} else {{
-      var col = today < 0.20 ? '#4ade80' : today < 0.50 ? '#fbbf24' : '#f87171';
+      var col = today < 0.20 ? '#6fcf97' : today < 0.50 ? '#e3b95f' : '#e8837a';
       head.innerHTML = '<b style="color:' + col + '">' + (today * 100).toFixed(1) +
                        '%</b> posterior probability of illness today';
     }}
@@ -3844,8 +5637,39 @@ function renderIllnessTab() {{
 }}
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
+(function () {{
+  var last = 0;
+  function ping() {{ var n = Date.now(); if (n - last > 10000) {{ last = n; document.title = '__active__' + n; }} }}
+  ['mousemove', 'keydown', 'scroll', 'click', 'wheel'].forEach(function (e) {{ document.addEventListener(e, ping, true); }});
+  setInterval(function () {{ var a = document.activeElement; if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && (a.value || '').length) ping(); }}, 10000);
+  try {{ var body = document.querySelector('.tab-body');
+    if (body) {{ var y = +sessionStorage.getItem('tabScroll'); setTimeout(function () {{ body.scrollTop = y || 0; }}, 200);
+      body.addEventListener('scroll', function () {{ sessionStorage.setItem('tabScroll', body.scrollTop); }}); }} }} catch (e) {{}}
+}})();
+setInterval(function () {{          // the eating pace moves with the clock, so keep it current without a reload
+  var n = DATA && DATA.nutrition; if (!n || n.eatStart == null) return;
+  var d = new Date(), h = d.getHours() + d.getMinutes() / 60, f = Math.max(0, Math.min((h - n.eatStart) / (n.eatEnd - n.eatStart), 1));
+  n.dayFrac = Math.round(f * 1000) / 1000; n.paceExpected = Math.round(n.target * f);
+  if (typeof renderNutritionDash === 'function') renderNutritionDash();
+  if (typeof renderTodayDials === 'function') renderTodayDials();
+}}, 60000);
+function openApp(id) {{ if (!id) return; document.title = '__openapp__' + Date.now() + '|' + id; var s = document.getElementById('appSwitch'); if (s) s.value = ''; }}
 var trackerRendered = false;
 var illnessRendered = false;
+
+// Stat -> detail: open the tab, then bring the relevant section into view.
+function goTo(tab, anchor) {{
+  selectTab(tab);
+  if (!anchor) return;
+  setTimeout(function() {{
+    var el = document.getElementById(anchor);
+    if (!el) return;
+    el.scrollIntoView({{block: 'center', behavior: 'smooth'}});
+    var host = el.closest('.chart-cell') || el;
+    host.classList.add('flash');
+    setTimeout(function() {{ host.classList.remove('flash'); }}, 1600);
+  }}, 120);
+}}
 
 function selectTab(name) {{
   document.querySelectorAll('.tab').forEach(function(t) {{
@@ -3884,6 +5708,12 @@ function selectTab(name) {{
     }});
   }} else if (name === 'nutrition') {{
     requestAnimationFrame(renderNutritionDash);
+  }} else if (name === 'focus') {{
+    requestAnimationFrame(renderFocus);
+  }} else if (name === 'life') {{
+    requestAnimationFrame(renderLife);
+  }} else if (name === 'sleep') {{
+    requestAnimationFrame(renderSleep);
   }}
 }}
 
@@ -3891,6 +5721,13 @@ function selectTab(name) {{
   document.querySelectorAll('.tab').forEach(function(t) {{
     t.addEventListener('click', function() {{ selectTab(t.dataset.panel); }});
   }});
+
+  var planBox = document.getElementById('plan-box');
+  if (planBox) {{
+    planBox.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ e.preventDefault(); submitPlan(); }}
+    }});
+  }}
 
   var noteBox = document.getElementById('note-box');
   if (noteBox) {{
@@ -3950,7 +5787,7 @@ function drawDonut(cid, segments, opts) {{
   var a0 = -Math.PI/2;
   if (total <= 0) {{
     ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2*Math.PI); ctx.arc(cx, cy, r, 0, 2*Math.PI, true);
-    ctx.fillStyle = '#1e293b'; ctx.fill('evenodd');
+    ctx.fillStyle = '#2a2c2f'; ctx.fill('evenodd');
     return;
   }}
   segments.forEach(function(seg) {{
@@ -3964,26 +5801,89 @@ function drawDonut(cid, segments, opts) {{
     ctx.fill();
     a0 = a1;
   }});
+  if (opts && opts.markerValue != null) {{            // a tick across the ring, e.g. the eating pace
+    var am = -Math.PI/2 + Math.min(Math.max(opts.markerValue / total, 0), 1) * 2 * Math.PI;
+    ctx.beginPath();
+    ctx.moveTo(cx + (r - 4) * Math.cos(am), cy + (r - 4) * Math.sin(am));
+    ctx.lineTo(cx + (R + 4) * Math.cos(am), cy + (R + 4) * Math.sin(am));
+    ctx.strokeStyle = opts.markerColor || '#e8e9ea'; ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.stroke();
+  }}
 }}
 
 function macroByKey(k) {{
   return (DATA.nutrition && DATA.nutrition.macros || []).filter(function(m) {{ return m.key === k; }})[0];
 }}
 
+function renderPaceBar() {{
+  var n = DATA.nutrition, host = document.getElementById('pace-bar-host');
+  if (!host || !n) return;
+  var esc = function(s) {{ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }};
+  var fmt = function(v) {{ return Math.round(v).toLocaleString(); }};
+  var meals = n.meals || [], scale = Math.max(n.target, n.consumed * 1.03, 1);
+  var pct = function(v) {{ return v / scale * 100; }};
+  var acc = 0, segs = '';
+  meals.forEach(function(m, i) {{
+    var w = pct(m.kcal), left = pct(acc); acc += m.kcal;
+    var mk = m.p * 4 + m.c * 4 + m.f * 9;
+    var parts = mk > 0
+      ? [[m.p * 4, '#88dcfd'], [m.c * 4, '#b79cf0'], [m.f * 9, '#e3b95f']].map(function(x) {{ return '<i style="flex:' + x[0] + ';background:' + x[1] + '"></i>'; }}).join('')
+      : '<i style="flex:1;background:#75777a"></i>';
+    segs += '<div class="pace-seg" data-i="' + i + '" style="left:' + left + '%;width:calc(' + w + '% - 2px)">' + parts
+      + (w > 6 ? '<span>' + esc(m.time) + '</span>' : '') + '</div>';
+  }});
+  var behind = n.paceExpected - n.consumed;
+  var near = Math.abs(behind) < 50;
+  var status = near ? 'on pace' : (behind > 0 ? fmt(behind) + ' kcal behind pace' : fmt(-behind) + ' kcal ahead of pace');
+  var col = near ? '#6fcf97' : (behind > 0 ? '#e3b95f' : '#b79cf0');
+  host.innerHTML = '<div class="pace-top"><span><b>' + fmt(n.consumed) + '</b> of ' + fmt(n.target) + ' kcal</span><span style="color:' + col + '">' + status + '</span></div>'
+    + '<div class="pace-bar" id="pace-bar">' + segs
+    + '<div class="pace-rest" id="pace-rest" style="left:' + pct(n.consumed) + '%;right:0"></div>'
+    + '<div class="pace-marker" id="pace-marker" style="left:' + pct(n.paceExpected) + '%"></div>'
+    + '<div class="pace-target" style="left:' + pct(n.target) + '%"></div></div>'
+    + '<div class="pace-axis"><span>0</span><span style="left:' + pct(n.paceExpected) + '%">pace ' + fmt(n.paceExpected) + '</span><span class="r">' + fmt(n.target) + ' target</span></div>'
+    + '<div class="pace-legend"><span><i style="background:#88dcfd"></i>Protein</span><span><i style="background:#b79cf0"></i>Carbs</span><span><i style="background:#e3b95f"></i>Fat</span><span style="color:#75777a">each block is split by share of its calories</span></div>';
+  var bar = document.getElementById('pace-bar'), tip = document.getElementById('pace-tip');
+  var show = function(html, e) {{
+    tip.innerHTML = html; tip.style.display = 'block';
+    var x = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 10);
+    tip.style.left = x + 'px'; tip.style.top = (e.clientY + 16) + 'px';
+  }};
+  bar.addEventListener('mousemove', function(e) {{
+    var seg = e.target.closest('.pace-seg');
+    if (seg) {{
+      var m = meals[parseInt(seg.dataset.i, 10)];
+      show('<b>' + esc(m.time) + '</b> &middot; ' + esc(m.desc.length > 70 ? m.desc.slice(0, 70) + '…' : m.desc)
+        + '<br><b>' + fmt(m.kcal) + ' kcal</b> &middot; P ' + Math.round(m.p) + 'g &middot; C ' + Math.round(m.c) + 'g &middot; F ' + Math.round(m.f) + 'g'
+        + ((m.p * 4 + m.c * 4 + m.f * 9) > 0 ? '<br><span style="color:#a3a6a9">calories from protein ' + Math.round(m.p * 4 / (m.p * 4 + m.c * 4 + m.f * 9) * 100) + '% &middot; carbs ' + Math.round(m.c * 4 / (m.p * 4 + m.c * 4 + m.f * 9) * 100) + '% &middot; fat ' + Math.round(m.f * 9 / (m.p * 4 + m.c * 4 + m.f * 9) * 100) + '%</span>' : '')
+        + (m.items.length ? '<br><span style="color:#a3a6a9">' + esc(m.items.join(', ')) + '</span>' : '')
+        + '<br><span style="color:#75777a">' + Math.round(m.kcal / Math.max(n.consumed, 1) * 100) + '% of what you’ve eaten today</span>', e);
+    }} else if (e.target.closest('#pace-marker')) {{
+      show('<b>Pace</b>: about ' + fmt(n.paceExpected) + ' kcal by now<br>(' + Math.round(n.dayFrac * 100) + '% through the ' + n.eatStart + ':00–' + n.eatEnd + ':00 eating window)<br>'
+        + (near ? 'You are on pace.' : behind > 0 ? 'You are ' + fmt(behind) + ' kcal behind.' : 'You are ' + fmt(-behind) + ' kcal ahead.'), e);
+    }} else if (e.target.closest('#pace-rest')) {{
+      show('<b>' + fmt(Math.max(n.target - n.consumed, 0)) + ' kcal</b> still to eat for today’s ' + fmt(n.target) + ' kcal target<br><span style="color:#a3a6a9">base ' + fmt(n.base) + (n.sessionKcal ? ' + ' + fmt(n.sessionKcal) + ' training' : '') + '</span>', e);
+    }} else {{ tip.style.display = 'none'; }}
+  }});
+  bar.addEventListener('mouseleave', function() {{ tip.style.display = 'none'; }});
+}}
+
 function renderNutritionDash() {{
   var n = DATA.nutrition;
   if (!n) return;
+  renderPaceBar();
 
   // ── Energy ring: eaten vs remaining to target ──
   var remaining = Math.max(n.target - n.consumed, 0);
   drawDonut('c-cal-ring', [
-    {{value: n.consumed,  color: '#a78bfa'}},
-    {{value: remaining,   color: '#1e293b'}}
-  ], {{inner: 0.72}});
+    {{value: n.consumed,  color: '#88dcfd'}},
+    {{value: remaining,   color: '#2a2c2f'}}
+  ], {{inner: 0.72, markerValue: n.paceExpected, markerColor: '#e8e9ea'}});
+  var ringWrap = document.querySelector('.cal-ring-wrap');
+  if (ringWrap) ringWrap.title = 'White tick = eating pace: about ' + Math.round(n.paceExpected).toLocaleString() + ' kcal by now';
   var isOver = n.consumed > n.target;
   var mid = document.getElementById('cal-ring-mid');
   if (mid) {{
-    mid.innerHTML = '<div class="big" style="color:' + (isOver ? '#fbbf24' : '#e2e8f0') + '">' +
+    mid.innerHTML = '<div class="big" style="color:' + (isOver ? '#e3b95f' : '#e8e9ea') + '">' +
       Math.round(n.consumed).toLocaleString() + '</div>' +
       '<div class="small">of ' + Math.round(n.target).toLocaleString() + ' kcal</div>';
   }}
@@ -3994,6 +5894,7 @@ function renderNutritionDash() {{
       row('Base target', n.base + ' kcal') +
       (n.sessionKcal ? row('Training burn', '+' + n.sessionKcal + ' kcal') : '') +
       row('Eaten', '<b>' + Math.round(n.consumed).toLocaleString() + '</b>') +
+      row('Pace tick (by now)', Math.round(n.paceExpected).toLocaleString() + ' kcal') +
       row(isOver ? 'Over by' : 'Remaining',
           '<b>' + Math.abs(n.target - n.consumed).toLocaleString() + ' kcal</b>');
   }}
@@ -4021,8 +5922,8 @@ function renderNutritionDash() {{
       var unit = m.unit || 'g';
       var pct = m.target ? m.g / m.target * 100 : 0;
       var col = m.kind === 'limit'
-        ? (pct > 100 ? '#ef4444' : pct > 75 ? '#fbbf24' : '#4ade80')
-        : (pct >= 100 ? '#4ade80' : pct >= 75 ? '#fbbf24' : '#ef4444');
+        ? (pct > 100 ? '#e8837a' : pct > 75 ? '#e3b95f' : '#6fcf97')
+        : (pct >= 100 ? '#6fcf97' : pct >= 75 ? '#e3b95f' : '#e8837a');
       return '<div class="mb-row">' +
         '<span class="mb-name">' + m.label + '</span>' +
         '<span class="mb-track">' +
@@ -4050,21 +5951,21 @@ function renderBulk() {{
   if (!stats) return;
   if (b.avg_surplus == null) {{
     stats.innerHTML = '<div class="bulk-stat" style="grid-column:span 2">' +
-      '<div class="k">Trend</div><div class="v" style="font-size:12px;color:#64748b">' +
+      '<div class="k">Trend</div><div class="v" style="font-size:12px;color:#75777a">' +
       'Log a few full days to see your rolling surplus</div></div>';
     return;
   }}
-  var stateCol = {{'on track':'#4ade80','slow but positive':'#fbbf24','in deficit':'#f87171'}}[b.state] || '#94a3b8';
+  var stateCol = {{'on track':'#6fcf97','slow but positive':'#e3b95f','in deficit':'#e8837a'}}[b.state] || '#a3a6a9';
   var proj = (b.today_projected != null)
     ? '<div class="bulk-stat"><div class="k">Today projected</div><div class="v" style="color:' +
-      (b.today_projected >= 0 ? '#4ade80' : '#f87171') + '">' +
+      (b.today_projected >= 0 ? '#6fcf97' : '#e8837a') + '">' +
       (b.today_projected >= 0 ? '+' : '') + b.today_projected + '</div></div>'
     : '';
   stats.innerHTML =
     '<div class="bulk-stat"><div class="k">7-day avg surplus</div><div class="v" style="color:' + stateCol + '">' +
-      (b.avg_surplus >= 0 ? '+' : '') + b.avg_surplus + '<span style="font-size:10px;color:#64748b"> kcal/d</span></div></div>' +
+      (b.avg_surplus >= 0 ? '+' : '') + b.avg_surplus + '<span style="font-size:10px;color:#75777a"> kcal/d</span></div></div>' +
     '<div class="bulk-stat"><div class="k">Projected change</div><div class="v" style="color:' + stateCol + '">' +
-      (b.kg_per_week >= 0 ? '+' : '') + b.kg_per_week + '<span style="font-size:10px;color:#64748b"> kg/wk</span></div></div>' +
+      (b.kg_per_week >= 0 ? '+' : '') + b.kg_per_week + '<span style="font-size:10px;color:#75777a"> kg/wk</span></div></div>' +
     '<div class="bulk-stat"><div class="k">Status</div><div class="v" style="font-size:13px;color:' + stateCol + '">' +
       b.state + '</div></div>' +
     (proj || '<div class="bulk-stat"><div class="k">Logged days</div><div class="v">' +
@@ -4077,7 +5978,7 @@ function paintGoalReadout(kcalPerDay) {{
   var kgEl = document.getElementById('goal-kg'), kcalEl = document.getElementById('goal-kcal');
   if (kgEl) {{
     kgEl.textContent = (kg >= 0 ? '+' : '') + kg.toFixed(2);
-    kgEl.style.color = kg > 0.02 ? '#4ade80' : kg < -0.02 ? '#f87171' : '#94a3b8';
+    kgEl.style.color = kg > 0.02 ? '#6fcf97' : kg < -0.02 ? '#e8837a' : '#a3a6a9';
   }}
   if (kcalEl) kcalEl.textContent = (kcalPerDay >= 0 ? '+' : '') + kcalPerDay + ' kcal/day';
 }}
@@ -4108,8 +6009,8 @@ function drawNutrWeight() {{
   var xOf = function(i) {{ return PAD.left + (i / Math.max(dates.length - 1, 1)) * cW; }};
   var yOf = function(v) {{ return PAD.top + (1 - (v - lo) / (hi - lo)) * cH; }};
 
-  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
-  ctx.fillStyle = '#475569'; ctx.font = '9px system-ui';
+  ctx.strokeStyle = '#2a2c2f'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#56585a'; ctx.font = '9px system-ui';
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (var i = 0; i <= 3; i++) {{
     var v = lo + (hi - lo) * i / 3, y = Math.round(yOf(v)) + 0.5;
@@ -4120,14 +6021,14 @@ function drawNutrWeight() {{
   var n = vals.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
   for (var k = 0; k < n; k++) {{ sx += k; sy += vals[k]; sxx += k*k; sxy += k*vals[k]; }}
   var slope = (n*sxy - sx*sy) / (n*sxx - sx*sx || 1), icpt = (sy - slope*sx) / n;
-  ctx.strokeStyle = '#334155'; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+  ctx.strokeStyle = '#424446'; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(xOf(0), yOf(icpt)); ctx.lineTo(xOf(n-1), yOf(icpt + slope*(n-1)));
   ctx.stroke(); ctx.setLineDash([]);
 
-  ctx.strokeStyle = '#67e8f9'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.beginPath();
+  ctx.strokeStyle = '#d3d5d7'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.beginPath();
   vals.forEach(function(v, i) {{ i ? ctx.lineTo(xOf(i), yOf(v)) : ctx.moveTo(xOf(i), yOf(v)); }});
   ctx.stroke();
-  ctx.fillStyle = '#67e8f9';
+  ctx.fillStyle = '#d3d5d7';
   ctx.beginPath(); ctx.arc(xOf(n-1), yOf(vals[n-1]), 3, 0, 7); ctx.fill();
 
   if (sub) {{
@@ -4145,7 +6046,7 @@ function renderTodayDials() {{
   if (!host || !n) return;
   if (n.consumed <= 0) {{
     host.innerHTML = '<div class="brief-label">Nutrition</div>' +
-      '<div style="font-size:11.5px;color:#475569">Nothing logged yet today. ' +
+      '<div style="font-size:11.5px;color:#56585a">Nothing logged yet today. ' +
       'Log food from the Nutrition tab.</div>';
     return;
   }}
@@ -4161,12 +6062,12 @@ function renderTodayDials() {{
 
   var remaining = Math.max(n.target - n.consumed, 0);
   drawDonut('c-dial-ring', [
-    {{value: n.consumed, color: '#a78bfa'}},
-    {{value: remaining,  color: '#1e293b'}}
+    {{value: n.consumed, color: '#88dcfd'}},
+    {{value: remaining,  color: '#2a2c2f'}}
   ], {{inner: 0.72}});
   var over = n.consumed > n.target;
   document.getElementById('dial-ring-mid').innerHTML =
-    '<div class="big" style="color:' + (over ? '#fbbf24' : '#e2e8f0') + '">' +
+    '<div class="big" style="color:' + (over ? '#e3b95f' : '#e8e9ea') + '">' +
     Math.round(n.consumed / n.target * 100) + '%</div><div class="small">of kcal</div>';
 
   document.getElementById('dial-macros').innerHTML =
@@ -4182,7 +6083,7 @@ function renderTodayDials() {{
   var b = DATA.bulk || {{}};
   var foot = document.getElementById('dial-foot');
   if (b.avg_surplus != null) {{
-    var col = {{'on track':'#4ade80','slow but positive':'#fbbf24','in deficit':'#f87171'}}[b.state] || '#94a3b8';
+    var col = {{'on track':'#6fcf97','slow but positive':'#e3b95f','in deficit':'#e8837a'}}[b.state] || '#a3a6a9';
     foot.innerHTML = '<span>7-day surplus <b style="color:' + col + '">' +
       (b.avg_surplus >= 0 ? '+' : '') + b.avg_surplus + '</b> kcal/d</span>' +
       '<span><b style="color:' + col + '">' + (b.kg_per_week >= 0 ? '+' : '') + b.kg_per_week +
@@ -4226,24 +6127,78 @@ function parseClock(raw) {{
   return mins * 60 + secs;
 }}
 
-function submitMetric() {{
-  var metric = document.getElementById('log-metric').value;
-  var raw    = document.getElementById('log-value').value;
-  var m      = metricByKey(metric);
-  // A 5k typed as "20:04" must not be logged as 2004 seconds.
-  var value  = (m && m.is_time) ? parseClock(raw) : parseFloat(raw);
-  var reps   = parseInt(document.getElementById('log-reps').value) || null;
-  var notes  = document.getElementById('log-notes').value.trim();
-  if (!metric || isNaN(value)) {{ return; }}
-  var payload = JSON.stringify({{metric:metric, value:value, reps:reps, notes:notes}});
-  document.title = '__logmetric__' + Date.now() + '|' + encodeURIComponent(payload);
-  // Clear inputs and confirm
-  document.getElementById('log-value').value = '';
-  document.getElementById('log-reps').value  = '';
-  document.getElementById('log-notes').value = '';
-  document.getElementById('log-metric').value = '';
+// ── Performance: log / add dialogs ────────────────────────────────────────────
+var PM = {{mode: null, tier: 'bank'}};
+function pmOpen(mode, html) {{
+  PM.mode = mode;
+  document.getElementById('pm-dialog').innerHTML = html;
+  document.getElementById('pm-overlay').style.display = 'flex';
+  var f = document.querySelector('#pm-dialog [data-autofocus]'); if (f) f.focus();
+}}
+function pmClose() {{ PM.mode = null; var o = document.getElementById('pm-overlay'); if (o) o.style.display = 'none'; }}
+document.addEventListener('keydown', function(e) {{
+  if (!PM.mode) return;
+  if (e.key === 'Escape') pmClose();
+  else if (e.key === 'Enter' && e.target.tagName !== 'SELECT' && e.target.tagName !== 'BUTTON') {{
+    if (PM.mode === 'log') submitLog(); else if (PM.mode === 'add') submitAddMetric();
+  }}
+}});
+function metricOptions(sel) {{
+  return [['key', 'Key metrics'], ['goal', 'Goals'], ['bank', 'Stored']].map(function(g) {{
+    var ms = (DATA.metrics || []).filter(function(m) {{ return m.tier === g[0] && m.key !== 'bodyweight'; }});
+    if (!ms.length) return '';
+    return '<optgroup label="' + g[1] + '">' + ms.map(function(m) {{
+      return '<option value="' + escAttr(m.key) + '"' + (m.key === sel ? ' selected' : '') + '>' + escAttr(m.label) + '</option>';
+    }}).join('') + '</optgroup>';
+  }}).join('');
+}}
+function openLogModal(key) {{
+  var today = new Date().toLocaleDateString('en-CA');
+  pmOpen('log',
+    '<div class="pm-title">Log a result</div>' +
+    '<div class="pm-field"><label>Metric</label><select id="pm-metric" onchange="pmSync()">' +
+      '<option value="">Choose a metric…</option>' + metricOptions(key) + '</select>' +
+      '<div class="pm-hint" id="pm-hint"></div></div>' +
+    '<div class="pm-row">' +
+      '<div class="pm-field"><label>Result</label><input id="pm-value" type="text" data-autofocus placeholder="value"></div>' +
+      '<div class="pm-field" id="pm-reps-wrap"><label>Reps</label><input id="pm-reps" type="number" min="1" step="1" placeholder="e.g. 8"></div>' +
+      '<div class="pm-field"><label>Date</label><input id="pm-date" type="date" value="' + today + '" max="' + today + '"></div>' +
+    '</div>' +
+    '<div class="pm-field"><label>Notes <span class="pm-opt">optional</span></label><input id="pm-notes" type="text" placeholder="how it felt, conditions…"></div>' +
+    '<div class="pm-err" id="pm-err"></div>' +
+    '<div class="pm-actions"><button onclick="pmClose()">Cancel</button><button class="btn" onclick="submitLog()">Save result</button></div>');
+  pmSync();
+}}
+function pmSync() {{
+  var sel = document.getElementById('pm-metric'); if (!sel) return;
+  var m = metricByKey(sel.value);
+  var v = document.getElementById('pm-value');
+  v.placeholder = m ? (m.is_time ? 'm:ss  (e.g. 6:29)' : (m.unit || 'value')) : 'value';
+  document.getElementById('pm-reps-wrap').style.display = (m && m.rep_weighted) ? '' : 'none';
+  var h = '';
+  if (m) {{
+    h = m.has_data
+      ? 'Last <b>' + fmtVal(m, m.value) + '</b>' + (m.reps ? ' ×' + m.reps : '') + ' · ' + m.date + (m.pb != null ? ' · best ' + fmtVal(m, m.pb) : '')
+      : 'No result yet — the first one sets the baseline.';
+    if (m.lower) h += ' · lower is better';
+  }}
+  document.getElementById('pm-hint').innerHTML = h;
+}}
+function submitLog() {{
+  var key = document.getElementById('pm-metric').value, m = metricByKey(key);
+  var raw = document.getElementById('pm-value').value.trim();
+  var value = (m && m.is_time) ? parseClock(raw) : parseFloat(raw);
+  var err = document.getElementById('pm-err');
+  if (!key) {{ err.textContent = 'Choose which metric this is for.'; return; }}
+  if (isNaN(value)) {{ err.textContent = (m && m.is_time) ? 'Enter a time like 6:29.' : 'Enter a number.'; return; }}
+  var payload = {{metric: key, value: value, notes: document.getElementById('pm-notes').value.trim(),
+                  reps: parseInt(document.getElementById('pm-reps').value, 10) || null}};
+  var d = document.getElementById('pm-date').value;
+  if (d && d !== new Date().toLocaleDateString('en-CA')) payload.date = d;
+  document.title = '__logmetric__' + Date.now() + '|' + encodeURIComponent(JSON.stringify(payload));
+  pmClose();
   var conf = document.getElementById('log-confirm');
-  if (conf) {{ conf.textContent = '✓ logged'; setTimeout(function(){{ conf.textContent=''; }}, 2500); }}
+  if (conf) {{ conf.textContent = '✓ logged ' + (m ? m.label : ''); setTimeout(function() {{ conf.textContent = ''; }}, 3000); }}
 }}
 
 // ── Performance tracker ───────────────────────────────────────────────────────
@@ -4389,40 +6344,43 @@ function syncAddKey() {{
 }}
 
 function openAddMetric() {{
-  var host = document.getElementById('add-metric-form');
-  if (host.style.display === 'block') {{ host.style.display = 'none'; return; }}
-  host.style.display = 'block';
-  host.innerHTML =
-    '<label>Name<input id="am-label" type="text" placeholder="5k run" oninput="syncAddKey()"></label>' +
-    unitSelect('am-unit', '') +
-    '<label>Baseline<input id="am-base" type="text" placeholder="number"></label>' +
-    '<label>Target<input id="am-tgt" type="text" placeholder="number"></label>' +
-    '<label>Lifetime PB<input id="am-pb" type="text" placeholder="number"></label>' +
-    '<label>PB date<input id="am-pbd" type="text" placeholder="YYYY-MM-DD"></label>' +
-    '<label>Tier<select id="am-tier">' +
-      '<option value="bank" selected>Stored</option>' +
-      '<option value="key">Key metric</option>' +
-      '<option value="goal">Goal</option>' +
-    '</select></label>' +
-    '<label class="chk"><input id="am-lb" type="checkbox"> lower is better</label>' +
-    '<label class="chk"><input id="am-rw" type="checkbox"> rep-weighted</label>' +
-    '<label>Key<input id="am-key" type="text" placeholder="auto from name" ' +
-      'onchange="this.dataset.touched=1"></label>' +
-    '<div class="metric-form-actions">' +
-      '<button class="log-btn" onclick="submitAddMetric()">Add</button>' +
-      '<button onclick="openAddMetric()">Cancel</button>' +
-    '</div>';
+  PM.tier = 'bank';
+  var tiers = [['goal', 'Goal', 'charted against a target'], ['key', 'Key metric', 'on the profile, fed to the coach'],
+               ['bank', 'Stored', 'tracked quietly, e.g. PBs']];
+  pmOpen('add',
+    '<div class="pm-title">New metric</div>' +
+    '<div class="pm-field"><label>Name</label><input id="am-label" type="text" data-autofocus placeholder="e.g. 5k run" oninput="syncAddKey()"></div>' +
+    '<div class="pm-row">' + unitSelect('am-unit', '').replace('<label>Unit', '<label>Measured in').replace('<label>', '<div class="pm-field"><label>').replace('</select></label>', '</select></div>') +
+      '<div class="pm-field"><label>Better is</label><label class="chk"><input id="am-lb" type="checkbox"> lower (times, splits)</label></div></div>' +
+    '<div class="pm-row">' +
+      '<div class="pm-field"><label>Baseline <span class="pm-opt">where you are now</span></label><input id="am-base" type="text" placeholder="number"></div>' +
+      '<div class="pm-field"><label>Target <span class="pm-opt">where you want to be</span></label><input id="am-tgt" type="text" placeholder="number"></div></div>' +
+    '<div class="pm-field"><label>Where should it live?</label><div id="am-tiers">' + tiers.map(function(x) {{
+      return '<span class="sl-chip' + (x[0] === PM.tier ? ' on' : '') + '" data-tier="' + x[0] + '" title="' + x[2] + '">' + x[1] + '</span>';
+    }}).join('') + '</div><div class="pm-hint" id="am-tier-hint">tracked quietly, e.g. PBs</div></div>' +
+    '<details class="pm-more"><summary>More options</summary>' +
+      '<div class="pm-row"><div class="pm-field"><label>Lifetime best</label><input id="am-pb" type="text" placeholder="number"></div>' +
+      '<div class="pm-field"><label>Best set on</label><input id="am-pbd" type="text" placeholder="YYYY-MM-DD"></div></div>' +
+      '<label class="chk"><input id="am-rw" type="checkbox"> compare across rep ranges (weights)</label>' +
+      '<div class="pm-field"><label>Key <span class="pm-opt">auto from name</span></label><input id="am-key" type="text" onchange="this.dataset.touched=1"></div>' +
+    '</details>' +
+    '<div class="pm-err" id="pm-err"></div>' +
+    '<div class="pm-actions"><button onclick="pmClose()">Cancel</button><button class="btn" onclick="submitAddMetric()">Add metric</button></div>');
   document.getElementById('am-unit').addEventListener('change', addUnitChanged);
+  document.getElementById('am-tiers').addEventListener('click', function(e) {{
+    var c = e.target.closest('[data-tier]'); if (!c) return;
+    PM.tier = c.dataset.tier;
+    Array.prototype.forEach.call(this.children, function(x) {{ x.classList.toggle('on', x === c); }});
+    document.getElementById('am-tier-hint').textContent = c.title;
+  }});
 }}
 
 function submitAddMetric() {{
+  var err = document.getElementById('pm-err');
   var label = document.getElementById('am-label').value.trim();
   var key   = document.getElementById('am-key').value.trim() || slugify(label);
-  if (!label) {{ metricError('Give the metric a name.'); return; }}
-  if (!/^[a-z0-9_]+$/.test(key)) {{
-    metricError('Key must be lowercase letters, digits and underscores (e.g. run_5k).');
-    return;
-  }}
+  if (!label) {{ err.textContent = 'Give the metric a name.'; return; }}
+  if (!/^[a-z0-9_]+$/.test(key)) {{ err.textContent = 'Key must be lowercase letters, digits and underscores.'; return; }}
   metricCfg('add', key, {{
     label:           label,
     unit:            document.getElementById('am-unit').value,
@@ -4430,11 +6388,11 @@ function submitAddMetric() {{
     target:          document.getElementById('am-tgt').value.trim(),
     lifetime:        document.getElementById('am-pb').value.trim(),
     lifetime_date:   document.getElementById('am-pbd').value.trim(),
-    tier:            document.getElementById('am-tier').value,
+    tier:            PM.tier,
     lower_is_better: document.getElementById('am-lb').checked,
     rep_weighted:    document.getElementById('am-rw').checked
   }});
-  document.getElementById('add-metric-form').style.display = 'none';
+  pmClose();
 }}
 
 // ── Goal charts ───────────────────────────────────────────────────────────────
@@ -4463,7 +6421,7 @@ function renderGoals() {{
           '<span class="goal-pct">' + pct + '%</span></div>' +
       '</div>' +
       '<div class="goal-wrap" id="gw-' + m.key + '"><canvas id="gc-' + m.key + '"></canvas></div>' +
-      '<div class="metric-tiers">' + tierButtons(m) + editButton(m) + '</div>' +
+      '<div class="metric-tiers">' + logButton(m) + tierButtons(m) + editButton(m) + '</div>' +
       '<div class="metric-form" id="edit-' + m.key + '" style="display:none"></div>' +
     '</div>';
   }}).join('');
@@ -4493,8 +6451,8 @@ function drawGoalChart(m) {{
     return PAD.top + (m.lower ? f : 1 - f) * cH;
   }};
 
-  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
-  ctx.fillStyle = '#475569'; ctx.font = '9px system-ui';
+  ctx.strokeStyle = '#2a2c2f'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#56585a'; ctx.font = '9px system-ui';
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (var i = 0; i <= 3; i++) {{
     var v = lo + (hi - lo) * i / 3, y = Math.round(yOf(v)) + 0.5;
@@ -4502,9 +6460,9 @@ function drawGoalChart(m) {{
     ctx.fillText(m.lower ? formatTime(v, m.unit) : v.toFixed(0), PAD.left - 6, y);
   }}
 
-  [[m.start, '#475569', 'baseline'],
-   [m.pb_source === 'lifetime' ? m.pb : null, '#22d3ee', 'lifetime PB'],
-   [m.target, '#4ade80', 'target']].forEach(function(t) {{
+  [[m.start, '#56585a', 'baseline'],
+   [m.pb_source === 'lifetime' ? m.pb : null, '#b79cf0', 'lifetime PB'],
+   [m.target, '#6fcf97', 'target']].forEach(function(t) {{
     if (t[0] == null || t[0] < lo || t[0] > hi) return;
     var y = Math.round(yOf(t[0])) + 0.5;
     ctx.strokeStyle = t[1]; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
@@ -4520,11 +6478,11 @@ function drawGoalChart(m) {{
   vals.forEach(function(v, i) {{ i ? ctx.lineTo(xOf(i), yOf(v)) : ctx.moveTo(xOf(i), yOf(v)); }});
   ctx.stroke();
   vals.forEach(function(v, i) {{
-    ctx.fillStyle = i === vals.length - 1 ? m.color : '#334155';
+    ctx.fillStyle = i === vals.length - 1 ? m.color : '#424446';
     ctx.beginPath(); ctx.arc(xOf(i), yOf(v), i === vals.length - 1 ? 3.5 : 2, 0, 7); ctx.fill();
   }});
 
-  ctx.fillStyle = '#475569'; ctx.font = '9px system-ui'; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#56585a'; ctx.font = '9px system-ui'; ctx.textBaseline = 'top';
   ctx.textAlign = 'left';  ctx.fillText(hist[0].date, PAD.left, H - PAD.bottom + 5);
   ctx.textAlign = 'right'; ctx.fillText(hist[hist.length-1].date, W - PAD.right, H - PAD.bottom + 5);
 }}
@@ -4536,6 +6494,10 @@ function tierButtons(m) {{
     return '<button class="tier-btn' + on + '" title="' + d[2] +
            '" onclick="setTier(\\'' + m.key + '\\',\\'' + d[0] + '\\')">' + d[1] + '</button>';
   }}).join('') + '</div>';
+}}
+
+function logButton(m) {{
+  return '<button class="edit-btn" title="Log a result" onclick="openLogModal(&quot;' + m.key + '&quot;)">+</button>';
 }}
 
 function editButton(m) {{
@@ -4563,7 +6525,7 @@ function drawRadar() {{
     var c2 = canvas.getContext('2d');
     c2.setTransform(1,0,0,1,0,0);
     c2.clearRect(0, 0, canvas.width, canvas.height);
-    c2.fillStyle = '#475569';
+    c2.fillStyle = '#56585a';
     c2.font = '12px system-ui';
     c2.textAlign = 'center';
     c2.fillText('Star 3+ key metrics to draw the profile', canvas.width/2, canvas.height/2);
@@ -4584,7 +6546,7 @@ function drawRadar() {{
   var n = axes.length;
 
   // Background fill
-  ctx.fillStyle = '#0f172a';
+  ctx.fillStyle = '#1b1c1e';
   ctx.fillRect(0, 0, W, H);
 
   // Grid rings
@@ -4596,7 +6558,7 @@ function drawRadar() {{
       if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
     }}
     ctx.closePath();
-    ctx.strokeStyle = t===1.0 ? '#334155' : '#1e293b';
+    ctx.strokeStyle = t===1.0 ? '#424446' : '#2a2c2f';
     ctx.lineWidth = 1; ctx.stroke();
   }});
 
@@ -4605,12 +6567,12 @@ function drawRadar() {{
   for (var i=0; i<n; i++) {{
     var a = i * 2*Math.PI/n - Math.PI/2;
     var hasData = vals[i] !== null;
-    ctx.strokeStyle='#1e293b'; ctx.lineWidth=1;
+    ctx.strokeStyle='#2a2c2f'; ctx.lineWidth=1;
     if (!hasData) ctx.setLineDash([2,2]);
     ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a)); ctx.stroke();
     ctx.setLineDash([]);
     var lx = cx + (r+14)*Math.cos(a), ly = cy + (r+14)*Math.sin(a);
-    ctx.fillStyle = hasData ? '#64748b' : '#334155';
+    ctx.fillStyle = hasData ? '#75777a' : '#424446';
     ctx.font='9px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
     ctx.fillText(axes[i].label + (hasData ? '' : ' (–)'), lx, ly);
   }}
@@ -4624,8 +6586,8 @@ function drawRadar() {{
     if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   }}
   ctx.closePath();
-  ctx.fillStyle='rgba(167,139,250,0.15)'; ctx.fill();
-  ctx.strokeStyle='#a78bfa'; ctx.lineWidth=2; ctx.stroke();
+  ctx.fillStyle='rgba(139,219,250,0.15)'; ctx.fill();
+  ctx.strokeStyle='#88dcfd'; ctx.lineWidth=2; ctx.stroke();
 
   // Target ring (100%)
   ctx.beginPath();
@@ -4634,7 +6596,7 @@ function drawRadar() {{
     if (i===0) ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a));
     else ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a));
   }}
-  ctx.closePath(); ctx.strokeStyle='rgba(167,139,250,0.35)'; ctx.lineWidth=1.5;
+  ctx.closePath(); ctx.strokeStyle='rgba(139,219,250,0.35)'; ctx.lineWidth=1.5;
   ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
 
   // Dots
@@ -4643,7 +6605,7 @@ function drawRadar() {{
     var pct = Math.min(vals[i], 120) / 100;
     var a = i * 2*Math.PI/n - Math.PI/2;
     ctx.beginPath(); ctx.arc(cx+pct*r*Math.cos(a), cy+pct*r*Math.sin(a), 3, 0, 2*Math.PI);
-    ctx.fillStyle='#a78bfa'; ctx.fill();
+    ctx.fillStyle='#88dcfd'; ctx.fill();
   }}
 }}
 
@@ -4658,12 +6620,12 @@ function pbRow(m) {{
 }}
 
 function metricCard(m) {{
-  var color = m.color || '#a78bfa';
+  var color = m.color || '#88dcfd';
 
   if (!m.has_data) {{
     return '<div class="metric-card empty">' +
       '<div class="mc-head"><div class="mc-label">' + m.label + '</div>' +
-        '<div class="mc-actions">' + tierButtons(m) + editButton(m) + '</div></div>' +
+        '<div class="mc-actions">' + logButton(m) + tierButtons(m) + editButton(m) + '</div></div>' +
       pbRow(m) +
       '<div class="mc-none">No result logged yet — the first will set the baseline</div>' +
       '<div class="mc-journey"><span>' + fmtVal(m, m.start) +
@@ -4674,15 +6636,15 @@ function metricCard(m) {{
 
   var hasJourney = m.journey_pct != null;
   var jpct    = hasJourney ? Math.max(0, Math.min(100, m.journey_pct)) : 0;
-  var jpctCol = jpct >= 66 ? '#4ade80' : jpct >= 33 ? '#fbbf24' : '#f87171';
-  var repsStr = (m.reps && !m.lower) ? (' <span style="font-size:11px;color:#475569">×' + m.reps + '</span>') : '';
+  var jpctCol = jpct >= 66 ? '#6fcf97' : jpct >= 33 ? '#e3b95f' : '#e8837a';
+  var repsStr = (m.reps && !m.lower) ? (' <span style="font-size:11px;color:#56585a">×' + m.reps + '</span>') : '';
   var pctStr  = hasJourney
     ? ' <span style="font-size:10px;color:' + jpctCol + '">' + Math.round(jpct) + '%</span>'
-    : ' <span style="font-size:10px;color:#475569">no target</span>';
+    : ' <span style="font-size:10px;color:#56585a">no target</span>';
 
   return '<div class="metric-card' + (m.tier === 'bank' ? ' stored' : '') + '">' +
     '<div class="mc-head"><div class="mc-label">' + m.label + '</div>' +
-      '<div class="mc-actions">' + tierButtons(m) + editButton(m) + '</div></div>' +
+      '<div class="mc-actions">' + logButton(m) + tierButtons(m) + editButton(m) + '</div></div>' +
     '<div><span class="mc-val" style="color:' + color + '">' + fmtVal(m, m.value) + '</span>' +
     repsStr + pctStr + '</div>' +
     (hasJourney
@@ -4735,7 +6697,7 @@ function renderSparkSVG(spark, lowerBetter, color) {{
     return x + ',' + y;
   }});
   var trend = lowerBetter ? (vals[0] - vals[vals.length-1]) : (vals[vals.length-1] - vals[0]);
-  var trendCol = trend > 0 ? '#4ade80' : trend < 0 ? '#f87171' : '#475569';
+  var trendCol = trend > 0 ? '#6fcf97' : trend < 0 ? '#e8837a' : '#56585a';
   return '<svg class="mc-spark" viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg">' +
     '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linejoin="round"/>' +
     '<circle cx="' + pts[pts.length-1].split(',')[0] + '" cy="' + pts[pts.length-1].split(',')[1] + '" r="2.5" fill="' + trendCol + '"/>' +
@@ -4776,8 +6738,65 @@ class BriefWindow(Gtk.Window):
         # the queue lets the UI accept new entries immediately instead of
         # blocking on the ~20s Ollama round trip.
         self._food_queue = queue.Queue()
+        # Quiet auto-refresh: rebuild in the background and swap the page only while the user is idle.
+        self._last_input = time.monotonic()
+        self._last_render = time.monotonic()
+        self._render_date = datetime.now().date()
+        self._refreshing = False
+        self._sig = None
+        self._last_probe = 0.0
+        self.connect("focus-in-event", self._on_focus_in)
+        GLib.timeout_add_seconds(30, self._auto_tick)
+        if apphub:
+            apphub.listen("dashboard", self._on_hub)
         self._food_queue_depth = 0
         threading.Thread(target=self._food_worker, daemon=True).start()
+        for it in load_pending():                         # entries that never finished before the last exit
+            log.info("restoring pending food entry %s (%d meals done)", it["id"][:8], it.get("done", 0))
+            self._food_queue_depth += 1
+            self._food_queue.put((it["id"], it["text"], it.get("day"), it.get("done", 0), 0))
+
+        # Focus check-ins are written by a separate popup process; push new ones in place.
+        self._focus_mtime = 0
+        if _focus:
+            GLib.timeout_add_seconds(20, self._poll_focus)
+        if _life:
+            GLib.timeout_add_seconds(5, self._poll_life)
+
+    def _push_life(self):
+        sessions = []
+        try:
+            sessions = load_training_plan().get("sessions", [])
+        except Exception:
+            pass
+        payload = json.dumps(_life.life_payload(sessions))
+        GLib.idle_add(lambda: self.wv.run_javascript(
+            f"DATA.life={payload}; renderLife();", None, None, None) or False)
+
+    def _poll_life(self):
+        try:
+            m = (os.path.getmtime(_life.TODOS_FILE),
+                 os.path.getmtime(_life.EVENTS_FILE) if os.path.exists(_life.EVENTS_FILE) else 0)
+        except OSError:
+            return True
+        if m != getattr(self, "_life_mtime", None):
+            first = getattr(self, "_life_mtime", None) is None
+            self._life_mtime = m
+            if not first:                # initial state is already in the page
+                self._push_life()
+        return True
+
+    def _poll_focus(self):
+        try:
+            m = os.path.getmtime(_focus.LOG_FILE)
+        except OSError:
+            return True
+        if m != self._focus_mtime:
+            self._focus_mtime = m
+            payload = json.dumps(_focus.focus_payload())
+            self.wv.run_javascript(
+                f"if (window.DATA) {{ DATA.focus={payload}; renderFocus(); }}", None, None, None)
+        return True
 
     def _on_title_changed(self, wv, _):
         t = wv.get_title() or ""
@@ -4794,6 +6813,40 @@ class BriefWindow(Gtk.Window):
         elif t.startswith("__clearnotes__"):
             clear_notes()
             self._notes_changed()
+        elif t.startswith("__excludeday__"):
+            try:
+                toggle_excluded_day(t.partition("|")[2])
+                threading.Thread(target=self._refresh, daemon=True).start()
+            except Exception:
+                log.exception("exclude day failed")
+        elif t.startswith("__sleeprate__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t.partition("|")
+            try:
+                _sleep.save_rating(json.loads(_up.unquote(enc)))
+                wellness = self._last_data[0] if getattr(self, "_last_data", None) else []
+                payload = json.dumps(_sleep.sleep_payload(wellness))
+                self.wv.run_javascript(f"DATA.sleep={payload}; renderSleep();", None, None, None)
+            except Exception:
+                log.exception("sleep rating failed")
+        elif t.startswith("__lifeadd__") or t.startswith("__lifeact__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t.partition("|")
+            try:
+                obj = json.loads(_up.unquote(enc))
+                if t.startswith("__lifeadd__"):
+                    _life.add_item(obj)
+                elif obj.get("act") == "toggle":
+                    _life.toggle_todo(obj["id"])
+                elif obj.get("act") == "del":
+                    _life.delete_item(obj["id"])
+                self._push_life()
+            except Exception:
+                log.exception("life command failed")
+        elif t.startswith("__focusnow__"):
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.realpath(__file__)), "focus.py"),
+                       "popup", "--force"])
         elif t.startswith("__logmetric__"):
             import urllib.parse as _up
             _nonce, _, enc = t[len("__logmetric__"):].partition("|")
@@ -4831,11 +6884,46 @@ class BriefWindow(Gtk.Window):
             import urllib.parse as _up
             _nonce, _, enc = t[len("__logfood__"):].partition("|")
             description = _up.unquote(enc)
+            day = None
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})::(.*)$", description, re.S)
+            if m:
+                day, description = m.group(1), m.group(2)
+                if day > datetime.now().strftime("%Y-%m-%d"):
+                    day = None          # never log into the future
+            item_id = uuid.uuid4().hex
+            pending_add({"id": item_id, "text": description, "day": day, "done": 0})
+            save_food_draft("")                      # it is safely queued, so the box draft is no longer needed
             self._food_queue_depth += 1
-            self._food_queue.put(description)
+            self._food_queue.put((item_id, description, day, 0, 0))
             GLib.idle_add(
                 lambda n=self._food_queue_depth: self.wv.run_javascript(
                     f"setFoodQueued({n})", None, None, None) or False)
+        elif t.startswith("__openapp__"):
+            if apphub:
+                apphub.request(t.partition("|")[2])
+        elif t.startswith("__active__"):
+            self._last_input = time.monotonic()
+        elif t.startswith("__fooddraft__"):
+            import urllib.parse as _up
+            save_food_draft(_up.unquote(t.partition("|")[2]))
+        elif t.startswith("__voice__"):
+            _nonce, _, rest = t[len("__voice__"):].partition("|")
+            target, _, action = rest.partition("|")
+            self._voice_input(target, action)
+        elif t.startswith("__planweek__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t[len("__planweek__"):].partition("|")
+            threading.Thread(target=self._plan_week, args=(_up.unquote(enc),), daemon=True).start()
+        elif t.startswith("__saveplan__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t[len("__saveplan__"):].partition("|")
+            try:
+                save_week_plan(json.loads(_up.unquote(enc)))
+                threading.Thread(target=self._refresh, daemon=True).start()
+            except Exception:
+                log.exception("save week plan failed")
+                GLib.idle_add(lambda: self.wv.run_javascript(
+                    "setPlanStatus('Saving the plan failed.', true)", None, None, None) or False)
         elif t.startswith("__warmfood__"):
             threading.Thread(target=warm_local_model, daemon=True).start()
         elif t.startswith("__delfood__"):
@@ -4856,6 +6944,64 @@ class BriefWindow(Gtk.Window):
             except Exception:
                 log.exception("edit food entry failed")
 
+    def _plan_week(self, text):
+        """Worker thread: parse the typed/spoken week and hand the draft to the grid."""
+        def js(code):
+            GLib.idle_add(lambda: self.wv.run_javascript(code, None, None, None) or False)
+        try:
+            rows = parse_week_plan(text)
+        except Exception as e:
+            js(f"setPlanStatus({json.dumps(str(e))}, true)")
+            return
+        if not rows:
+            js("setPlanStatus('No sessions found in that — try naming the day for each one.', true)")
+            return
+        for r in rows:
+            r["tss"], _ = plan_session_load(r["minutes"], r["kind"], r["work_minutes"], r["name"])
+        js(f"showPlanDraft({json.dumps(rows)}, {json.dumps(plan_lifting_conflicts(rows))})")
+
+    def _voice_input(self, target, action):
+        """Mic buttons: "start" opens the stream, "stop" transcribes off the GTK
+        thread and hands the text to that target's box (food or plan). One recorder
+        is shared, so only one mic can be live at a time. Runs on the main thread."""
+        def js(code):
+            GLib.idle_add(lambda: self.wv.run_javascript(code, None, None, None) or False)
+
+        if target not in ("food", "plan"):
+            return
+        if not hasattr(self, "_voice"):
+            self._voice = VoiceFoodRecorder()
+        if action == "start" and not self._voice.recording:
+            try:
+                self._voice.start(on_timeout=lambda: self._voice_input(target, "stop"))
+            except Exception as e:
+                log.exception("voice food: mic start failed")
+                js(f"setVoiceState('{target}', 'idle'); voiceError('{target}', {json.dumps(f'Microphone unavailable: {e}')})")
+                return
+            # Qwen loads while he talks, so the parse after Enter/Plan isn't a cold start.
+            threading.Thread(target=warm_local_model, daemon=True).start()
+            js(f"setVoiceState('{target}', 'recording', 'Listening… press ■ when done')")
+        elif action == "stop" and self._voice.recording:
+            audio = self._voice.stop()
+            js(f"setVoiceState('{target}', 'transcribing', 'Transcribing…')")
+
+            def work():
+                try:
+                    text = self._voice.transcribe(
+                        audio, _voice_food_prompt() if target == "food" else VOICE_PLAN_PROMPT)
+                except Exception:
+                    log.exception("voice food: transcription failed")
+                    js(f"setVoiceState('{target}', 'idle'); voiceError('{target}', 'Transcription failed — try again.')")
+                    return
+                log.info("voice transcript (%s): %s", target, text[:120])
+                if text:
+                    if target == "food":
+                        save_food_draft(text)        # survives a reload/restart until it is submitted
+                    js(f"setVoiceTranscript('{target}', {json.dumps(text)})")
+                else:
+                    js(f"setVoiceState('{target}', 'idle'); voiceError('{target}', 'Didn\\'t catch anything — try again.')")
+            threading.Thread(target=work, daemon=True).start()
+
     def _push_metrics(self):
         """Rebuild the metrics payload from disk and re-render the tracker in place."""
         benchmark_cfg = load_benchmark_config()
@@ -4875,15 +7021,40 @@ class BriefWindow(Gtk.Window):
         so entries are never processed concurrently (which would race writing
         food-log.json) while the UI stays free to accept more entries meanwhile."""
         while True:
-            description = self._food_queue.get()
+            item_id, description, day, done, attempt = self._food_queue.get()
+            retry = False
             try:
-                ok, err = log_food_via_qwen(description)
+                meals = split_meals(description)
+                if len(meals) > 1:
+                    log.info("food entry split into %d meals", len(meals))
+                ok, err = True, None
+                for idx, (meal, time_hint) in enumerate(meals):
+                    if idx < done:
+                        continue                         # logged before a restart/retry
+                    m_ok, m_err = log_food_via_qwen(meal, time_hint, day)
+                    if not m_ok:
+                        ok, err = False, m_err
+                        break
+                    done = idx + 1
+                    pending_update(item_id, done=done)
+                    if len(meals) > 1:
+                        self._refresh_nutrition_ui()     # each meal appears as it lands
             except Exception:
                 log.exception("food log failed")
                 ok, err = False, "Failed to log food — try again."
-            self._food_queue_depth = max(0, self._food_queue_depth - 1)
-            if not ok:
+            rejected = (not ok) and (err or "").startswith(("That doesn't look like a food", "Couldn't match any food"))
+            if ok or rejected:
+                pending_remove(item_id)                  # finished, or deliberately not a food
+            elif attempt < 3:
+                retry = True                             # model/Ollama trouble: try again, keep it pending
+            self._food_queue_depth = max(0, self._food_queue_depth - (0 if retry else 1))
+            if retry:
+                log.warning("food entry %s will retry (attempt %d): %s", item_id[:8], attempt + 1, err)
+                threading.Timer(45, lambda i=(item_id, description, day, done, attempt + 1): self._food_queue.put(i)).start()
+            elif not ok:
                 msg = (err or "Failed to log food — try again.").replace("\\", "\\\\").replace("'", "\\'")
+                if not rejected:
+                    msg += " (kept — it will be retried when the app next starts)"
                 GLib.idle_add(
                     lambda m=msg: self.wv.run_javascript(f"setFoodError('{m}')", None, None, None) or False)
             else:
@@ -4894,9 +7065,12 @@ class BriefWindow(Gtk.Window):
             self._food_queue.task_done()
 
     def _refresh_nutrition_ui(self):
-        """After a food quick-add: refresh the logged-today list and re-render the
-        nutrition dashboard + Today dials from the recomputed macro data, all in
-        place, so the user never has to hit refresh."""
+        """After a food quick-add/edit/delete: refresh the logged-today list and
+        re-render the nutrition dashboard + Today dials from the recomputed macro
+        data, all in place, so the user never has to hit refresh. Callers may run
+        on the GTK main thread (edit/delete) or a worker thread (quick-add), so
+        everything here must be either instant or pushed to its own thread —
+        nothing may block synchronously on an LLM call."""
         ctx = getattr(self, "_nutr_ctx", None)
         if not ctx:
             return
@@ -4911,16 +7085,19 @@ class BriefWindow(Gtk.Window):
                 f"renderNutritionDash(); renderTodayDials();",
                 None, None, None) or False)
         # Gap may have closed (or changed) — refresh the chart-hover suggestion too.
-        try:
-            suggestion = get_calorie_gap_suggestion(food_data, ctx)
-            js_val = ("'" + suggestion.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "&#10;") + "'") if suggestion else "null"
-            gap = round(ctx["expected_so_far"] - (food_data or {}).get("calories", 0))
-            GLib.idle_add(
-                lambda: self.wv.run_javascript(
-                    f"DATA.calGapSuggestion={js_val}; DATA.calGapKcal={gap}; renderCalGap();",
-                    None, None, None) or False)
-        except Exception:
-            log.exception("calorie gap suggestion refresh failed")
+        # This calls the local model, so it must never run on the GTK main thread.
+        def _refresh_gap():
+            try:
+                suggestion = get_calorie_gap_suggestion(food_data, ctx)
+                js_val = ("'" + suggestion.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "&#10;") + "'") if suggestion else "null"
+                gap = round(ctx["expected_so_far"] - (food_data or {}).get("calories", 0))
+                GLib.idle_add(
+                    lambda: self.wv.run_javascript(
+                        f"DATA.calGapSuggestion={js_val}; DATA.calGapKcal={gap}; renderCalGap();",
+                        None, None, None) or False)
+            except Exception:
+                log.exception("calorie gap suggestion refresh failed")
+        threading.Thread(target=_refresh_gap, daemon=True).start()
 
     def _notes_changed(self):
         """Refresh the notes list in the UI and reprocess all briefs with the new context."""
@@ -4958,10 +7135,65 @@ class BriefWindow(Gtk.Window):
                 None, None, None) or False
         )
 
+    def _data_signature(self):
+        """Cheap fingerprint of the newest intervals.icu data (last 2 days of wellness, last 3 of activities)."""
+        cfg = load_config()
+        auth = ("API_KEY", cfg["api_key"])
+        base = f"{BASE_URL}/athlete/{cfg['athlete_id']}"
+        today = datetime.now()
+        w = requests.get(f"{base}/wellness", params={"oldest": (today - timedelta(days=2)).strftime("%Y-%m-%d"),
+                         "newest": today.strftime("%Y-%m-%d")}, auth=auth, timeout=8).json()
+        a = requests.get(f"{base}/activities", params={"oldest": (today - timedelta(days=3)).strftime("%Y-%m-%dT00:00:00"),
+                         "newest": today.strftime("%Y-%m-%dT23:59:59")}, auth=auth, timeout=8).json()
+        keep = ("id", "ctl", "atl", "hrv", "restingHR", "sleepSecs", "sleepScore", "weight", "steps", "updated")
+        return hashlib.md5(json.dumps([[{k: x.get(k) for k in keep} for x in w],
+                                       [(x.get("id"), x.get("icu_training_load"), x.get("moving_time")) for x in a]],
+                                      sort_keys=True, default=str).encode()).hexdigest()
+
+    def _probe_worker(self):
+        try:
+            sig = self._data_signature()
+        except Exception as e:
+            log.warning("auto-refresh probe failed: %s", e)
+            return
+        if self._sig is not None and sig != self._sig and not self._refreshing and time.monotonic() - self._last_input >= 20:
+            log.info("new intervals.icu data: refreshing")
+            self._refreshing = True
+            self._fetch_and_render(quiet=True)
+        self._sig = sig
+
+    def _auto_tick(self):
+        now = time.monotonic()
+        if self._refreshing or now - self._last_input < 60:          # never while the user is active/typing
+            return True
+        if datetime.now().date() != self._render_date or now - self._last_render > 1800:
+            self._refreshing = True
+            threading.Thread(target=self._fetch_and_render, kwargs={"quiet": True}, daemon=True).start()
+        elif now - self._last_probe > 120:
+            self._last_probe = now
+            threading.Thread(target=self._probe_worker, daemon=True).start()
+        return True
+
+    def _on_hub(self, m):
+        """Another app asked for this one (and maybe a particular tab)."""
+        self.present()
+        if m.get("tab"):
+            self.wv.run_javascript(f"goTo({json.dumps(m['tab'])}, {json.dumps(m.get('anchor') or '')})", None, None, None)
+
+    def _on_focus_in(self, *_):
+        """Coming back to the window after a while: bring it up to date."""
+        if not self._refreshing and time.monotonic() - self._last_render > 180:
+            self._refreshing = True
+            threading.Thread(target=self._fetch_and_render, kwargs={"quiet": True}, daemon=True).start()
+        return False
+
     def _load(self, html):
+        self._last_render = time.monotonic()
+        self._render_date = datetime.now().date()
+        self._refreshing = False
         GLib.idle_add(lambda: self.wv.load_html(html, "file:///") or False)
 
-    def _fetch_and_render(self, force_illness_full=False):
+    def _fetch_and_render(self, force_illness_full=False, quiet=False):
         config     = load_config()
         athlete_id = config["athlete_id"]
         api_key    = config["api_key"]
@@ -4974,6 +7206,10 @@ class BriefWindow(Gtk.Window):
                 lambda: fetch_activities(athlete_id, api_key),
                 self._status, max_attempts=4)
         except Exception as e:
+            if quiet:                                   # a failed background refresh keeps the current page
+                log.warning("auto-refresh failed: %s", e)
+                self._refreshing = False
+                return
             self._load(error_html(str(e)))
             return
 
@@ -4985,6 +7221,15 @@ class BriefWindow(Gtk.Window):
 
         # Grab cached illness data synchronously (instant — no model run)
         illness = get_cached_result() if _ILLNESS_AVAILABLE else None
+
+        # Zone settings change maybe twice a year, so a failure here just means the
+        # brief gives no bpm figures that day — not a reason to fail the whole render.
+        try:
+            self._sport_settings = fetch_sport_settings(athlete_id, api_key)
+        except Exception:
+            log.warning("sport-settings fetch failed; HR advice will omit zones",
+                        exc_info=True)
+            self._sport_settings = getattr(self, "_sport_settings", None)
 
         # Stash so briefs can be reprocessed (e.g. after a note) without re-fetching
         self._last_data = (wellness, activities, training_plan, food_data, illness)
@@ -5032,7 +7277,9 @@ class BriefWindow(Gtk.Window):
             coach_summary = None
             try:
                 coach_summary, _ = get_training_summary(
-                    build_data_text(wellness, activities, training_plan, illness=illness))
+                    build_brief_facts(wellness, activities, training_plan, illness=illness),
+                    build_tips_context(wellness, training_plan,
+                                       sport_settings=getattr(self, '_sport_settings', None)))
                 _js(f"setCoachBrief('{esc(coach_summary.get('overview', ''))}', "
                     f"'{esc(coach_summary.get('tips', ''))}')")
             except Exception:
@@ -5070,26 +7317,15 @@ class BriefWindow(Gtk.Window):
             except Exception:
                 log.exception("calorie gap suggestion failed")
 
-        # Let the LLM log any clearly-described upcoming sessions from the notes
-        def extract_worker():
-            try:
-                added = extract_sessions_from_notes(load_notes().get("active", []))
-                if added:
-                    summary = "; ".join(f"{a['date']} {a['name']}" for a in added)
-                    msg = ("✓ Added to plan: " + summary).replace("\\", "\\\\").replace("'", "\\'")
-                    _js("var l=document.getElementById('notes-list');"
-                        "if(l){var d=document.createElement('div');d.className='note-added';"
-                        "d.textContent='" + msg + "';l.insertBefore(d,l.firstChild);}")
-            except Exception:
-                log.exception("session extraction failed")
-
         # Fire the independent LLM calls on separate threads. NOTE: with the local
         # Ollama model this no longer buys real parallelism the way concurrent
         # claude -p API calls did — Ollama serializes requests against one CPU-bound
         # model instance, so wall time here is closer to the sum of all 4 calls than
         # the max. Kept threaded so the UI thread isn't blocked either way.
+        # Sessions are no longer pulled out of free-text notes: the Plan box is the
+        # one way into the plan, and doing both double-booked days under different names.
         workers = [threading.Thread(target=w, daemon=True)
-                   for w in (coach_worker, insight_worker, extract_worker, gap_worker)]
+                   for w in (coach_worker, insight_worker, gap_worker)]
         for w in workers: w.start()
         for w in workers: w.join()
 
@@ -5129,6 +7365,7 @@ class BriefWindow(Gtk.Window):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
+    GLib.set_prgname("training-brief")  # dock matches this to training-brief.desktop
     lock_fh = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)

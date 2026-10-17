@@ -1,0 +1,1820 @@
+{
+ "white bread": {
+  "per100": {
+   "kcal": 236.0,
+   "protein_g": 8.7,
+   "carbs_g": 48.7,
+   "fat_g": 2.1,
+   "fiber_g": 2.9,
+   "sugar_g": 3.0,
+   "sodium_mg": 400.0
+  },
+  "source": "CoFID 2021 11-1145 (Bread, white, average)",
+  "units": {
+   "g": 1,
+   "slice": 38
+  },
+  "default_unit": "slice",
+  "aliases": [
+   "toast",
+   "white toast",
+   "sliced bread"
+  ]
+ },
+ "wholemeal bread": {
+  "per100": {
+   "kcal": 217.0,
+   "protein_g": 9.4,
+   "carbs_g": 42.0,
+   "fat_g": 2.5,
+   "fiber_g": 7.0,
+   "sugar_g": 2.8,
+   "sodium_mg": 400.0
+  },
+  "source": "CoFID 2021 11-981 (Bread, wholemeal, average)",
+  "units": {
+   "g": 1,
+   "slice": 38
+  },
+  "default_unit": "slice",
+  "aliases": [
+   "brown bread",
+   "brown toast"
+  ]
+ },
+ "sourdough": {
+  "per100": {
+   "kcal": 272,
+   "protein_g": 10.8,
+   "carbs_g": 51.9,
+   "fat_g": 2.4,
+   "fiber_g": 2.2,
+   "sugar_g": 4.3,
+   "sodium_mg": 600
+  },
+  "source": "USDA FDC 172675 (French/Vienna incl. sourdough)",
+  "units": {
+   "g": 1,
+   "slice": 50
+  },
+  "default_unit": "slice",
+  "aliases": [
+   "sourdough toast",
+   "sourdough bread"
+  ]
+ },
+ "bread roll": {
+  "per100": {
+   "kcal": 254.0,
+   "protein_g": 9.3,
+   "carbs_g": 51.5,
+   "fat_g": 2.6,
+   "fiber_g": 2.6,
+   "sugar_g": 2.6,
+   "sodium_mg": 400.0
+  },
+  "source": "CoFID 2021 11-1006 (Bread rolls, white, soft)",
+  "units": {
+   "g": 1,
+   "item": 60
+  },
+  "default_unit": "item",
+  "aliases": [
+   "burger bun",
+   "bap",
+   "brown roll",
+   "soft roll"
+  ]
+ },
+ "bagel": {
+  "per100": {
+   "kcal": 273.0,
+   "protein_g": 10.0,
+   "carbs_g": 57.8,
+   "fat_g": 1.8,
+   "fiber_g": 3.0,
+   "sugar_g": 4.8,
+   "sodium_mg": 400.0
+  },
+  "source": "CoFID 2021 11-970 (Bagels, plain)",
+  "units": {
+   "g": 1,
+   "item": 85
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "ciabatta": {
+  "per100": {
+   "kcal": 271.0,
+   "protein_g": 10.2,
+   "carbs_g": 52.0,
+   "fat_g": 3.9,
+   "fiber_g": 3.3,
+   "sugar_g": 3.1,
+   "sodium_mg": 350.0
+  },
+  "source": "CoFID 2021 11-969 (Bread, ciabatta)",
+  "units": {
+   "g": 1,
+   "item": 80,
+   "slice": 30
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "tortilla wrap": {
+  "per100": {
+   "kcal": 285.0,
+   "protein_g": 7.8,
+   "carbs_g": 53.9,
+   "fat_g": 5.7,
+   "fiber_g": 3.6,
+   "sugar_g": 2.0,
+   "sodium_mg": 622.0
+  },
+  "source": "CoFID 2021 11-925 (Tortilla, wheat, soft)",
+  "units": {
+   "g": 1,
+   "item": 62
+  },
+  "default_unit": "item",
+  "aliases": [
+   "wrap",
+   "tortilla"
+  ]
+ },
+ "naan": {
+  "per100": {
+   "kcal": 285.0,
+   "protein_g": 7.8,
+   "carbs_g": 50.2,
+   "fat_g": 7.3,
+   "fiber_g": 2.9,
+   "sugar_g": 3.1,
+   "sodium_mg": 360.0
+  },
+  "source": "CoFID 2021 11-973 (Bread, naan, retail)",
+  "units": {
+   "g": 1,
+   "item": 130
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "granola": {
+  "per100": {
+   "kcal": 450.0,
+   "protein_g": 8.4,
+   "carbs_g": 61.9,
+   "fat_g": 20.5,
+   "fiber_g": 7.9,
+   "sugar_g": 23.1,
+   "sodium_mg": 138.0
+  },
+  "source": "CoFID 2021 11-939 (Breakfast cereal, crunchy/crispy muesli type cereal, with nuts, unfortified)",
+  "units": {
+   "g": 1,
+   "bowl": 70,
+   "serving": 45
+  },
+  "default_unit": "bowl",
+  "aliases": [
+   "crunchy muesli",
+   "crunchy oat cereal"
+  ]
+ },
+ "muesli": {
+  "per100": {
+   "kcal": 366.0,
+   "protein_g": 9.2,
+   "carbs_g": 72.6,
+   "fat_g": 6.3,
+   "fiber_g": 8.8,
+   "sugar_g": 21.3,
+   "sodium_mg": 138.0
+  },
+  "source": "CoFID 2021 11-780 (Muesli, Swiss style, unfortified)",
+  "units": {
+   "g": 1,
+   "bowl": 60,
+   "serving": 45
+  },
+  "default_unit": "bowl",
+  "aliases": []
+ },
+ "porridge oats (dry)": {
+  "per100": {
+   "kcal": 381.0,
+   "protein_g": 10.9,
+   "carbs_g": 70.7,
+   "fat_g": 8.1,
+   "fiber_g": 7.8,
+   "sugar_g": 0.3,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 11-788 (Porridge oats, unfortified)",
+  "units": {
+   "g": 1,
+   "bowl": 50,
+   "serving": 40,
+   "cup": 80
+  },
+  "default_unit": "bowl",
+  "aliases": [
+   "oats",
+   "rolled oats",
+   "porridge",
+   "overnight oats"
+  ]
+ },
+ "cornflakes": {
+  "per100": {
+   "kcal": 376.0,
+   "protein_g": 7.1,
+   "carbs_g": 90.9,
+   "fat_g": 0.8,
+   "fiber_g": 2.6,
+   "sugar_g": 7.3,
+   "sodium_mg": 450.0
+  },
+  "source": "CoFID 2021 11-742 (Breakfast cereal, cornflakes, fortified)",
+  "units": {
+   "g": 1,
+   "bowl": 40,
+   "serving": 30
+  },
+  "default_unit": "bowl",
+  "aliases": []
+ },
+ "pasta (dry weight)": {
+  "per100": {
+   "kcal": 343.0,
+   "protein_g": 11.3,
+   "carbs_g": 75.6,
+   "fat_g": 1.6,
+   "fiber_g": 3.7,
+   "sugar_g": 2.1,
+   "sodium_mg": 2.0
+  },
+  "source": "CoFID 2021 11-716 (Pasta, white, dried, raw)",
+  "units": {
+   "g": 1,
+   "portion": 100
+  },
+  "default_unit": "g",
+  "aliases": [
+   "pasta",
+   "spaghetti",
+   "penne",
+   "linguine",
+   "fusilli"
+  ]
+ },
+ "pasta (cooked)": {
+  "per100": {
+   "kcal": 169.0,
+   "protein_g": 5.5,
+   "carbs_g": 37.2,
+   "fat_g": 0.8,
+   "fiber_g": 2.5,
+   "sugar_g": 1.1,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 11-1129 (Pasta, white, dried, boiled in unsalted water)",
+  "units": {
+   "g": 1,
+   "bowl": 250,
+   "portion": 230
+  },
+  "default_unit": "bowl",
+  "aliases": [
+   "cooked pasta",
+   "leftover pasta"
+  ]
+ },
+ "rice (dry weight)": {
+  "per100": {
+   "kcal": 355.0,
+   "protein_g": 6.7,
+   "carbs_g": 85.1,
+   "fat_g": 1.0,
+   "fiber_g": 1.1,
+   "sugar_g": 0.2,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 11-861 (Rice, white, long grain, raw)",
+  "units": {
+   "g": 1,
+   "portion": 75
+  },
+  "default_unit": "g",
+  "aliases": [
+   "rice"
+  ]
+ },
+ "rice (cooked)": {
+  "per100": {
+   "kcal": 131.0,
+   "protein_g": 2.8,
+   "carbs_g": 31.1,
+   "fat_g": 0.4,
+   "fiber_g": 0.5,
+   "sugar_g": 0.0,
+   "sodium_mg": 11.0
+  },
+  "source": "CoFID 2021 11-862 (Rice, white, long grain, boiled in unsalted water)",
+  "units": {
+   "g": 1,
+   "bowl": 200,
+   "portion": 180
+  },
+  "default_unit": "bowl",
+  "aliases": [
+   "cooked rice",
+   "sticky rice",
+   "boiled rice"
+  ]
+ },
+ "whole milk": {
+  "per100": {
+   "kcal": 63.0,
+   "protein_g": 3.4,
+   "carbs_g": 4.6,
+   "fat_g": 3.6,
+   "fiber_g": 0.0,
+   "sugar_g": 4.6,
+   "sodium_mg": 42.0
+  },
+  "source": "CoFID 2021 12-596 (Milk, whole, pasteurised, average)",
+  "units": {
+   "g": 1,
+   "ml": 1.03,
+   "glass": 258,
+   "pint": 585,
+   "splash": 30
+  },
+  "default_unit": "ml",
+  "aliases": [
+   "milk",
+   "full fat milk"
+  ]
+ },
+ "semi-skimmed milk": {
+  "per100": {
+   "kcal": 46.0,
+   "protein_g": 3.5,
+   "carbs_g": 4.7,
+   "fat_g": 1.7,
+   "fiber_g": 0.0,
+   "sugar_g": 4.7,
+   "sodium_mg": 43.0
+  },
+  "source": "CoFID 2021 12-313 (Milk, semi-skimmed, pasteurised, average)",
+  "units": {
+   "g": 1,
+   "ml": 1.03,
+   "glass": 258,
+   "pint": 585,
+   "splash": 30
+  },
+  "default_unit": "ml",
+  "aliases": [
+   "semi skimmed milk"
+  ]
+ },
+ "greek yoghurt": {
+  "per100": {
+   "kcal": 133.0,
+   "protein_g": 5.7,
+   "carbs_g": 4.8,
+   "fat_g": 10.2,
+   "fiber_g": 0.0,
+   "sugar_g": 4.5,
+   "sodium_mg": 66.0
+  },
+  "source": "CoFID 2021 12-555 (Yogurt, Greek style, plain)",
+  "units": {
+   "g": 1,
+   "pot": 150,
+   "bowl": 170,
+   "tbsp": 20
+  },
+  "default_unit": "pot",
+  "aliases": [
+   "greek yogurt",
+   "yoghurt",
+   "yogurt"
+  ]
+ },
+ "cheddar": {
+  "per100": {
+   "kcal": 416.0,
+   "protein_g": 25.4,
+   "carbs_g": 0.1,
+   "fat_g": 34.9,
+   "fiber_g": 0.0,
+   "sugar_g": 0.1,
+   "sodium_mg": 723.0
+  },
+  "source": "CoFID 2021 12-346 (Cheese, Cheddar, English)",
+  "units": {
+   "g": 1,
+   "slice": 20,
+   "handful grated": 30,
+   "tbsp grated": 7
+  },
+  "default_unit": "slice",
+  "aliases": [
+   "cheddar cheese",
+   "mature cheddar",
+   "cheese",
+   "grated cheese"
+  ]
+ },
+ "mozzarella": {
+  "per100": {
+   "kcal": 257.0,
+   "protein_g": 18.6,
+   "carbs_g": 0.0,
+   "fat_g": 20.3,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 395.0
+  },
+  "source": "CoFID 2021 12-360 (Cheese, Mozzarella, fresh)",
+  "units": {
+   "g": 1,
+   "ball": 125
+  },
+  "default_unit": "ball",
+  "aliases": []
+ },
+ "halloumi": {
+  "per100": {
+   "kcal": 313.0,
+   "protein_g": 23.9,
+   "carbs_g": 1.7,
+   "fat_g": 23.5,
+   "fiber_g": 0.0,
+   "sugar_g": 1.7,
+   "sodium_mg": 1200.0
+  },
+  "source": "CoFID 2021 12-496 (Cheese, Halloumi)",
+  "units": {
+   "g": 1,
+   "slice": 25
+  },
+  "default_unit": "slice",
+  "aliases": []
+ },
+ "parmesan": {
+  "per100": {
+   "kcal": 415.0,
+   "protein_g": 36.2,
+   "carbs_g": 0.9,
+   "fat_g": 29.7,
+   "fiber_g": 0.0,
+   "sugar_g": 0.9,
+   "sodium_mg": 660.0
+  },
+  "source": "CoFID 2021 12-526 (Cheese, Parmesan, fresh)",
+  "units": {
+   "g": 1,
+   "tbsp grated": 5
+  },
+  "default_unit": "tbsp grated",
+  "aliases": []
+ },
+ "butter": {
+  "per100": {
+   "kcal": 744.0,
+   "protein_g": 0.6,
+   "carbs_g": 0.6,
+   "fat_g": 82.2,
+   "fiber_g": 0.0,
+   "sugar_g": 0.6,
+   "sodium_mg": 730.0
+  },
+  "source": "CoFID 2021 17-685 (Butter, salted)",
+  "units": {
+   "g": 1,
+   "knob": 10,
+   "tsp": 5,
+   "tbsp": 14,
+   "spread on toast": 7
+  },
+  "default_unit": "knob",
+  "aliases": []
+ },
+ "double cream": {
+  "per100": {
+   "kcal": 496.0,
+   "protein_g": 1.6,
+   "carbs_g": 1.7,
+   "fat_g": 53.7,
+   "fiber_g": 0.0,
+   "sugar_g": 1.7,
+   "sodium_mg": 22.0
+  },
+  "source": "CoFID 2021 12-334 (Cream, fresh, double, including Jersey cream)",
+  "units": {
+   "g": 1,
+   "tbsp": 15
+  },
+  "default_unit": "tbsp",
+  "aliases": []
+ },
+ "egg": {
+  "per100": {
+   "kcal": 143.0,
+   "protein_g": 14.1,
+   "carbs_g": 0.0,
+   "fat_g": 9.6,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 150.0
+  },
+  "source": "CoFID 2021 12-940 (Eggs, chicken, whole, boiled)",
+  "units": {
+   "g": 1,
+   "item": 50
+  },
+  "default_unit": "item",
+  "aliases": [
+   "eggs",
+   "boiled egg",
+   "poached egg"
+  ]
+ },
+ "fried egg": {
+  "per100": {
+   "kcal": 200.0,
+   "protein_g": 14.7,
+   "carbs_g": 0.0,
+   "fat_g": 15.7,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 172.0
+  },
+  "source": "CoFID 2021 12-944 (Eggs, chicken, whole, fried in sunflower oil)",
+  "units": {
+   "g": 1,
+   "item": 55
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "scrambled eggs": {
+  "per100": {
+   "kcal": 237.0,
+   "protein_g": 11.0,
+   "carbs_g": 0.7,
+   "fat_g": 21.2,
+   "fiber_g": 0.1,
+   "sugar_g": 0.7,
+   "sodium_mg": 253.0
+  },
+  "source": "CoFID 2021 12-945 (Eggs, chicken, scrambled, with semi-skimmed milk)",
+  "units": {
+   "g": 1,
+   "egg's worth": 60
+  },
+  "default_unit": "egg's worth",
+  "aliases": [
+   "scrambled egg"
+  ]
+ },
+ "vanilla ice cream": {
+  "per100": {
+   "kcal": 169.0,
+   "protein_g": 3.2,
+   "carbs_g": 22.0,
+   "fat_g": 8.2,
+   "fiber_g": 0.2,
+   "sugar_g": 22.0,
+   "sodium_mg": 63.0
+  },
+  "source": "CoFID 2021 12-508 (Ice cream, dairy, vanilla, soft scoop)",
+  "units": {
+   "g": 1,
+   "scoop": 50
+  },
+  "default_unit": "scoop",
+  "aliases": [
+   "ice cream"
+  ]
+ },
+ "back bacon (grilled)": {
+  "per100": {
+   "kcal": 287.0,
+   "protein_g": 23.2,
+   "carbs_g": 0.0,
+   "fat_g": 21.6,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 1390.0
+  },
+  "source": "CoFID 2021 19-500 (Bacon rashers, back, grilled)",
+  "units": {
+   "g": 1,
+   "rasher": 25
+  },
+  "default_unit": "rasher",
+  "aliases": [
+   "bacon",
+   "bacon rasher",
+   "rashers"
+  ]
+ },
+ "pork sausage (grilled)": {
+  "per100": {
+   "kcal": 294.0,
+   "protein_g": 14.5,
+   "carbs_g": 9.8,
+   "fat_g": 22.1,
+   "fiber_g": 2.3,
+   "sugar_g": 1.5,
+   "sodium_mg": 640.0
+  },
+  "source": "CoFID 2021 19-509 (Sausages, pork, chilled, grilled)",
+  "units": {
+   "g": 1,
+   "item": 40
+  },
+  "default_unit": "item",
+  "aliases": [
+   "sausage",
+   "sausages",
+   "pork sausages"
+  ]
+ },
+ "chicken breast (grilled)": {
+  "per100": {
+   "kcal": 148.0,
+   "protein_g": 32.0,
+   "carbs_g": 0.0,
+   "fat_g": 2.2,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 55.0
+  },
+  "source": "CoFID 2021 18-323 (Chicken, breast, grilled without skin, meat only)",
+  "units": {
+   "g": 1,
+   "item": 130
+  },
+  "default_unit": "item",
+  "aliases": [
+   "chicken breast",
+   "chicken"
+  ]
+ },
+ "chicken thigh (meat)": {
+  "per100": {
+   "kcal": 180.0,
+   "protein_g": 25.6,
+   "carbs_g": 0.0,
+   "fat_g": 8.6,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 40.0
+  },
+  "source": "CoFID 2021 18-319 (Chicken, thighs, casseroled, meat only, diced)",
+  "units": {
+   "g": 1,
+   "item": 90
+  },
+  "default_unit": "item",
+  "aliases": [
+   "chicken thighs"
+  ]
+ },
+ "beef mince": {
+  "per100": {
+   "kcal": 263.0,
+   "protein_g": 26.4,
+   "carbs_g": 0.0,
+   "fat_g": 17.5,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 91.0
+  },
+  "source": "CoFID 2021 18-037 (Beef, mince, microwaved)",
+  "units": {
+   "g": 1,
+   "portion": 125
+  },
+  "default_unit": "g",
+  "aliases": [
+   "mince",
+   "ground beef"
+  ]
+ },
+ "beef burger patty": {
+  "per100": {
+   "kcal": 264.0,
+   "protein_g": 29.6,
+   "carbs_g": 0.0,
+   "fat_g": 16.2,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 98.0
+  },
+  "source": "CoFID 2021 18-042 (Beef, mince patties, barbecued)",
+  "units": {
+   "g": 1,
+   "item": 110
+  },
+  "default_unit": "item",
+  "aliases": [
+   "burger",
+   "beef patty"
+  ]
+ },
+ "salmon fillet (baked)": {
+  "per100": {
+   "kcal": 232.0,
+   "protein_g": 25.2,
+   "carbs_g": 0.0,
+   "fat_g": 14.6,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 49.0
+  },
+  "source": "CoFID 2021 16-359 (Salmon, farmed, flesh only, baked)",
+  "units": {
+   "g": 1,
+   "item": 110
+  },
+  "default_unit": "item",
+  "aliases": [
+   "salmon",
+   "salmon fillet"
+  ]
+ },
+ "tuna (canned in brine)": {
+  "per100": {
+   "kcal": 109.0,
+   "protein_g": 24.9,
+   "carbs_g": 0.0,
+   "fat_g": 1.0,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 293.0
+  },
+  "source": "CoFID 2021 16-416 (Tuna, canned in brine, drained)",
+  "units": {
+   "g": 1,
+   "can": 102,
+   "half can": 51
+  },
+  "default_unit": "can",
+  "aliases": [
+   "tuna"
+  ]
+ },
+ "prawns (cooked)": {
+  "per100": {
+   "kcal": 68.0,
+   "protein_g": 16.2,
+   "carbs_g": 0.0,
+   "fat_g": 0.4,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 643.0
+  },
+  "source": "CoFID 2021 16-389 (Prawns, king, purchased cooked)",
+  "units": {
+   "g": 1,
+   "handful": 60
+  },
+  "default_unit": "handful",
+  "aliases": [
+   "prawns",
+   "king prawns"
+  ]
+ },
+ "fish fingers (cod, baked)": {
+  "per100": {
+   "kcal": 223.0,
+   "protein_g": 14.3,
+   "carbs_g": 22.0,
+   "fat_g": 9.2,
+   "fiber_g": 2.0,
+   "sugar_g": 1.5,
+   "sodium_mg": 317.0
+  },
+  "source": "CoFID 2021 16-405 (Fish fingers, cod, grilled/baked)",
+  "units": {
+   "g": 1,
+   "item": 28
+  },
+  "default_unit": "item",
+  "aliases": [
+   "fish fingers"
+  ]
+ },
+ "banana": {
+  "per100": {
+   "kcal": 81.0,
+   "protein_g": 1.2,
+   "carbs_g": 20.3,
+   "fat_g": 0.1,
+   "fiber_g": 1.4,
+   "sugar_g": 18.1,
+   "sodium_mg": 0.0
+  },
+  "source": "CoFID 2021 14-318 (Bananas, flesh only)",
+  "units": {
+   "g": 1,
+   "item": 120
+  },
+  "default_unit": "item",
+  "aliases": [
+   "bananas"
+  ]
+ },
+ "apple": {
+  "per100": {
+   "kcal": 51.0,
+   "protein_g": 0.6,
+   "carbs_g": 11.6,
+   "fat_g": 0.5,
+   "fiber_g": 1.2,
+   "sugar_g": 11.6,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 14-319 (Apples, eating, raw, flesh and skin)",
+  "units": {
+   "g": 1,
+   "item": 160,
+   "half": 80
+  },
+  "default_unit": "item",
+  "aliases": [
+   "apples",
+   "pink lady",
+   "pink lady apple",
+   "apple slices"
+  ]
+ },
+ "orange": {
+  "per100": {
+   "kcal": 36.0,
+   "protein_g": 0.8,
+   "carbs_g": 8.2,
+   "fat_g": 0.2,
+   "fiber_g": 1.2,
+   "sugar_g": 8.2,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 14-327 (Oranges, flesh only)",
+  "units": {
+   "g": 1,
+   "item": 130
+  },
+  "default_unit": "item",
+  "aliases": [
+   "easy peeler",
+   "satsuma",
+   "clementine"
+  ]
+ },
+ "grapes": {
+  "per100": {
+   "kcal": 65.0,
+   "protein_g": 0.7,
+   "carbs_g": 16.1,
+   "fat_g": 0.2,
+   "fiber_g": 1.3,
+   "sugar_g": 16.1,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 14-350 (Grapes, average)",
+  "units": {
+   "g": 1,
+   "handful": 80
+  },
+  "default_unit": "handful",
+  "aliases": []
+ },
+ "strawberries": {
+  "per100": {
+   "kcal": 30.0,
+   "protein_g": 0.6,
+   "carbs_g": 6.1,
+   "fat_g": 0.5,
+   "fiber_g": 3.8,
+   "sugar_g": 6.1,
+   "sodium_mg": 1.0
+  },
+  "source": "CoFID 2021 14-324 (Strawberries, raw)",
+  "units": {
+   "g": 1,
+   "handful": 80,
+   "punnet": 400
+  },
+  "default_unit": "handful",
+  "aliases": []
+ },
+ "avocado": {
+  "per100": {
+   "kcal": 171.0,
+   "protein_g": 1.8,
+   "carbs_g": 1.8,
+   "fat_g": 17.4,
+   "fiber_g": 3.1,
+   "sugar_g": 0.4,
+   "sodium_mg": 7.0
+  },
+  "source": "CoFID 2021 14-386 (Avocado, Hass, flesh only)",
+  "units": {
+   "g": 1,
+   "half": 70,
+   "item": 140
+  },
+  "default_unit": "half",
+  "aliases": []
+ },
+ "mushrooms (raw weight)": {
+  "per100": {
+   "kcal": 7.0,
+   "protein_g": 1.0,
+   "carbs_g": 0.3,
+   "fat_g": 0.2,
+   "fiber_g": 0.7,
+   "sugar_g": 0.3,
+   "sodium_mg": 4.0
+  },
+  "source": "CoFID 2021 13-505 (Mushrooms, white, raw)",
+  "units": {
+   "g": 1,
+   "pack": 250,
+   "half pack": 125,
+   "handful": 40
+  },
+  "default_unit": "pack",
+  "aliases": [
+   "mushrooms"
+  ]
+ },
+ "tomato": {
+  "per100": {
+   "kcal": 14.0,
+   "protein_g": 0.5,
+   "carbs_g": 3.0,
+   "fat_g": 0.1,
+   "fiber_g": 1.0,
+   "sugar_g": 3.0,
+   "sodium_mg": 2.0
+  },
+  "source": "CoFID 2021 13-517 (Tomatoes, standard, raw)",
+  "units": {
+   "g": 1,
+   "item": 85,
+   "cherry tomato": 15
+  },
+  "default_unit": "item",
+  "aliases": [
+   "tomatoes"
+  ]
+ },
+ "spinach": {
+  "per100": {
+   "kcal": 25.0,
+   "protein_g": 2.8,
+   "carbs_g": 1.6,
+   "fat_g": 0.8,
+   "fiber_g": 2.1,
+   "sugar_g": 1.5,
+   "sodium_mg": 140.0
+  },
+  "source": "CoFID 2021 13-572 (Spinach, mature, raw)",
+  "units": {
+   "g": 1,
+   "bag": 200,
+   "handful": 30
+  },
+  "default_unit": "bag",
+  "aliases": []
+ },
+ "broccoli": {
+  "per100": {
+   "kcal": 28.0,
+   "protein_g": 3.3,
+   "carbs_g": 2.8,
+   "fat_g": 0.5,
+   "fiber_g": 2.8,
+   "sugar_g": 1.6,
+   "sodium_mg": 6.0
+  },
+  "source": "CoFID 2021 13-503 (Broccoli, green, boiled in unsalted water)",
+  "units": {
+   "g": 1,
+   "portion": 80
+  },
+  "default_unit": "portion",
+  "aliases": [
+   "tenderstem broccoli"
+  ]
+ },
+ "peas": {
+  "per100": {
+   "kcal": 70.0,
+   "protein_g": 5.5,
+   "carbs_g": 11.2,
+   "fat_g": 0.7,
+   "fiber_g": 5.5,
+   "sugar_g": 5.9,
+   "sodium_mg": 4.0
+  },
+  "source": "CoFID 2021 13-536 (Peas, frozen, boiled in unsalted water)",
+  "units": {
+   "g": 1,
+   "portion": 80
+  },
+  "default_unit": "portion",
+  "aliases": []
+ },
+ "onion": {
+  "per100": {
+   "kcal": 35.0,
+   "protein_g": 1.0,
+   "carbs_g": 8.0,
+   "fat_g": 0.1,
+   "fiber_g": 2.2,
+   "sugar_g": 6.2,
+   "sodium_mg": 3.0
+  },
+  "source": "CoFID 2021 13-499 (Onions, raw)",
+  "units": {
+   "g": 1,
+   "item": 150
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "carrot": {
+  "per100": {
+   "kcal": 34.0,
+   "protein_g": 0.5,
+   "carbs_g": 7.7,
+   "fat_g": 0.4,
+   "fiber_g": 3.9,
+   "sugar_g": 7.2,
+   "sodium_mg": 27.0
+  },
+  "source": "CoFID 2021 13-496 (Carrots, old, raw)",
+  "units": {
+   "g": 1,
+   "item": 80
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "potato (baked)": {
+  "per100": {
+   "kcal": 97.0,
+   "protein_g": 2.5,
+   "carbs_g": 22.6,
+   "fat_g": 0.2,
+   "fiber_g": 2.6,
+   "sugar_g": 1.4,
+   "sodium_mg": 2.0
+  },
+  "source": "CoFID 2021 13-491 (Potatoes, old, baked, flesh and skin)",
+  "units": {
+   "g": 1,
+   "item": 220
+  },
+  "default_unit": "item",
+  "aliases": [
+   "jacket potato",
+   "baked potato"
+  ]
+ },
+ "new potatoes (boiled)": {
+  "per100": {
+   "kcal": 68.0,
+   "protein_g": 1.8,
+   "carbs_g": 14.9,
+   "fat_g": 0.1,
+   "fiber_g": 1.8,
+   "sugar_g": 1.1,
+   "sodium_mg": 3.0
+  },
+  "source": "CoFID 2021 13-495 (Potatoes, new and salad, boiled in unsalted water, flesh and skin)",
+  "units": {
+   "g": 1,
+   "portion": 175
+  },
+  "default_unit": "portion",
+  "aliases": [
+   "new potatoes",
+   "potatoes"
+  ]
+ },
+ "oven chips": {
+  "per100": {
+   "kcal": 189.0,
+   "protein_g": 3.2,
+   "carbs_g": 35.3,
+   "fat_g": 4.9,
+   "fiber_g": 3.5,
+   "sugar_g": 1.0,
+   "sodium_mg": 31.0
+  },
+  "source": "CoFID 2021 13-487 (Potato chips, oven ready, no batter, baked)",
+  "units": {
+   "g": 1,
+   "portion": 150
+  },
+  "default_unit": "portion",
+  "aliases": [
+   "chips",
+   "french fries",
+   "fries"
+  ]
+ },
+ "baked beans": {
+  "per100": {
+   "kcal": 81.0,
+   "protein_g": 5.0,
+   "carbs_g": 15.0,
+   "fat_g": 0.5,
+   "fiber_g": 4.9,
+   "sugar_g": 4.8,
+   "sodium_mg": 261.0
+  },
+  "source": "CoFID 2021 13-532 (Baked beans, canned in tomato sauce)",
+  "units": {
+   "g": 1,
+   "tin": 415,
+   "half tin": 207
+  },
+  "default_unit": "tin",
+  "aliases": [
+   "beans"
+  ]
+ },
+ "mayonnaise": {
+  "per100": {
+   "kcal": 686.0,
+   "protein_g": 1.1,
+   "carbs_g": 2.4,
+   "fat_g": 74.8,
+   "fiber_g": 0.0,
+   "sugar_g": 2.4,
+   "sodium_mg": 131.0
+  },
+  "source": "CoFID 2021 17-654 (Mayonnaise, standard, retail)",
+  "units": {
+   "g": 1,
+   "tbsp": 15,
+   "tsp": 5
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "mayo"
+  ]
+ },
+ "tomato ketchup": {
+  "per100": {
+   "kcal": 115.0,
+   "protein_g": 1.6,
+   "carbs_g": 28.6,
+   "fat_g": 0.1,
+   "fiber_g": 0.9,
+   "sugar_g": 27.5,
+   "sodium_mg": 800.0
+  },
+  "source": "CoFID 2021 17-709 (Tomato ketchup)",
+  "units": {
+   "g": 1,
+   "tbsp": 15
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "ketchup"
+  ]
+ },
+ "pesto (green)": {
+  "per100": {
+   "kcal": 420.0,
+   "protein_g": 5.6,
+   "carbs_g": 3.9,
+   "fat_g": 42.5,
+   "fiber_g": 1.1,
+   "sugar_g": 2.3,
+   "sodium_mg": 840.0
+  },
+  "source": "CoFID 2021 17-622 (Pesto, green)",
+  "units": {
+   "g": 1,
+   "tbsp": 15
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "pesto"
+  ]
+ },
+ "peanut butter": {
+  "per100": {
+   "kcal": 607.0,
+   "protein_g": 22.8,
+   "carbs_g": 13.1,
+   "fat_g": 51.8,
+   "fiber_g": 6.6,
+   "sugar_g": 6.7,
+   "sodium_mg": 350.0
+  },
+  "source": "CoFID 2021 14-892 (Peanut butter, smooth)",
+  "units": {
+   "g": 1,
+   "tbsp": 16,
+   "tsp": 6
+  },
+  "default_unit": "tbsp",
+  "aliases": []
+ },
+ "honey": {
+  "per100": {
+   "kcal": 288.0,
+   "protein_g": 0.4,
+   "carbs_g": 76.4,
+   "fat_g": 0.0,
+   "fiber_g": 0.0,
+   "sugar_g": 76.4,
+   "sodium_mg": 11.0
+  },
+  "source": "CoFID 2021 17-050 (Honey)",
+  "units": {
+   "g": 1,
+   "tsp": 7,
+   "tbsp": 21
+  },
+  "default_unit": "tsp",
+  "aliases": []
+ },
+ "nutella": {
+  "per100": {
+   "kcal": 539,
+   "protein_g": 6.3,
+   "carbs_g": 57.5,
+   "fat_g": 30.9,
+   "fiber_g": 0,
+   "sugar_g": 56.3,
+   "sodium_mg": 41
+  },
+  "source": "Label: Ferrero Nutella (Open Food Facts)",
+  "units": {
+   "g": 1,
+   "tbsp": 15,
+   "tsp": 7
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "chocolate spread"
+  ]
+ },
+ "olive oil": {
+  "per100": {
+   "kcal": 899.0,
+   "protein_g": 0.0,
+   "carbs_g": 0.0,
+   "fat_g": 99.9,
+   "fiber_g": 0.0,
+   "sugar_g": 0.0,
+   "sodium_mg": 0.0
+  },
+  "source": "CoFID 2021 17-038 (Oil, olive)",
+  "units": {
+   "g": 1,
+   "tbsp": 14,
+   "tsp": 5,
+   "drizzle": 7
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "oil",
+   "cooking oil",
+   "garlic oil"
+  ]
+ },
+ "houmous": {
+  "per100": {
+   "kcal": 307.0,
+   "protein_g": 6.8,
+   "carbs_g": 10.5,
+   "fat_g": 26.7,
+   "fiber_g": 4.9,
+   "sugar_g": 0.6,
+   "sodium_mg": 410.0
+  },
+  "source": "CoFID 2021 13-556 (Houmous)",
+  "units": {
+   "g": 1,
+   "tbsp": 30
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "hummus"
+  ]
+ },
+ "coleslaw": {
+  "per100": {
+   "kcal": 173.0,
+   "protein_g": 0.8,
+   "carbs_g": 6.0,
+   "fat_g": 16.3,
+   "fiber_g": 1.2,
+   "sugar_g": 6.0,
+   "sodium_mg": 296.0
+  },
+  "source": "CoFID 2021 15-635 (Coleslaw, not low calorie, retail)",
+  "units": {
+   "g": 1,
+   "tbsp": 25,
+   "portion": 50
+  },
+  "default_unit": "tbsp",
+  "aliases": []
+ },
+ "flapjack": {
+  "per100": {
+   "kcal": 434.0,
+   "protein_g": 5.1,
+   "carbs_g": 55.7,
+   "fat_g": 22.8,
+   "fiber_g": 5.2,
+   "sugar_g": 29.2,
+   "sodium_mg": 194.0
+  },
+  "source": "CoFID 2021 11-814 (Flapjacks, retail)",
+  "units": {
+   "g": 1,
+   "item": 65
+  },
+  "default_unit": "item",
+  "aliases": [
+   "flapjacks"
+  ]
+ },
+ "cereal bar": {
+  "per100": {
+   "kcal": 354.0,
+   "protein_g": 5.6,
+   "carbs_g": 62.9,
+   "fat_g": 10.7,
+   "fiber_g": 6.2,
+   "sugar_g": 34.3,
+   "sodium_mg": 65.0
+  },
+  "source": "CoFID 2021 11-819 (Cereal bars, with fruit and/or nuts, no chocolate, unfortified)",
+  "units": {
+   "g": 1,
+   "item": 30
+  },
+  "default_unit": "item",
+  "aliases": [
+   "snack bar",
+   "granola bar",
+   "nature valley bar"
+  ]
+ },
+ "protein bar": {
+  "per100": {
+   "kcal": 355,
+   "protein_g": 33,
+   "carbs_g": 30,
+   "fat_g": 13,
+   "fiber_g": 8,
+   "sugar_g": 2,
+   "sodium_mg": 400
+  },
+  "source": "Label (typical Grenade-type 60 g bar; not verified)",
+  "units": {
+   "g": 1,
+   "item": 60
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "energy gel": {
+  "per100": {
+   "kcal": 145,
+   "protein_g": 0,
+   "carbs_g": 37,
+   "fat_g": 0,
+   "fiber_g": 0,
+   "sugar_g": 1,
+   "sodium_mg": 20
+  },
+  "source": "Label: SiS GO isotonic 60 ml (not verified)",
+  "units": {
+   "g": 1,
+   "item": 60
+  },
+  "default_unit": "item",
+  "aliases": []
+ },
+ "kit kat chunky": {
+  "per100": {
+   "kcal": 505,
+   "protein_g": 6.8,
+   "carbs_g": 64.8,
+   "fat_g": 25,
+   "fiber_g": 0,
+   "sugar_g": 52,
+   "sodium_mg": 40
+  },
+  "source": "Label: Nestlé KitKat Chunky (Open Food Facts)",
+  "units": {
+   "g": 1,
+   "item": 40
+  },
+  "default_unit": "item",
+  "aliases": [
+   "kitkat chunky"
+  ]
+ },
+ "milk chocolate": {
+  "per100": {
+   "kcal": 519.0,
+   "protein_g": 7.3,
+   "carbs_g": 56.0,
+   "fat_g": 31.1,
+   "fiber_g": 2.3,
+   "sugar_g": 56.0,
+   "sodium_mg": 89.0
+  },
+  "source": "CoFID 2021 17-648 (Chocolate, milk)",
+  "units": {
+   "g": 1,
+   "bar": 45,
+   "square": 6
+  },
+  "default_unit": "bar",
+  "aliases": [
+   "chocolate"
+  ]
+ },
+ "rich tea biscuit": {
+  "per100": {
+   "kcal": 460,
+   "protein_g": 7.2,
+   "carbs_g": 71.1,
+   "fat_g": 15.7,
+   "fiber_g": 2.5,
+   "sugar_g": 20,
+   "sodium_mg": 280
+  },
+  "source": "Label: McVitie's Rich Tea (Open Food Facts)",
+  "units": {
+   "g": 1,
+   "item": 8.3
+  },
+  "default_unit": "item",
+  "aliases": [
+   "rich tea",
+   "rich tea biscuits"
+  ]
+ },
+ "ginger nut biscuit": {
+  "per100": {
+   "kcal": 443.0,
+   "protein_g": 4.8,
+   "carbs_g": 75.3,
+   "fat_g": 15.7,
+   "fiber_g": 2.2,
+   "sugar_g": 31.3,
+   "sodium_mg": 429.0
+  },
+  "source": "CoFID 2021 11-798 (Biscuits, ginger nuts)",
+  "units": {
+   "g": 1,
+   "item": 10
+  },
+  "default_unit": "item",
+  "aliases": [
+   "ginger snaps",
+   "ginger nuts"
+  ]
+ },
+ "crisps": {
+  "per100": {
+   "kcal": 493.0,
+   "protein_g": 6.2,
+   "carbs_g": 55.8,
+   "fat_g": 28.8,
+   "fiber_g": 4.4,
+   "sugar_g": 0.9,
+   "sodium_mg": 604.0
+  },
+  "source": "CoFID 2021 17-671 (Potato crisps, fried in sunflower oil)",
+  "units": {
+   "g": 1,
+   "bag": 25,
+   "sharing bag": 150
+  },
+  "default_unit": "bag",
+  "aliases": [
+   "walkers crisps",
+   "salt and vinegar crisps"
+  ]
+ },
+ "doughnut (jam)": {
+  "per100": {
+   "kcal": 321.0,
+   "protein_g": 5.4,
+   "carbs_g": 48.4,
+   "fat_g": 13.1,
+   "fiber_g": 1.7,
+   "sugar_g": 20.3,
+   "sodium_mg": 404.0
+  },
+  "source": "CoFID 2021 11-849 (Doughnuts, with jam)",
+  "units": {
+   "g": 1,
+   "item": 75
+  },
+  "default_unit": "item",
+  "aliases": [
+   "jam doughnut",
+   "donut",
+   "jam donuts"
+  ]
+ },
+ "whey protein": {
+  "per100": {
+   "kcal": 384,
+   "protein_g": 69,
+   "carbs_g": 18,
+   "fat_g": 3.4,
+   "fiber_g": 0,
+   "sugar_g": 6,
+   "sodium_mg": 250
+  },
+  "source": "Label: Bulk Pure Whey (Open Food Facts)",
+  "units": {
+   "g": 1,
+   "scoop": 30
+  },
+  "default_unit": "scoop",
+  "aliases": [
+   "protein powder",
+   "whey"
+  ]
+ },
+ "yazoo chocolate milk": {
+  "per100": {
+   "kcal": 62,
+   "protein_g": 3.2,
+   "carbs_g": 8.8,
+   "fat_g": 1.4,
+   "fiber_g": 0,
+   "sugar_g": 8.6,
+   "sodium_mg": 50
+  },
+  "source": "Label: Yazoo chocolate (Open Food Facts)",
+  "units": {
+   "g": 1,
+   "ml": 1.03,
+   "bottle": 412,
+   "small bottle": 206
+  },
+  "default_unit": "ml",
+  "aliases": [
+   "yazoo",
+   "chocolate milk"
+  ]
+ },
+ "pizza (cheese & tomato)": {
+  "per100": {
+   "kcal": 272.0,
+   "protein_g": 12.2,
+   "carbs_g": 36.1,
+   "fat_g": 9.8,
+   "fiber_g": 2.9,
+   "sugar_g": 3.9,
+   "sodium_mg": 397.0
+  },
+  "source": "CoFID 2021 11-936 (Pizza, cheese and tomato, retail)",
+  "units": {
+   "g": 1,
+   "whole": 380,
+   "slice": 50,
+   "half": 190
+  },
+  "default_unit": "whole",
+  "aliases": [
+   "pizza",
+   "margherita"
+  ]
+ },
+ "rice krispies square": {
+  "per100": {
+   "kcal": 425.0,
+   "protein_g": 2.9,
+   "carbs_g": 75.0,
+   "fat_g": 12.1,
+   "fiber_g": 1.1,
+   "sugar_g": 32.1,
+   "sodium_mg": 300.0
+  },
+  "source": "Label: Kellogg's Rice Krispies Squares Marshmallow, 28 g bar (UK product listings)",
+  "units": {
+   "g": 1,
+   "item": 28
+  },
+  "default_unit": "item",
+  "aliases": [
+   "cereal square",
+   "kellogg's square",
+   "kellogg's square bar",
+   "kellogg's square bars",
+   "kellogg's squares",
+   "kelloggs square",
+   "kelloggs square bar",
+   "kelloggs square bars",
+   "kelloggs squares",
+   "marshmallow square",
+   "rice krispies squares",
+   "square bar",
+   "square bars",
+   "squares",
+   "squares bar",
+   "squares bars"
+  ]
+ },
+ "pear": {
+  "per100": {
+   "kcal": 57.0,
+   "protein_g": 0.4,
+   "carbs_g": 15.2,
+   "fat_g": 0.1,
+   "fiber_g": 3.1,
+   "sugar_g": 9.8,
+   "sodium_mg": 1.0
+  },
+  "source": "Label/typical: Pear, raw (USDA FDC 169118)",
+  "units": {
+   "g": 1,
+   "item": 178
+  },
+  "default_unit": "item",
+  "aliases": [
+   "pears"
+  ]
+ },
+ "chia seeds": {
+  "per100": {
+   "kcal": 486.0,
+   "protein_g": 16.5,
+   "carbs_g": 42.1,
+   "fat_g": 30.7,
+   "fiber_g": 34.4,
+   "sugar_g": 0.0,
+   "sodium_mg": 16.0
+  },
+  "source": "Label/typical: Chia seeds, dried (USDA FDC 170554)",
+  "units": {
+   "g": 1,
+   "tbsp": 12,
+   "tsp": 4
+  },
+  "default_unit": "tbsp",
+  "aliases": [
+   "chia"
+  ]
+ },
+ "beetroot": {
+  "per100": {
+   "kcal": 43.0,
+   "protein_g": 1.6,
+   "carbs_g": 9.6,
+   "fat_g": 0.2,
+   "fiber_g": 2.8,
+   "sugar_g": 6.8,
+   "sodium_mg": 78.0
+  },
+  "source": "Label/typical: Beetroot, raw (USDA FDC 169145)",
+  "units": {
+   "g": 1,
+   "item": 50
+  },
+  "default_unit": "item",
+  "aliases": [
+   "beets",
+   "beetroots"
+  ]
+ },
+ "blueberries": {
+  "per100": {
+   "kcal": 57.0,
+   "protein_g": 0.7,
+   "carbs_g": 14.5,
+   "fat_g": 0.3,
+   "fiber_g": 2.4,
+   "sugar_g": 10.0,
+   "sodium_mg": 1.0
+  },
+  "source": "Label/typical: Blueberries, raw (USDA FDC 171711)",
+  "units": {
+   "g": 1,
+   "handful": 50
+  },
+  "default_unit": "g",
+  "aliases": [
+   "blueberry"
+  ]
+ },
+ "raspberries": {
+  "per100": {
+   "kcal": 52.0,
+   "protein_g": 1.2,
+   "carbs_g": 11.9,
+   "fat_g": 0.7,
+   "fiber_g": 6.5,
+   "sugar_g": 4.4,
+   "sodium_mg": 1.0
+  },
+  "source": "Label/typical: Raspberries, raw (USDA FDC 167755)",
+  "units": {
+   "g": 1,
+   "handful": 50
+  },
+  "default_unit": "g",
+  "aliases": [
+   "raspberry"
+  ]
+ },
+ "blackberries": {
+  "per100": {
+   "kcal": 43.0,
+   "protein_g": 1.4,
+   "carbs_g": 9.6,
+   "fat_g": 0.5,
+   "fiber_g": 5.3,
+   "sugar_g": 4.9,
+   "sodium_mg": 1.0
+  },
+  "source": "Label/typical: Blackberries, raw (USDA FDC 173946)",
+  "units": {
+   "g": 1,
+   "handful": 50
+  },
+  "default_unit": "g",
+  "aliases": [
+   "blackberry"
+  ]
+ },
+ "kale": {
+  "per100": {
+   "kcal": 49.0,
+   "protein_g": 4.3,
+   "carbs_g": 8.8,
+   "fat_g": 0.9,
+   "fiber_g": 3.6,
+   "sugar_g": 2.3,
+   "sodium_mg": 38.0
+  },
+  "source": "Label/typical: Kale, raw (USDA FDC 168421)",
+  "units": {
+   "g": 1,
+   "handful": 30
+  },
+  "default_unit": "g",
+  "aliases": [
+   "crispy kale (no oil)",
+   "curly kale"
+  ]
+ },
+ "pizza (hawaiian)": {
+  "per100": {
+   "kcal": 245.0,
+   "protein_g": 11.0,
+   "carbs_g": 31.0,
+   "fat_g": 8.5,
+   "fiber_g": 2.0,
+   "sugar_g": 5.0,
+   "sodium_mg": 540.0
+  },
+  "source": "Typical ham-and-pineapple pizza, approximate (not a specific brand; whole = ~400 g, a medium takeaway/frozen pizza)",
+  "units": {
+   "g": 1,
+   "whole": 400,
+   "slice": 50,
+   "half": 200
+  },
+  "default_unit": "whole",
+  "aliases": [
+   "hawaiian pizza",
+   "hawaiian",
+   "ham and pineapple pizza",
+   "hawaii pizza",
+   "pineapple pizza"
+  ]
+ }
+}
