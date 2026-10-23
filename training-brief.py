@@ -4047,7 +4047,6 @@ button:hover{{background:rgba(159,165,173,.18)}}
     <button class="tab" role="tab" aria-selected="false" data-panel="perf">Performance</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="oya">Vs Last Year</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="focus">Focus</button>
-    <button class="tab" role="tab" aria-selected="false" data-panel="life">Life</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="sustain">Load</button>
   </div>
   <select id="appSwitch" onchange="openApp(this.value)" title="Open another app"><option value="">Apps</option><option value="journal">Paper Journal</option><option value="calendar">Calendar</option><option value="todo">Todo</option><option value="maths">Maths Panel</option><option value="revise">Revision Brief</option></select>

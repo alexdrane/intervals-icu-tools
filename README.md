@@ -15,7 +15,7 @@ $EDITOR ~/.config/intervals-icu/config.json   # athlete_id + api_key from interv
 
 Then open **Training Dashboard** from the app menu. Needs Linux with GTK3/WebKit2 4.1 (Ubuntu 22.04+).
 
-**AI features run locally**: the coach tips, nutrition insight, food logging and the Load tab explainer use [Ollama](https://ollama.com) with `qwen2.5:7b` and `qwen2.5:3b` (`install.sh` pulls them). No cloud key is needed; without Ollama the dashboard still runs but those features are blank. Voice input (the 🎤 buttons) uses `faster-whisper` and a microphone. Tabs: Today, Trends, Sleep, Vs Last Year, Focus, Life, Load. The coach prompts are written for a solo rower and are in `training-brief.py` (`COACH_ROLE`); edit them for your sport.
+**AI features run locally**: the coach tips, nutrition insight, food logging and the Load tab explainer use [Ollama](https://ollama.com) with `qwen2.5:7b` and `qwen2.5:3b` (`install.sh` pulls them). No cloud key is needed; without Ollama the dashboard still runs but those features are blank. Voice input (the 🎤 buttons) uses `faster-whisper` and a microphone. Tabs: Today, Trends, Sleep, Vs Last Year, Focus, Load. The coach prompts are written for a solo rower and are in `training-brief.py` (`COACH_ROLE`); edit them for your sport.
 
 The "Apps" dropdown links to other personal apps (`~/app-hub`) and does nothing unless you have them.
 
