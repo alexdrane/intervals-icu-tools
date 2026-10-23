@@ -1,29 +1,53 @@
 # intervals-icu-tools
 
-Three tools for [intervals.icu](https://intervals.icu) — a terminal CLI, a GTK morning dashboard, and a food logger. Linux only.
-
----
+A GTK training dashboard on top of [intervals.icu](https://intervals.icu), plus a terminal CLI (`icu`) and an older food logger (`food`). Linux only.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/alexdrane/intervals-icu-tools.git
 cd intervals-icu-tools
-./install.sh --autostart     # apt deps, pip deps, config files, app-menu launcher, Qwen models
+./install.sh --autostart     # apt + pip deps, config files, app-menu launcher, Qwen models
 $EDITOR ~/.config/intervals-icu/config.json   # athlete_id + api_key from intervals.icu
 ```
 
-Then open **Training Dashboard** from the app menu. Needs Linux with GTK3/WebKit2 4.1 (Ubuntu 22.04+).
+Then open **Training Dashboard** from the app menu (or `python3 training-brief.py`). Needs GTK3 + WebKit2 4.1 (Ubuntu 22.04+).
 
-**AI features run locally**: the coach tips, nutrition insight, food logging and the Load tab explainer use [Ollama](https://ollama.com) with `qwen2.5:7b` and `qwen2.5:3b` (`install.sh` pulls them). No cloud key is needed; without Ollama the dashboard still runs but those features are blank. Voice input (the 🎤 buttons) uses `faster-whisper` and a microphone. Tabs: Today, Trends, Sleep, Vs Last Year, Focus, Load. The coach prompts are written for a solo rower and are in `training-brief.py` (`COACH_ROLE`); edit them for your sport.
+`install.sh` copies the example config, training plan and benchmarks into `~/.config/intervals-icu/`, symlinks `icu`, `food` and `training-brief.py` into `~/bin`, installs the icon and `.desktop` launcher, and pulls the Qwen models if Ollama is present.
 
-The "Apps" dropdown links to other personal apps (`~/app-hub`) and does nothing unless you have them.
+### Things to change for your own use
+- **Coach prompts** are written for a solo rower called Alex (`COACH_ROLE` and the nutrition prompt in `training-brief.py`). Edit them for your sport.
+- **`oya_anchor`** in `config.json` (Vs Last Year tab) defaults to 2025-10-13; set it to the Monday your own training restarted.
+- **`calorie_baseline` / `calorie_surplus_target`** in `config.json` set the daily calorie target.
+- The "Apps" dropdown in the header links to personal apps (`~/app-hub`) and does nothing unless you have them.
 
 ---
 
-## Tools
+## The dashboard (`training-brief.py`)
 
-### `icu` — terminal CLI
+A 1440x860 GTK/WebKit window. Tabs:
+
+| Tab | What it shows |
+|---|---|
+| **Today** | Form (TSB), HRV, resting HR, sleep; coach overview and tips; next 7 days of planned sessions; "Plan the week" box; food box |
+| **Trends** | CTL/ATL, TSB, HRV+RHR, Z4+ load, calories vs target, body weight, sleep debt, with projections from your plan |
+| **Nutrition** | Macro bars, calorie gap, AI nutrition coach, editable food log |
+| **Performance** | Radar profile and test-metric cards from `benchmarks.json` (see below) |
+| **Vs Last Year** | This year's training against last year's, led by time in HR zone (`one-year-ago/`) |
+| **Focus** | Daily focus log |
+| **Load** | How much load today is sustainable given your HRV/RHR state (`sustain*.py`); Student-t lag model with a step-up ceiling |
+
+There is also an illness-tracking view, and a stretching streak tracker. The Life tab (calendar/todos) is hidden.
+
+**AI runs locally** through [Ollama](https://ollama.com) (`qwen2.5:7b` for tips and food parsing, `qwen2.5:3b` for the nutrition coach). No cloud key is needed. The coach *overview* is composed in plain Python; only the tips are model-written and are checked against your data. Without Ollama the dashboard still runs, but tips, food logging and the Load explainer are blank. Food logging maps what you say to a nutrition table (`food_table.json`, built by `build_food_table.py`); the model only picks foods and amounts.
+
+**Voice input** (the mic buttons for food and weekly planning) uses `faster-whisper` (`small.en`, CPU) and `sounddevice`, so it needs a microphone.
+
+Data lives in `~/.config/intervals-icu/` (config, plan, benchmarks), `~/.local/share/training-brief/` (food, focus, sleep, notes logs) and `~/.cache/training-brief/`. Restart note: to restart the app, run `pkill -f '[b]in/training-brief.py'` as its own command.
+
+---
+
+## `icu` terminal CLI
 
 ```
 icu                     # list 15 most recent activities
@@ -36,81 +60,42 @@ icu zones               # activity list with zone columns
 icu --setup             # interactive setup wizard
 ```
 
-### `training-brief.py` — GTK morning dashboard
+## `food` CLI (legacy)
 
-A 1440×860 GTK/WebKit window showing:
-
-- Form (TSB), HRV, resting HR, sleep score with hover tooltips
-- 7 charts: CTL/ATL, TSB (zone-coloured), HRV+RHR, Z4+ high-intensity load, calorie intake vs target, body weight, sleep debt
-- Projected CTL/ATL/TSB and Z4+ load based on your training plan
-- AI coach brief (local Qwen via Ollama) — overview and training tips, cached until data changes
-- Nutrition section with macro bars and AI nutrition coach
-- Training plan upcoming sessions panel with intensity indicators
-- Stretch streak tracker
-
-```bash
-python3 training-brief.py
-```
-
-### `food` — nutrition logger
-
-Log meals by describing them in plain English. Uses Gemini (or Claude Haiku if you have an Anthropic key) to parse macros.
+The dashboard now logs food itself with the local model. This CLI is the older route and still needs a cloud key: `anthropic_api_key` (Claude Haiku) or `gemini_api_key` in `config.json`. You can ignore it.
 
 ```
 food add "scrambled eggs on toast with OJ"
-food add "lunch was a chicken wrap and an apple"
 food today          # show today's log and totals
 food undo           # remove last entry
-food undo 2         # remove last 2 entries
-food clear          # clear today's log
 ```
 
 ---
 
-## Setup
+## Setup details
 
-### 1. Install dependencies
-
-```bash
-pip install requests rich google-genai anthropic
-# For training-brief.py (GTK window):
-sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.1
-```
-
-### 2. Configure
+`install.sh` does all of this. By hand:
 
 ```bash
-# Option A: interactive wizard
-./icu --setup
-
-# Option B: manually
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.1 python3-pip libportaudio2
+pip install --user -r requirements.txt
 mkdir -p ~/.config/intervals-icu
 cp config.example.json ~/.config/intervals-icu/config.json
-# edit ~/.config/intervals-icu/config.json with your keys
+cp training-plan.example.json ~/.config/intervals-icu/training-plan.json
+ollama pull qwen2.5:7b && ollama pull qwen2.5:3b
 ```
 
-**Getting your credentials:**
+`./icu --setup` is an interactive alternative for the config.
 
 | Key | Where to find it |
 |---|---|
 | `athlete_id` | URL when logged in: `intervals.icu/athletes/i123456` |
-| `api_key` | intervals.icu → Settings → Developer Settings → API Key |
-| `gemini_api_key` | [Google AI Studio](https://aistudio.google.com/) — free tier works |
-| `anthropic_api_key` | Optional. `food add` uses this for Claude Haiku if present, otherwise falls back to Gemini |
+| `api_key` | intervals.icu -> Settings -> Developer Settings -> API Key |
 | `calorie_baseline` | Your daily base calorie target (before training). Dashboard adds session burn on top. |
+| `calorie_surplus_target` | Extra kcal/day above that for a gain goal (0 to maintain) |
+| `gemini_api_key`, `anthropic_api_key` | Only for the legacy `food` CLI |
 
-The config lives at `~/.config/intervals-icu/config.json` and is gitignored — it never gets committed.
-
-### 3. Put tools on your PATH
-
-```bash
-# symlink from the repo so edits are reflected immediately
-ln -s ~/intervals-icu-tools/icu ~/bin/icu
-ln -s ~/intervals-icu-tools/food ~/bin/food
-ln -s ~/intervals-icu-tools/training-brief.py ~/bin/training-brief.py
-```
-
-Or copy them to `/usr/local/bin/` if you prefer.
+The config lives at `~/.config/intervals-icu/config.json` and is gitignored.
 
 ---
 
@@ -121,6 +106,8 @@ The training plan lives at `~/.config/intervals-icu/training-plan.json` (gitigno
 ```bash
 cp training-plan.example.json ~/.config/intervals-icu/training-plan.json
 ```
+
+You can also type or dictate a week into the **Plan the week** box on the Today tab; it parses the text into an editable grid, and Save writes the sessions into this file (an optional `kind` field records the session type, and an `illness` block pauses hard work).
 
 ### Format
 
@@ -196,24 +183,6 @@ cp benchmarks.example.json ~/.config/intervals-icu/benchmarks.json
 
 ---
 
-## Keeping the repo up to date
+## Keeping your copy up to date
 
-If you edit the scripts directly in `~/intervals-icu-tools/` (which you should if you used symlinks above), push changes with:
-
-```bash
-cd ~/intervals-icu-tools
-git add -p          # review changes interactively
-git commit -m "describe what changed"
-git push
-```
-
-If you edited scripts in `~/bin/` directly, copy them back first:
-
-```bash
-cp ~/bin/icu ~/intervals-icu-tools/icu
-cp ~/bin/training-brief.py ~/intervals-icu-tools/training-brief.py
-cp ~/bin/food ~/intervals-icu-tools/food
-cd ~/intervals-icu-tools && git add . && git commit -m "..." && git push
-```
-
-The easiest long-term setup is to use the symlinks above — then editing the repo file IS editing the live script.
+`install.sh` symlinks the scripts from the clone into `~/bin`, so editing the repo file edits the live app. Pull updates with `git pull` and restart the dashboard.
