@@ -13,7 +13,9 @@ DATA_DIR = os.path.expanduser("~/.local/share/training-brief")
 EVENTS_FILE = os.path.join(DATA_DIR, "life-events.json")
 # Shared with the standalone todo panel (~/todo-panel): {"tasks": [{id, text, done, created(ms)}]}.
 # We add optional fields (area, due, done_ts) which the panel preserves.
-TODOS_FILE = os.path.expanduser("~/todo-panel/todo.json")
+# Falls back to our own data dir when the todo panel isn't installed.
+_PANEL_TODOS = os.path.expanduser("~/todo-panel/todo.json")
+TODOS_FILE = _PANEL_TODOS if os.path.isdir(os.path.dirname(_PANEL_TODOS)) else os.path.join(DATA_DIR, "life-todos.json")
 
 AREAS = ["research", "admin", "home", "social", "health", "rest", "other"]
 REPEATS = ["", "daily", "weekly"]
@@ -46,6 +48,7 @@ def _load_todos():
 
 
 def _save_todos(tasks):
+    os.makedirs(os.path.dirname(TODOS_FILE), exist_ok=True)
     tmp = TODOS_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"tasks": tasks}, f, indent=2)

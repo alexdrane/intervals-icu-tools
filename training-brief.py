@@ -43,6 +43,13 @@ try:
     import life as _life
 except Exception:  # Life tab is optional
     _life = None
+try:
+    import sustain as _sustain
+    import sustain_ui as _sus_ui
+    _SUS_CSS, _SUS_JS, _SUS_PANEL = _sus_ui.CSS, _sus_ui.JS, _sus_ui.PANEL
+except Exception:  # Load tab is optional
+    _sustain = None
+    _SUS_CSS = _SUS_JS = _SUS_PANEL = ""
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "one-year-ago"))
 try:
@@ -3457,6 +3464,10 @@ def build_html(wellness, activities, training_plan, summary=None, calorie_target
     chart_data = json.dumps({
         "focus": (_focus.focus_payload() if _focus else None),
         "sleep": (_sleep.sleep_payload(wellness) if _sleep else None),
+        "sustain": (_sustain.sustain_payload(
+            wellness, activities, illness,
+            illness_paused=bool((training_plan or {}).get("illness") and
+                                not (training_plan or {})["illness"].get("cleared"))) if _sustain else None),
         "life": (_life.life_payload((training_plan or {}).get("sessions", [])) if _life else None),
         "dates": chart_dates, "ctl": ctl_vals, "atl": atl_vals, "tsb": tsb_vals,
         "hrv": hrv_vals_c, "rhr": rhr_vals_c,
@@ -4023,6 +4034,7 @@ button:hover{{background:rgba(159,165,173,.18)}}
 #sleep-root{{font-size:13.5px}}
 #life-lists{{margin-top:16px}}
 #life-form{{gap:8px!important}}
+{_SUS_CSS}
 </style></head>
 <body>
 <div class="header">
@@ -4036,6 +4048,7 @@ button:hover{{background:rgba(159,165,173,.18)}}
     <button class="tab" role="tab" aria-selected="false" data-panel="oya">Vs Last Year</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="focus">Focus</button>
     <button class="tab" role="tab" aria-selected="false" data-panel="life">Life</button>
+    <button class="tab" role="tab" aria-selected="false" data-panel="sustain">Load</button>
   </div>
   <select id="appSwitch" onchange="openApp(this.value)" title="Open another app"><option value="">Apps</option><option value="journal">Paper Journal</option><option value="calendar">Calendar</option><option value="todo">Todo</option><option value="maths">Maths Panel</option><option value="revise">Revision Brief</option></select>
   <select id="periodSelect" onchange="setPeriod(this.value)">
@@ -4268,6 +4281,8 @@ button:hover{{background:rgba(159,165,173,.18)}}
   <section class="panel" data-panel="focus">
     <div id="focus-root" style="padding:22px 26px;max-width:900px"></div>
   </section>
+
+  {_SUS_PANEL}
 
   <section class="panel" data-panel="illness">
     <div class="ill-panel">
@@ -5671,6 +5686,8 @@ function goTo(tab, anchor) {{
   }}, 120);
 }}
 
+{_SUS_JS}
+
 function selectTab(name) {{
   document.querySelectorAll('.tab').forEach(function(t) {{
     t.setAttribute('aria-selected', String(t.dataset.panel === name));
@@ -5710,6 +5727,8 @@ function selectTab(name) {{
     requestAnimationFrame(renderNutritionDash);
   }} else if (name === 'focus') {{
     requestAnimationFrame(renderFocus);
+  }} else if (name === 'sustain') {{
+    requestAnimationFrame(renderSustain);
   }} else if (name === 'life') {{
     requestAnimationFrame(renderLife);
   }} else if (name === 'sleep') {{
@@ -6819,6 +6838,14 @@ class BriefWindow(Gtk.Window):
                 threading.Thread(target=self._refresh, daemon=True).start()
             except Exception:
                 log.exception("exclude day failed")
+        elif t.startswith("__susexplain__"):
+            import urllib.parse as _up
+            _nonce, _, enc = t.partition("|")
+            try:
+                ctx = json.loads(_up.unquote(enc) or "{}")
+            except ValueError:
+                ctx = {}
+            threading.Thread(target=self._sustain_explain, args=(ctx,), daemon=True).start()
         elif t.startswith("__sleeprate__"):
             import urllib.parse as _up
             _nonce, _, enc = t.partition("|")
@@ -7328,6 +7355,29 @@ class BriefWindow(Gtk.Window):
                    for w in (coach_worker, insight_worker, gap_worker)]
         for w in workers: w.start()
         for w in workers: w.join()
+
+    def _sustain_explain(self, ctx):
+        """Qwen rewords model-code facts for the Load tab; numbers are verified, else fall back."""
+        text, src = "", "fallback"
+        try:
+            wellness, activities, plan, _food, illness = self._last_data
+            ill = (plan or {}).get("illness")
+            p = _sustain.sustain_payload(wellness, activities, illness,
+                                         illness_paused=bool(ill and not ill.get("cleared")))
+            if p.get("ok"):
+                facts = _sustain.explain_facts(p, ctx)
+                text = " ".join(facts)
+                try:
+                    raw = _ollama_p(_sustain.explain_prompt(facts), timeout=300, source="sustain_explain")
+                    checked = _sustain.verify_explanation(raw, facts, ctx.get("mode") or p["mode0"])
+                    if len(checked.split()) >= 25:
+                        text, src = checked, "qwen"
+                except Exception:
+                    log.warning("sustain explain: qwen failed, using fallback", exc_info=True)
+        except Exception:
+            log.exception("sustain explain failed")
+        GLib.idle_add(lambda: self.wv.run_javascript(
+            f"susExplainDone({json.dumps(text)}, {json.dumps(src)})", None, None, None) or False)
 
     def _fetch_illness(self, wellness, force_full=False):
         # Lower this thread's OS scheduling priority — the GP/HMM fit (esp. the weekly

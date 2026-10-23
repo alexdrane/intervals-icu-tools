@@ -4,6 +4,23 @@ Three tools for [intervals.icu](https://intervals.icu) — a terminal CLI, a GTK
 
 ---
 
+## Quick start
+
+```bash
+git clone https://github.com/alexdrane/intervals-icu-tools.git
+cd intervals-icu-tools
+./install.sh --autostart     # apt deps, pip deps, config files, app-menu launcher, Qwen models
+$EDITOR ~/.config/intervals-icu/config.json   # athlete_id + api_key from intervals.icu
+```
+
+Then open **Training Dashboard** from the app menu. Needs Linux with GTK3/WebKit2 4.1 (Ubuntu 22.04+).
+
+**AI features run locally**: the coach tips, nutrition insight, food logging and the Load tab explainer use [Ollama](https://ollama.com) with `qwen2.5:7b` and `qwen2.5:3b` (`install.sh` pulls them). No cloud key is needed; without Ollama the dashboard still runs but those features are blank. Voice input (the 🎤 buttons) uses `faster-whisper` and a microphone. Tabs: Today, Trends, Sleep, Vs Last Year, Focus, Life, Load. The coach prompts are written for a solo rower and are in `training-brief.py` (`COACH_ROLE`); edit them for your sport.
+
+The "Apps" dropdown links to other personal apps (`~/app-hub`) and does nothing unless you have them.
+
+---
+
 ## Tools
 
 ### `icu` — terminal CLI
@@ -26,7 +43,7 @@ A 1440×860 GTK/WebKit window showing:
 - Form (TSB), HRV, resting HR, sleep score with hover tooltips
 - 7 charts: CTL/ATL, TSB (zone-coloured), HRV+RHR, Z4+ high-intensity load, calorie intake vs target, body weight, sleep debt
 - Projected CTL/ATL/TSB and Z4+ load based on your training plan
-- AI coach brief (Gemini 2.5 Flash) — overview and training tips, cached until data changes
+- AI coach brief (local Qwen via Ollama) — overview and training tips, cached until data changes
 - Nutrition section with macro bars and AI nutrition coach
 - Training plan upcoming sessions panel with intensity indicators
 - Stretch streak tracker

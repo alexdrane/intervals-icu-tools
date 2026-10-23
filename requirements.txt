@@ -1,0 +1,7 @@
+requests
+rich
+numpy
+scipy
+# voice food logging (optional)
+sounddevice
+faster-whisper

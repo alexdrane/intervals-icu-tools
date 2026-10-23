@@ -9,3 +9,4 @@ stretch-log.json
 benchmarks.json
 test-metrics.json
 notes-log.json
+*.bak*

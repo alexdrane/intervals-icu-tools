@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Training Dashboard
+Comment=Training, nutrition, sleep and focus dashboard
+Exec=/usr/bin/python3 @REPO@/training-brief.py
+Icon=@ICON@
+Terminal=false
+StartupWMClass=training-brief
+Categories=Utility;
